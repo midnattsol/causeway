@@ -1,0 +1,31 @@
+# Zig build artifacts and caches
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Local build configuration
+.zig-global-cache/
+.zig-cache-local/
+
+# Test, benchmark, and coverage output
+coverage/
+zig-cache-test/
+*.profraw
+*.profdata
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editor and operating-system artifacts
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+
+# Local tool environments
+.direnv/
