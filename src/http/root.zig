@@ -10,3 +10,4 @@ pub const handlers = @import("handlers/root.zig");
 pub const extractors = @import("extractors/root.zig");
 pub const middleware = @import("middleware/root.zig");
 pub const connection = @import("connection.zig");
+pub const headers = @import("headers.zig");
