@@ -1,11 +1,25 @@
-//! Causeway HTTP response representation.
+//! Borrowed HTTP response representation.
 
+const std = @import("std");
+const Headers = @import("headers.zig").Headers;
 const Status = @import("status.zig").Status;
 
+/// An immutable HTTP response that borrows its headers and body.
+///
+/// The caller must keep the header storage and body alive while the response
+/// is being written. `Response` does not allocate and does not need `deinit`.
 pub const Response = struct {
     status: Status,
-    body: []const u8,
-    content_type: []const u8 = "application/octet-stream",
+    headers: Headers = .empty,
+    body: []const u8 = "",
+
+    pub fn init(status: Status, headers: Headers, body: []const u8) Response {
+        return .{
+            .status = status,
+            .headers = headers,
+            .body = body,
+        };
+    }
 };
 
 pub const ContentType = struct {
@@ -45,3 +59,21 @@ pub const ContentType = struct {
     // GraphQL
     pub const graphql = "application/graphql-response+json";
 };
+
+test "Response initializes status headers and body" {
+    const headers = Headers{ .items = &.{
+        .{ .name = "content-type", .value = ContentType.text },
+    } };
+    const response = Response.init(.ok, headers, "Hello");
+
+    try std.testing.expectEqual(Status.ok, response.status);
+    try std.testing.expectEqualStrings(ContentType.text, response.headers.get("Content-Type").?);
+    try std.testing.expectEqualStrings("Hello", response.body);
+}
+
+test "Response supports empty headers and body" {
+    const response = Response{ .status = .no_content };
+
+    try std.testing.expect(response.headers.isEmpty());
+    try std.testing.expectEqualStrings("", response.body);
+}
