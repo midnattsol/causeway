@@ -6,10 +6,12 @@ pub const errors = @import("error.zig");
 pub const frame = @import("frame.zig");
 pub const frame_reader = @import("frame_reader.zig");
 pub const frame_writer = @import("frame_writer.zig");
+pub const header_block = @import("header_block.zig");
 pub const header_semantics = @import("header_semantics.zig");
 pub const hpack = @import("hpack/root.zig");
 pub const settings = @import("settings.zig");
 pub const stream = @import("stream.zig");
+pub const stream_registry = @import("stream_registry.zig");
 
 // -----------------------------------------------------------------------------
 // Tests
