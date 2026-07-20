@@ -1,7 +1,7 @@
 //! Backend-agnostic HTTP rate-limit middleware.
 
 const std = @import("std");
-const Response = @import("../response.zig").Response;
+const Response = @import("../message/response.zig").Response;
 const header_helpers = @import("header_helpers.zig");
 const Io = std.Io;
 
@@ -75,9 +75,9 @@ fn validateDecision(decision: Decision) Error!void {
 
 fn addHeaders(
     allocator: std.mem.Allocator,
-    headers: @import("../headers.zig").Headers,
+    headers: @import("../message/headers.zig").Headers,
     decision: Decision,
-) !@import("../headers.zig").Headers {
+) !@import("../message/headers.zig").Headers {
     const reset_seconds = try resetSeconds(decision.reset_after);
     const storage = try allocator.alloc(u8, 3 * 20);
     var offset: usize = 0;
@@ -110,6 +110,10 @@ fn formatInteger(storage: []u8, offset: *usize, value: u64) []const u8 {
     offset.* += written.len;
     return written;
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 const TestContext = struct {
     execution: struct { allocator: std.mem.Allocator },

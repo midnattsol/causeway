@@ -33,6 +33,10 @@ pub fn status(err: anyerror) ?std.http.Status {
     };
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 test "extractor errors map to bad request without classifying unrelated errors" {
     try std.testing.expectEqual(.bad_request, status(error.InvalidQuery).?);
     try std.testing.expectEqual(null, status(error.OutOfMemory));

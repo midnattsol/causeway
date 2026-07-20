@@ -8,6 +8,10 @@ pub const group = @import("group.zig");
 pub const params = @import("params.zig");
 pub const pattern = @import("pattern.zig");
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 test {
     std.testing.refAllDecls(@This());
 }

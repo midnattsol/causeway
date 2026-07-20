@@ -1,9 +1,9 @@
 //! Borrowed request cookies and safe `Set-Cookie` serialization.
 
 const std = @import("std");
-const Headers = @import("headers.zig").Headers;
-const Header = @import("headers.zig").Header;
-const Response = @import("response.zig").Response;
+const Headers = @import("../message/headers.zig").Headers;
+const Header = @import("../message/headers.zig").Header;
+const Response = @import("../message/response.zig").Response;
 
 pub const Error = std.mem.Allocator.Error || error{
     InvalidCookieName,
@@ -211,6 +211,10 @@ fn isValidAttribute(value: []const u8) bool {
     }
     return true;
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 test "Cookies parses repeated headers quoted values and exact names" {
     const cookies = Cookies.init(.{ .items = &.{

@@ -4,6 +4,10 @@ const std = @import("std");
 const Headers = @import("headers.zig").Headers;
 const Status = @import("status.zig").Status;
 
+// -----------------------------------------------------------------------------
+// Public response model
+// -----------------------------------------------------------------------------
+
 /// Controls whether the HTTP connection may be reused after this response.
 pub const Connection = enum {
     keep_alive,
@@ -24,8 +28,10 @@ pub const Stream = struct {
     context: *anyopaque,
     produce_fn: *const fn (context: *anyopaque, writer: *std.Io.Writer) anyerror!void,
     finalize_fn: ?*const fn (context: *anyopaque) void = null,
+    trailers_fn: ?*const fn (context: *anyopaque) Headers = null,
     lifecycle: *Lifecycle,
     content_length: ?u64 = null,
+    trailer_names: []const []const u8 = &.{},
 
     pub const Lifecycle = struct {
         produced: bool = false,
@@ -34,6 +40,8 @@ pub const Stream = struct {
 
     pub const Options = struct {
         content_length: ?u64 = null,
+        /// Trailer field names advertised before a chunked response body.
+        trailer_names: []const []const u8 = &.{},
     };
 
     /// Copies `producer` into `allocator`, normally the request arena.
@@ -96,6 +104,13 @@ pub const Stream = struct {
         return self.produce_fn(self.context, writer);
     }
 
+    /// Returns trailer fields after production. Producers that advertise
+    /// `trailer_names` may implement `trailers(*Producer) Headers`.
+    pub fn trailers(self: *Stream) Headers {
+        const trailers_fn = self.trailers_fn orelse return .empty;
+        return trailers_fn(self.context);
+    }
+
     pub fn finalize(self: *Stream) void {
         if (self.lifecycle.finalized) return;
         self.lifecycle.finalized = true;
@@ -121,14 +136,21 @@ pub const Stream = struct {
                 const typed: *Producer = @ptrCast(@alignCast(context));
                 typed.finalize();
             }
+
+            fn trailers(context: *anyopaque) Headers {
+                const typed: *Producer = @ptrCast(@alignCast(context));
+                return typed.trailers();
+            }
         };
 
         return .{
             .context = producer,
             .produce_fn = Adapter.produce,
             .finalize_fn = if (@hasDecl(Producer, "finalize")) Adapter.finalize else null,
+            .trailers_fn = if (@hasDecl(Producer, "trailers")) Adapter.trailers else null,
             .lifecycle = lifecycle,
             .content_length = options.content_length,
+            .trailer_names = options.trailer_names,
         };
     }
 
@@ -139,6 +161,66 @@ pub const Stream = struct {
         }
         if (!@hasDecl(Producer, "produce") and !@hasDecl(Producer, "write"))
             @compileError("producer must declare produce or write");
+    }
+};
+
+/// Type-erased control transfer after an HTTP upgrade or successful CONNECT.
+pub const Takeover = struct {
+    context: *anyopaque,
+    run_fn: *const fn (*anyopaque, *std.Io.Reader, *std.Io.Writer) anyerror!void,
+    finalize_fn: ?*const fn (*anyopaque) void,
+    lifecycle: *Lifecycle,
+    kind: Kind,
+
+    pub const Kind = union(enum) {
+        upgrade: []const u8,
+        tunnel,
+    };
+
+    pub const Lifecycle = struct {
+        ran: bool = false,
+        finalized: bool = false,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, handler: anytype) std.mem.Allocator.Error!Takeover {
+        const Handler = @TypeOf(handler);
+        if (!@hasDecl(Handler, "run")) @compileError("takeover handler must declare run");
+        const Box = struct {
+            lifecycle: Lifecycle = .{},
+            handler: Handler,
+        };
+        const Adapter = struct {
+            fn run(context: *anyopaque, input: *std.Io.Reader, output: *std.Io.Writer) anyerror!void {
+                const typed: *Handler = @ptrCast(@alignCast(context));
+                return typed.run(input, output);
+            }
+
+            fn finalize(context: *anyopaque) void {
+                const typed: *Handler = @ptrCast(@alignCast(context));
+                typed.finalize();
+            }
+        };
+        const box = try allocator.create(Box);
+        box.* = .{ .handler = handler };
+        return .{
+            .context = &box.handler,
+            .run_fn = Adapter.run,
+            .finalize_fn = if (@hasDecl(Handler, "finalize")) Adapter.finalize else null,
+            .lifecycle = &box.lifecycle,
+            .kind = .tunnel,
+        };
+    }
+
+    pub fn run(self: *Takeover, input: *std.Io.Reader, output: *std.Io.Writer) !void {
+        if (self.lifecycle.ran) return error.TakeoverAlreadyRun;
+        self.lifecycle.ran = true;
+        return self.run_fn(self.context, input, output);
+    }
+
+    pub fn finalize(self: *Takeover) void {
+        if (self.lifecycle.finalized) return;
+        self.lifecycle.finalized = true;
+        if (self.finalize_fn) |finalize_fn| finalize_fn(self.context);
     }
 };
 
@@ -251,6 +333,8 @@ pub const Response = struct {
     completion: ?*Completion = null,
     /// Optional absolute deadline covering header and body emission.
     write_deadline: ?std.Io.Clock.Timestamp = null,
+    /// Transfers control of the HTTP stream after the final response head.
+    takeover: ?Takeover = null,
 
     /// Compatibility constructor for fixed byte responses.
     pub fn init(status: Status, headers: Headers, body: []const u8) Response {
@@ -266,6 +350,26 @@ pub const Response = struct {
             .status = status,
             .headers = headers,
             .body = .fromStream(stream),
+        };
+    }
+
+    pub fn upgrade(headers: Headers, protocol: []const u8, takeover: Takeover) Response {
+        var control = takeover;
+        control.kind = .{ .upgrade = protocol };
+        return .{
+            .status = .switching_protocols,
+            .headers = headers,
+            .takeover = control,
+        };
+    }
+
+    pub fn tunnel(status: Status, headers: Headers, takeover: Takeover) Response {
+        var control = takeover;
+        control.kind = .tunnel;
+        return .{
+            .status = status,
+            .headers = headers,
+            .takeover = control,
         };
     }
 
@@ -311,6 +415,10 @@ pub const ContentType = struct {
     // GraphQL
     pub const graphql = "application/graphql-response+json";
 };
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 test "Response initializes status headers and byte body" {
     const headers = Headers{ .items = &.{

@@ -28,6 +28,10 @@ pub fn Local(comptime T: type, comptime name: []const u8) type {
     };
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 test "Local reads the named local value" {
     const Locals = struct {
         request_id: []const u8 = "request-1",

@@ -1,9 +1,8 @@
-//! Compile-time handler signature inspection and invocation.
+//! HTTP wire-protocol implementations.
 
 const std = @import("std");
 
-pub const handler = @import("handler.zig");
-pub const signature = @import("signature.zig");
+pub const http1 = @import("http1/root.zig");
 
 // -----------------------------------------------------------------------------
 // Tests

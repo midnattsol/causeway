@@ -163,6 +163,10 @@ pub const HeadersBuilder = struct {
     }
 };
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 test "empty headers have no values" {
     const headers: Headers = .empty;
 

@@ -23,7 +23,7 @@ The helper:
 2. Generates a weak metadata ETag unless one is supplied.
 3. Formats `Last-Modified` when the timestamp is representable as an HTTP date.
 4. Evaluates request preconditions.
-5. Resolves an optional single byte range.
+5. Resolves optional single or multiple byte ranges.
 6. Creates the file producer only when a body may be needed.
 
 The path is copied into the request arena. The directory handle must remain valid until response completion. `files.response` does not map URL paths to filesystem paths or sanitize user input; static-file path normalization and traversal protection belong in a separate higher-level component.
@@ -78,12 +78,13 @@ With `close_on_finalize = true`, stream ownership includes the file handle. Caus
 
 ## Byte ranges
 
-Causeway supports one byte range:
+Causeway supports single and multiple byte ranges:
 
 ```http
 Range: bytes=1000-1999
 Range: bytes=1000-
 Range: bytes=-500
+Range: bytes=0-99,200-299
 ```
 
 A satisfiable range returns:
@@ -102,7 +103,7 @@ HTTP/1.1 416 Range Not Satisfiable
 Content-Range: bytes */50000000
 ```
 
-Malformed fields and unsupported multi-range fields are ignored, producing the complete representation. Multipart byte ranges are intentionally not implemented yet.
+Multiple satisfiable ranges produce `multipart/byteranges` with a generated boundary, one `Content-Range` per part, and an exact aggregate `Content-Length`. Overlapping or adjacent ranges are coalesced. `Options.max_ranges` bounds parsing and response amplification; malformed or excessive range sets are ignored and produce the complete representation.
 
 ## Validators and preconditions
 
@@ -140,4 +141,4 @@ Applications that already have a content hash should provide a strong ETag throu
 Thu, 01 Jan 1970 00:00:00 GMT
 ```
 
-`conditional.parseDate` accepts that canonical HTTP/1.1 form. Invalid dates are ignored by date-based preconditions. File timestamps before the Unix epoch omit `Last-Modified` rather than failing the response.
+`conditional.parseDate` accepts IMF-fixdate plus the legacy RFC850 and asctime wire formats that RFC 9110 requires recipients to parse. This is protocol interoperability, not compatibility with previous Causeway releases. Causeway always emits only IMF-fixdate. Invalid dates are ignored by date-based preconditions. File timestamps before the Unix epoch omit `Last-Modified` rather than failing the response.

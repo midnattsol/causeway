@@ -1,7 +1,7 @@
 //! Maps selected downstream errors to HTTP responses.
 
 const std = @import("std");
-const Response = @import("../response.zig").Response;
+const Response = @import("../message/response.zig").Response;
 
 /// `Mapper` must expose `pub fn map(err: anyerror, context: anytype) ?Response`.
 pub fn ErrorMapping(comptime Mapper: type) type {
@@ -16,6 +16,10 @@ pub fn ErrorMapping(comptime Mapper: type) type {
         }
     };
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 const TestContext = struct { mapped: bool = false };
 const FailingNext = struct {

@@ -31,6 +31,10 @@ pub fn Header(comptime T: type, comptime name: []const u8) type {
     };
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 const TestHeaders = struct {
     name: []const u8,
     raw: ?[]const u8,

@@ -21,6 +21,10 @@ pub fn State(comptime T: type) type {
     };
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 test "State extracts the exact mutable state pointer" {
     const AppState = struct { requests: usize = 0 };
     var state = AppState{};

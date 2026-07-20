@@ -1,9 +1,8 @@
-//! Compile-time handler signature inspection and invocation.
+//! Network transport lifecycle and listener management.
 
 const std = @import("std");
 
-pub const handler = @import("handler.zig");
-pub const signature = @import("signature.zig");
+pub const server = @import("server.zig");
 
 // -----------------------------------------------------------------------------
 // Tests

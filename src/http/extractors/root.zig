@@ -22,6 +22,10 @@ pub const BodyStream = body_stream.BodyStream;
 pub const State = state.State;
 pub const Local = local.Local;
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 test {
     std.testing.refAllDecls(@This());
 }

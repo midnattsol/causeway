@@ -1,7 +1,7 @@
 //! Cooperative request-execution timeout middleware.
 
 const std = @import("std");
-const response_module = @import("../response.zig");
+const response_module = @import("../message/response.zig");
 const Response = response_module.Response;
 const Io = std.Io;
 
@@ -84,6 +84,10 @@ fn waitUntil(io: Io, deadline: Io.Clock.Timestamp) anyerror!void {
     try deadline.wait(io);
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 const TestContext = struct {
     execution: struct {
         io: Io,
@@ -115,7 +119,7 @@ test "Timeout preserves a response that completes before its deadline" {
 
     const response = try Timeout(.fromSeconds(1)).handle(&context, Fast);
     try std.testing.expectEqual(.ok, response.status);
-    try std.testing.expectEqual(@import("../response.zig").Connection.keep_alive, response.connection);
+    try std.testing.expectEqual(@import("../message/response.zig").Connection.keep_alive, response.connection);
 }
 
 test "Timeout cancels slow execution and closes the connection" {
@@ -129,7 +133,7 @@ test "Timeout cancels slow execution and closes the connection" {
 
     const response = try Timeout(.fromMilliseconds(1)).handle(&context, Slow);
     try std.testing.expectEqual(.gateway_timeout, response.status);
-    try std.testing.expectEqual(@import("../response.zig").Connection.close, response.connection);
+    try std.testing.expectEqual(@import("../message/response.zig").Connection.close, response.connection);
 }
 
 test "Timeout attaches its original deadline to response emission" {

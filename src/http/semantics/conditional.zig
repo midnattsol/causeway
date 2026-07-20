@@ -1,7 +1,7 @@
 //! HTTP validators, preconditions, and IMF-fixdate handling.
 
 const std = @import("std");
-const Headers = @import("headers.zig").Headers;
+const Headers = @import("../message/headers.zig").Headers;
 
 pub const Decision = enum {
     proceed,
@@ -16,9 +16,9 @@ pub const Validators = struct {
 
 /// Evaluates RFC 9110 request preconditions in their required precedence.
 pub fn evaluate(headers: Headers, method: std.http.Method, validators: Validators) Decision {
-    const if_match = headers.get("if-match");
-    if (if_match) |value| {
-        if (!matchesList(value, validators.etag, .strong)) return .precondition_failed;
+    const has_if_match = headers.contains("if-match");
+    if (has_if_match) {
+        if (!matchesHeaderValues(headers, "if-match", validators.etag, .strong)) return .precondition_failed;
     } else if (headers.get("if-unmodified-since")) |value| {
         if (validators.last_modified) |modified| {
             if (parseDate(value)) |date| {
@@ -27,8 +27,8 @@ pub fn evaluate(headers: Headers, method: std.http.Method, validators: Validator
         }
     }
 
-    if (headers.get("if-none-match")) |value| {
-        if (matchesList(value, validators.etag, .weak)) {
+    if (headers.contains("if-none-match")) {
+        if (matchesHeaderValues(headers, "if-none-match", validators.etag, .weak)) {
             return if (method == .GET or method == .HEAD)
                 .not_modified
             else
@@ -62,6 +62,14 @@ pub fn allowsRange(headers: Headers, validators: Validators) bool {
 }
 
 const Comparison = enum { strong, weak };
+
+fn matchesHeaderValues(headers: Headers, name: []const u8, current: ?[]const u8, comparison: Comparison) bool {
+    var values = headers.values(name);
+    while (values.next()) |value| {
+        if (matchesList(value, current, comparison)) return true;
+    }
+    return false;
+}
 
 fn matchesList(value: []const u8, current: ?[]const u8, comparison: Comparison) bool {
     var cursor: usize = 0;
@@ -122,8 +130,14 @@ fn parseTag(raw: []const u8) ?ParsedTag {
 pub const DateError = error{InvalidHttpDate};
 const maximum_http_date_seconds: i64 = 253_402_300_799;
 
-/// Parses the IMF-fixdate form emitted by HTTP/1.1 servers.
+/// Parses IMF-fixdate and the two legacy wire formats required by RFC 9110 recipients.
 pub fn parseDate(value: []const u8) DateError!i64 {
+    return parseImfFixdate(value) catch
+        parseRfc850Date(value) catch
+        parseAsctimeDate(value);
+}
+
+fn parseImfFixdate(value: []const u8) DateError!i64 {
     if (value.len != 29 or
         value[3] != ',' or value[4] != ' ' or value[7] != ' ' or
         value[11] != ' ' or value[16] != ' ' or value[19] != ':' or
@@ -131,13 +145,54 @@ pub fn parseDate(value: []const u8) DateError!i64 {
         !std.mem.eql(u8, value[26..29], "GMT")) return error.InvalidHttpDate;
 
     _ = weekdayIndex(value[0..3]) orelse return error.InvalidHttpDate;
-    const day = parseDecimal(u8, value[5..7]) catch return error.InvalidHttpDate;
-    const month = monthIndex(value[8..11]) orelse return error.InvalidHttpDate;
-    const year = parseDecimal(u16, value[12..16]) catch return error.InvalidHttpDate;
-    const hour = parseDecimal(u8, value[17..19]) catch return error.InvalidHttpDate;
-    const minute = parseDecimal(u8, value[20..22]) catch return error.InvalidHttpDate;
-    const second = parseDecimal(u8, value[23..25]) catch return error.InvalidHttpDate;
+    return timestamp(
+        parseDecimal(u16, value[12..16]) catch return error.InvalidHttpDate,
+        monthIndex(value[8..11]) orelse return error.InvalidHttpDate,
+        parseDecimal(u8, value[5..7]) catch return error.InvalidHttpDate,
+        parseDecimal(u8, value[17..19]) catch return error.InvalidHttpDate,
+        parseDecimal(u8, value[20..22]) catch return error.InvalidHttpDate,
+        parseDecimal(u8, value[23..25]) catch return error.InvalidHttpDate,
+    );
+}
 
+fn parseRfc850Date(value: []const u8) DateError!i64 {
+    const comma = std.mem.findScalar(u8, value, ',') orelse return error.InvalidHttpDate;
+    if (weekdayLongIndex(value[0..comma]) == null) return error.InvalidHttpDate;
+    const date = value[comma + 1 ..];
+    if (date.len != 23 or date[0] != ' ' or date[3] != '-' or date[7] != '-' or
+        date[10] != ' ' or date[13] != ':' or date[16] != ':' or date[19] != ' ' or
+        !std.mem.eql(u8, date[20..23], "GMT")) return error.InvalidHttpDate;
+    const short_year = parseDecimal(u8, date[8..10]) catch return error.InvalidHttpDate;
+    const year: u16 = if (short_year >= 70)
+        1900 + @as(u16, short_year)
+    else
+        2000 + @as(u16, short_year);
+    return timestamp(
+        year,
+        monthIndex(date[4..7]) orelse return error.InvalidHttpDate,
+        parseDecimal(u8, date[1..3]) catch return error.InvalidHttpDate,
+        parseDecimal(u8, date[11..13]) catch return error.InvalidHttpDate,
+        parseDecimal(u8, date[14..16]) catch return error.InvalidHttpDate,
+        parseDecimal(u8, date[17..19]) catch return error.InvalidHttpDate,
+    );
+}
+
+fn parseAsctimeDate(value: []const u8) DateError!i64 {
+    if (value.len != 24 or value[3] != ' ' or value[7] != ' ' or value[10] != ' ' or
+        value[13] != ':' or value[16] != ':' or value[19] != ' ') return error.InvalidHttpDate;
+    _ = weekdayIndex(value[0..3]) orelse return error.InvalidHttpDate;
+    const day_slice = if (value[8] == ' ') value[9..10] else value[8..10];
+    return timestamp(
+        parseDecimal(u16, value[20..24]) catch return error.InvalidHttpDate,
+        monthIndex(value[4..7]) orelse return error.InvalidHttpDate,
+        parseDecimal(u8, day_slice) catch return error.InvalidHttpDate,
+        parseDecimal(u8, value[11..13]) catch return error.InvalidHttpDate,
+        parseDecimal(u8, value[14..16]) catch return error.InvalidHttpDate,
+        parseDecimal(u8, value[17..19]) catch return error.InvalidHttpDate,
+    );
+}
+
+fn timestamp(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) DateError!i64 {
     if (year < 1970 or day == 0 or day > daysInMonth(year, month) or
         hour > 23 or minute > 59 or second > 59) return error.InvalidHttpDate;
 
@@ -194,10 +249,16 @@ fn daysInMonth(year: u16, month: u8) u8 {
 }
 
 const weekdays = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+const weekdays_long = [_][]const u8{ "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
 const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 
 fn weekdayIndex(value: []const u8) ?usize {
     for (weekdays, 0..) |name, index| if (std.mem.eql(u8, name, value)) return index;
+    return null;
+}
+
+fn weekdayLongIndex(value: []const u8) ?usize {
+    for (weekdays_long, 0..) |name, index| if (std.mem.eql(u8, name, value)) return index;
     return null;
 }
 
@@ -206,12 +267,23 @@ fn monthIndex(value: []const u8) ?u8 {
     return null;
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 test "HTTP dates reject values outside the four-digit year range" {
     try std.testing.expectError(error.InvalidHttpDate, formatDate(std.testing.allocator, -1));
     try std.testing.expectError(
         error.InvalidHttpDate,
         formatDate(std.testing.allocator, maximum_http_date_seconds + 1),
     );
+}
+
+test "HTTP date parser accepts the RFC-required legacy wire formats" {
+    const expected = try parseDate("Sun, 06 Nov 1994 08:49:37 GMT");
+    try std.testing.expectEqual(expected, try parseDate("Sunday, 06-Nov-94 08:49:37 GMT"));
+    try std.testing.expectEqual(expected, try parseDate("Sun Nov  6 08:49:37 1994"));
+    try std.testing.expectError(error.InvalidHttpDate, parseDate("Sunday, 32-Nov-94 08:49:37 GMT"));
 }
 
 test "HTTP dates round trip epoch and a leap-year date" {

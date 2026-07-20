@@ -1,14 +1,18 @@
-//! Efficient file responses with validators and single byte-range support.
+//! Efficient file responses with validators and byte-range support.
 
 const std = @import("std");
-const conditional = @import("conditional.zig");
-const range_module = @import("range.zig");
-const Header = @import("headers.zig").Header;
-const Headers = @import("headers.zig").Headers;
-const response_module = @import("response.zig");
+const conditional = @import("semantics/conditional.zig");
+const range_module = @import("semantics/range.zig");
+const Header = @import("message/headers.zig").Header;
+const Headers = @import("message/headers.zig").Headers;
+const response_module = @import("message/response.zig");
 const Response = response_module.Response;
 const Stream = response_module.Stream;
 const Io = std.Io;
+
+// -----------------------------------------------------------------------------
+// Public API
+// -----------------------------------------------------------------------------
 
 pub const Options = struct {
     /// Overrides extension-based media-type detection.
@@ -17,6 +21,7 @@ pub const Options = struct {
     etag: ?[]const u8 = null,
     include_last_modified: bool = true,
     enable_ranges: bool = true,
+    max_ranges: usize = 16,
     additional_headers: Headers = .empty,
 };
 
@@ -30,14 +35,70 @@ pub const Error = error{NotAFile};
 pub fn response(context: anytype, dir: Io.Dir, path: []const u8, options: Options) !Response {
     const allocator = context.execution.allocator;
     const io = context.execution.io;
+    const metadata = try inspect(allocator, io, dir, path, options);
+    if (try preconditionResponse(
+        allocator,
+        path,
+        options,
+        context.request.headers,
+        context.request.method,
+        metadata,
+    )) |result| return result;
+
+    const selection = try selectRange(
+        allocator,
+        context.request.headers,
+        context.request.method,
+        options,
+        metadata,
+    );
+    return switch (selection) {
+        .unsatisfiable => unsatisfiedResponse(allocator, path, options, metadata),
+        .multipart => |ranges| multipartResponse(
+            allocator,
+            io,
+            dir,
+            path,
+            options,
+            metadata.etag,
+            metadata.last_modified,
+            metadata.size,
+            ranges,
+        ),
+        .full, .partial => singleRangeResponse(
+            allocator,
+            io,
+            dir,
+            path,
+            options,
+            metadata,
+            selection,
+        ),
+    };
+}
+
+// -----------------------------------------------------------------------------
+// Metadata, preconditions, and range selection
+// -----------------------------------------------------------------------------
+
+const Metadata = struct {
+    size: u64,
+    etag: []const u8,
+    last_modified: ?[]const u8,
+    validators: conditional.Validators,
+};
+
+fn inspect(
+    allocator: std.mem.Allocator,
+    io: Io,
+    dir: Io.Dir,
+    path: []const u8,
+    options: Options,
+) !Metadata {
     const stat = try dir.statFile(io, path, .{});
     if (stat.kind != .file) return error.NotAFile;
-
     const modified_seconds = timestampSeconds(stat.mtime);
-    const etag = if (options.etag) |provided|
-        provided
-    else
-        try weakEtag(allocator, stat.size, stat.mtime.nanoseconds);
+    const etag = options.etag orelse try weakEtag(allocator, stat.size, stat.mtime.nanoseconds);
     const last_modified: ?[]const u8 = if (options.include_last_modified)
         conditional.formatDate(allocator, modified_seconds) catch |err| switch (err) {
             error.InvalidHttpDate => null,
@@ -45,90 +106,208 @@ pub fn response(context: anytype, dir: Io.Dir, path: []const u8, options: Option
         }
     else
         null;
-    const validators: conditional.Validators = .{
-        .etag = etag,
-        .last_modified = if (last_modified != null) modified_seconds else null,
-    };
-
-    const decision = conditional.evaluate(context.request.headers, context.request.method, validators);
-    if (decision != .proceed) {
-        return .{
-            .status = switch (decision) {
-                .not_modified => .not_modified,
-                .precondition_failed => .precondition_failed,
-                .proceed => unreachable,
-            },
-            .headers = try responseHeaders(
-                allocator,
-                path,
-                options,
-                etag,
-                last_modified,
-                null,
-            ),
-        };
-    }
-
-    const range_selection: range_module.Selection = if (options.enable_ranges and
-        (context.request.method == .GET or context.request.method == .HEAD) and
-        conditional.allowsRange(context.request.headers, validators))
-        range_module.select(context.request.headers.get("range"), stat.size)
-    else
-        .full;
-
-    if (range_selection == .unsatisfiable) {
-        return .{
-            .status = .range_not_satisfiable,
-            .headers = try responseHeaders(
-                allocator,
-                path,
-                options,
-                etag,
-                last_modified,
-                try range_module.formatUnsatisfied(allocator, stat.size),
-            ),
-        };
-    }
-
-    const selected = switch (range_selection) {
-        .full => range_module.ByteRange{
-            .start = 0,
-            .end = if (stat.size == 0) 0 else stat.size - 1,
-        },
-        .partial => |partial| partial,
-        .unsatisfiable => unreachable,
-    };
-    const length: u64 = switch (range_selection) {
-        .full => stat.size,
-        .partial => selected.length(),
-        .unsatisfiable => unreachable,
-    };
-    const content_range = switch (range_selection) {
-        .partial => try range_module.formatContentRange(allocator, selected, stat.size),
-        else => null,
-    };
-
-    const owned_path = try allocator.dupe(u8, path);
-    const stream = try Stream.init(
-        allocator,
-        FileBody{
-            .dir = dir,
-            .path = owned_path,
-            .io = io,
-            .offset = selected.start,
-            .length = length,
-        },
-        .{ .content_length = length },
-    );
     return .{
-        .status = if (range_selection == .partial) .partial_content else .ok,
+        .size = stat.size,
+        .etag = etag,
+        .last_modified = last_modified,
+        .validators = .{
+            .etag = etag,
+            .last_modified = if (last_modified != null) modified_seconds else null,
+        },
+    };
+}
+
+fn preconditionResponse(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    options: Options,
+    headers: Headers,
+    method: std.http.Method,
+    metadata: Metadata,
+) !?Response {
+    const decision = conditional.evaluate(headers, method, metadata.validators);
+    if (decision == .proceed) return null;
+    return .{
+        .status = switch (decision) {
+            .not_modified => .not_modified,
+            .precondition_failed => .precondition_failed,
+            .proceed => unreachable,
+        },
         .headers = try responseHeaders(
             allocator,
             path,
             options,
+            metadata.etag,
+            metadata.last_modified,
+            null,
+        ),
+    };
+}
+
+fn selectRange(
+    allocator: std.mem.Allocator,
+    headers: Headers,
+    method: std.http.Method,
+    options: Options,
+    metadata: Metadata,
+) !range_module.Selection {
+    if (!options.enable_ranges or (method != .GET and method != .HEAD) or
+        !conditional.allowsRange(headers, metadata.validators)) return .full;
+    return range_module.selectMany(
+        allocator,
+        headers.get("range"),
+        metadata.size,
+        .{ .max_ranges = options.max_ranges },
+    );
+}
+
+fn unsatisfiedResponse(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    options: Options,
+    metadata: Metadata,
+) !Response {
+    return .{
+        .status = .range_not_satisfiable,
+        .headers = try responseHeaders(
+            allocator,
+            path,
+            options,
+            metadata.etag,
+            metadata.last_modified,
+            try range_module.formatUnsatisfied(allocator, metadata.size),
+        ),
+    };
+}
+
+fn singleRangeResponse(
+    allocator: std.mem.Allocator,
+    io: Io,
+    dir: Io.Dir,
+    path: []const u8,
+    options: Options,
+    metadata: Metadata,
+    selection: range_module.Selection,
+) !Response {
+    const selected = switch (selection) {
+        .full => range_module.ByteRange{
+            .start = 0,
+            .end = if (metadata.size == 0) 0 else metadata.size - 1,
+        },
+        .partial => |partial| partial,
+        else => unreachable,
+    };
+    const length = if (selection == .partial) selected.length() else metadata.size;
+    const content_range = if (selection == .partial)
+        try range_module.formatContentRange(allocator, selected, metadata.size)
+    else
+        null;
+    const stream = try Stream.init(allocator, FileBody{
+        .dir = dir,
+        .path = try allocator.dupe(u8, path),
+        .io = io,
+        .offset = selected.start,
+        .length = length,
+    }, .{ .content_length = length });
+    return .{
+        .status = if (selection == .partial) .partial_content else .ok,
+        .headers = try responseHeaders(
+            allocator,
+            path,
+            options,
+            metadata.etag,
+            metadata.last_modified,
+            content_range,
+        ),
+        .body = .{ .stream = stream },
+    };
+}
+
+// -----------------------------------------------------------------------------
+// Streaming producers
+// -----------------------------------------------------------------------------
+
+const MultiRangePart = struct {
+    header: []const u8,
+    range: range_module.ByteRange,
+};
+
+pub const MultiRangeBody = struct {
+    dir: Io.Dir,
+    path: []const u8,
+    io: Io,
+    parts: []const MultiRangePart,
+    closing: []const u8,
+
+    pub fn produce(self: *@This(), writer: *Io.Writer) !void {
+        var file = try self.dir.openFile(self.io, self.path, .{});
+        defer file.close(self.io);
+        var read_buffer: [64 * 1024]u8 = undefined;
+        var reader = file.reader(self.io, &read_buffer);
+        for (self.parts) |part| {
+            try writer.writeAll(part.header);
+            try transferReader(&reader, part.range.start, part.range.length(), writer);
+            try writer.writeAll("\r\n");
+        }
+        try writer.writeAll(self.closing);
+    }
+};
+
+fn multipartResponse(
+    allocator: std.mem.Allocator,
+    io: Io,
+    dir: Io.Dir,
+    path: []const u8,
+    options: Options,
+    etag: []const u8,
+    last_modified: ?[]const u8,
+    size: u64,
+    ranges: []const range_module.ByteRange,
+) !Response {
+    const content_type = options.content_type orelse detectContentType(path);
+    const boundary = try std.fmt.allocPrint(
+        allocator,
+        "causeway-{x}-{x}",
+        .{ std.hash.Wyhash.hash(0, etag), size },
+    );
+    const parts = try allocator.alloc(MultiRangePart, ranges.len);
+    var content_length: u64 = 0;
+    for (ranges, parts) |selected, *part| {
+        const header = try std.fmt.allocPrint(
+            allocator,
+            "--{s}\r\ncontent-type: {s}\r\ncontent-range: bytes {d}-{d}/{d}\r\n\r\n",
+            .{ boundary, content_type, selected.start, selected.end, size },
+        );
+        part.* = .{ .header = header, .range = selected };
+        content_length = try std.math.add(u64, content_length, header.len);
+        content_length = try std.math.add(u64, content_length, selected.length());
+        content_length = try std.math.add(u64, content_length, 2);
+    }
+    const closing = try std.fmt.allocPrint(allocator, "--{s}--\r\n", .{boundary});
+    content_length = try std.math.add(u64, content_length, closing.len);
+    const owned_path = try allocator.dupe(u8, path);
+    const stream = try Stream.init(allocator, MultiRangeBody{
+        .dir = dir,
+        .path = owned_path,
+        .io = io,
+        .parts = parts,
+        .closing = closing,
+    }, .{ .content_length = content_length });
+    var response_options = options;
+    response_options.content_type = try std.fmt.allocPrint(
+        allocator,
+        "multipart/byteranges; boundary={s}",
+        .{boundary},
+    );
+    return .{
+        .status = .partial_content,
+        .headers = try responseHeaders(
+            allocator,
+            path,
+            response_options,
             etag,
             last_modified,
-            content_range,
+            null,
         ),
         .body = .{ .stream = stream },
     };
@@ -176,13 +355,16 @@ fn transfer(file: Io.File, io: Io, offset: u64, length: u64, writer: *Io.Writer)
     if (length == 0) return;
     var read_buffer: [64 * 1024]u8 = undefined;
     var reader = file.reader(io, &read_buffer);
-    try reader.seekTo(offset);
+    try transferReader(&reader, offset, length, writer);
+}
 
+fn transferReader(reader: *Io.File.Reader, offset: u64, length: u64, writer: *Io.Writer) !void {
+    try reader.seekTo(offset);
     _ = try writer.writableSliceGreedy(1);
     var remaining = length;
     while (remaining != 0) {
         const amount: usize = @intCast(@min(remaining, std.math.maxInt(usize) - 1));
-        const sent = try writer.sendFileAll(&reader, .limited(amount));
+        const sent = try writer.sendFileAll(reader, .limited(amount));
         if (sent != amount) return error.UnexpectedEndOfFile;
         remaining -= sent;
     }
@@ -237,6 +419,10 @@ pub fn detectContentType(path: []const u8) []const u8 {
     return "application/octet-stream";
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 const TestContext = struct {
     execution: struct {
         allocator: std.mem.Allocator,
@@ -284,6 +470,31 @@ test "FileResponse streams complete and partial files" {
     try partial.body.stream.produce(&partial_output.writer);
     partial.body.finalize();
     try std.testing.expectEqualStrings("3456", partial_output.written());
+}
+
+test "FileResponse emits multipart byte ranges with an exact length" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "asset.txt", .data = "0123456789" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var context = testContext(arena.allocator(), .GET, .{ .items = &.{.{
+        .name = "Range",
+        .value = "bytes=0-1,8-9",
+    }} });
+    var result = try response(&context, tmp.dir, "asset.txt", .{ .etag = "\"asset\"" });
+    defer result.body.finalize();
+    try std.testing.expectEqual(.partial_content, result.status);
+    try std.testing.expect(std.mem.startsWith(u8, result.headers.get("content-type").?, "multipart/byteranges; boundary="));
+    try std.testing.expect(result.headers.get("content-range") == null);
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try result.body.stream.produce(&output.writer);
+    try std.testing.expectEqual(result.body.contentLength().?, output.written().len);
+    try std.testing.expect(std.mem.find(u8, output.written(), "content-range: bytes 0-1/10\r\n\r\n01") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "content-range: bytes 8-9/10\r\n\r\n89") != null);
 }
 
 test "OpenFileBody transfers a selected region from an existing handle" {

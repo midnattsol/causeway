@@ -1,7 +1,7 @@
 //! Compile-time validation of HTTP handler parameters and return values.
 
 const std = @import("std");
-const Response = @import("../response.zig").Response;
+const Response = @import("../message/response.zig").Response;
 
 const Problem = enum {
     not_function,
@@ -99,6 +99,10 @@ fn isExtractor(comptime T: type) bool {
     if (@TypeOf(T.is_http_extractor) != bool) return false;
     return T.is_http_extractor;
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 const TestContext = struct {};
 

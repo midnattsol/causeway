@@ -1,8 +1,8 @@
 //! Request-ID propagation and generation middleware.
 
 const std = @import("std");
-const Headers = @import("../headers.zig").Headers;
-const Response = @import("../response.zig").Response;
+const Headers = @import("../message/headers.zig").Headers;
+const Response = @import("../message/response.zig").Response;
 const header_helpers = @import("header_helpers.zig");
 
 /// Request-ID policy defaults.
@@ -107,6 +107,10 @@ pub fn RequestId(comptime options: anytype) type {
         }
     };
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 const TestLocals = struct {
     request_id: []const u8 = "unset",

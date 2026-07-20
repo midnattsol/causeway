@@ -22,6 +22,8 @@ test "public HTTP API exposes cookies" {
 test "public HTTP API exposes typed app routing configuration" {
     _ = causeway.http.app.AppWithLocals;
     _ = causeway.http.app.AppWithLocalsAndOptions;
+    _ = causeway.http.app.AppWithProtocol;
+    _ = causeway.http.app.AppWithLocalsAndProtocol;
     _ = causeway.http.context.ContextWithLocals;
     _ = causeway.http.routing.route.routeWith;
     _ = causeway.http.routing.route.withBodyLimit;
@@ -42,16 +44,31 @@ test "public HTTP API exposes middleware" {
     _ = causeway.http.middleware.RateLimit;
     _ = causeway.http.middleware.RateLimitDecision;
     _ = causeway.http.middleware.ETag;
+    _ = causeway.http.middleware.Conditional;
     _ = causeway.http.middleware.Session;
     _ = causeway.http.middleware.Csrf;
     try std.testing.expect(true);
 }
 
+test "public HTTP API exposes protocol-independent messages and protocol layers" {
+    _ = causeway.http.message;
+    _ = causeway.http.semantics;
+    _ = causeway.http.protocol.http1;
+    _ = causeway.http.transport;
+    _ = causeway.http.message.request.Version.http_2;
+    _ = causeway.http.message.request_body.Source;
+    try std.testing.expect(true);
+}
+
 test "public HTTP API exposes request and response bodies" {
+    _ = causeway.http.request.Target;
+    _ = causeway.http.request.Version;
     _ = causeway.http.request_body.RequestBody;
     _ = causeway.http.request_body.BodyReader;
     _ = causeway.http.response.ResponseBody;
     _ = causeway.http.response.Stream;
+    _ = causeway.http.response.Takeover;
+    _ = causeway.http.exchange.Exchange;
     _ = causeway.http.response.CompletionResult;
     try std.testing.expect(true);
 }
@@ -63,7 +80,10 @@ test "public HTTP API exposes files ranges and conditional requests" {
     _ = causeway.http.files.Options;
     _ = causeway.http.range.ByteRange;
     _ = causeway.http.range.select;
+    _ = causeway.http.range.selectMany;
     _ = causeway.http.conditional.evaluate;
+    _ = causeway.http.cache_control.parse;
+    _ = causeway.http.cache_control.Policy;
     _ = causeway.http.conditional.allowsRange;
     try std.testing.expect(true);
 }

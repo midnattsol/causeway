@@ -1,13 +1,13 @@
 //! Typed composition of application state, request dispatch, connection handling, and server lifecycle.
 
 const std = @import("std");
-const connection = @import("connection.zig");
-const server = @import("server.zig");
+const http1 = @import("protocol/http1/root.zig");
+const server = @import("transport/server.zig");
 const Io = std.Io;
 
 /// Returns an application type using the default connection options.
 pub fn App(comptime State: type, comptime Dispatcher: type) type {
-    return AppConfigured(State, null, Dispatcher, .{});
+    return AppConfigured(State, null, http1, Dispatcher, http1.Options{});
 }
 
 /// Returns an application type specialized for state, dispatcher, and connection options.
@@ -19,9 +19,9 @@ pub fn App(comptime State: type, comptime Dispatcher: type) type {
 pub fn AppWithOptions(
     comptime State: type,
     comptime Dispatcher: type,
-    comptime connection_options: connection.Options,
+    comptime connection_options: http1.Options,
 ) type {
-    return AppConfigured(State, null, Dispatcher, connection_options);
+    return AppConfigured(State, null, http1, Dispatcher, connection_options);
 }
 
 /// Returns an application whose request contexts carry typed locals.
@@ -32,7 +32,7 @@ pub fn AppWithLocals(
     comptime Locals: type,
     comptime Dispatcher: type,
 ) type {
-    return AppConfigured(State, Locals, Dispatcher, .{});
+    return AppConfigured(State, Locals, http1, Dispatcher, http1.Options{});
 }
 
 /// Returns an application with typed request locals and custom connection options.
@@ -40,16 +40,40 @@ pub fn AppWithLocalsAndOptions(
     comptime State: type,
     comptime Locals: type,
     comptime Dispatcher: type,
-    comptime connection_options: connection.Options,
+    comptime connection_options: http1.Options,
 ) type {
-    return AppConfigured(State, Locals, Dispatcher, connection_options);
+    return AppConfigured(State, Locals, http1, Dispatcher, connection_options);
+}
+
+/// Returns an application composed with a stream-oriented protocol driver.
+/// The driver must provide `Handler` and `HandlerWithLocals` constructors with
+/// the same transport boundary as the built-in HTTP/1 engine.
+pub fn AppWithProtocol(
+    comptime State: type,
+    comptime Protocol: type,
+    comptime Dispatcher: type,
+    comptime protocol_options: anytype,
+) type {
+    return AppConfigured(State, null, Protocol, Dispatcher, protocol_options);
+}
+
+/// Returns an application with typed request locals and a custom stream-oriented protocol driver.
+pub fn AppWithLocalsAndProtocol(
+    comptime State: type,
+    comptime Locals: type,
+    comptime Protocol: type,
+    comptime Dispatcher: type,
+    comptime protocol_options: anytype,
+) type {
+    return AppConfigured(State, Locals, Protocol, Dispatcher, protocol_options);
 }
 
 fn AppConfigured(
     comptime State: type,
     comptime Locals: ?type,
+    comptime Protocol: type,
     comptime Dispatcher: type,
-    comptime connection_options: connection.Options,
+    comptime connection_options: anytype,
 ) type {
     return struct {
         server: server.Server,
@@ -101,7 +125,7 @@ fn AppConfigured(
             io: Io,
         ) anyerror!void {
             if (Locals) |RequestLocals| {
-                var handler = connection.HandlerWithLocals(State, RequestLocals, Dispatcher).init(
+                var handler = Protocol.HandlerWithLocals(State, RequestLocals, Dispatcher).init(
                     allocator,
                     state,
                     connection_options,
@@ -109,7 +133,7 @@ fn AppConfigured(
                 return handler.handle(stream, io);
             }
 
-            var handler = connection.Handler(State, Dispatcher).init(
+            var handler = Protocol.Handler(State, Dispatcher).init(
                 allocator,
                 state,
                 connection_options,
@@ -119,16 +143,20 @@ fn AppConfigured(
     };
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 const TestState = struct {};
 
 const TestDispatcher = struct {
-    pub fn dispatch(_: anytype) error{}!@import("response.zig").Response {
+    pub fn dispatch(_: anytype) error{}!@import("message/response.zig").Response {
         return .{ .status = .ok };
     }
 };
 
 const TestMiddleware = struct {
-    pub fn handle(context: anytype, next: anytype) !@import("response.zig").Response {
+    pub fn handle(context: anytype, next: anytype) !@import("message/response.zig").Response {
         return next.run(context);
     }
 };
@@ -152,12 +180,12 @@ test "AppWithLocals composes default-initialized request-local types" {
     try std.testing.expectEqual(server.ServerState.configured, app.server.serverState());
 }
 
-test "App composes borrowed state with a configured transport server" {
+test "AppWithProtocol composes an explicit protocol driver" {
     var threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
 
     var state: TestState = .{};
-    var app = App(TestState, TestAppDispatcher).init(
+    var app = AppWithProtocol(TestState, http1, TestAppDispatcher, http1.Options{}).init(
         std.testing.allocator,
         threaded.io(),
         &state,

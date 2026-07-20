@@ -105,6 +105,10 @@ fn parseBool(raw: []const u8) ParseError!bool {
     return error.InvalidValue;
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 test "parse supports every scalar category and optionals" {
     const Mode = enum { fast, safe };
 

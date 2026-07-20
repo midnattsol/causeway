@@ -1,7 +1,7 @@
 //! Callback-based HTTP request lifecycle observation.
 
 const std = @import("std");
-const response_module = @import("../response.zig");
+const response_module = @import("../message/response.zig");
 const Completion = response_module.Completion;
 const CompletionResult = response_module.CompletionResult;
 const Response = response_module.Response;
@@ -61,6 +61,10 @@ pub fn Logging(comptime Callbacks: type) type {
         }
     };
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 const TestContext = struct { events: std.ArrayList(u8) = .empty };
 const AllCallbacks = struct {

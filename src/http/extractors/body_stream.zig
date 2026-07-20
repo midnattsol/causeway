@@ -1,7 +1,7 @@
 //! Exclusive streaming HTTP request-body extraction.
 
 const std = @import("std");
-const request_body = @import("../request_body.zig");
+const request_body = @import("../message/request_body.zig");
 const RequestBody = request_body.RequestBody;
 
 /// Claims the request body for bounded incremental reads.
@@ -19,6 +19,10 @@ pub const BodyStream = struct {
         return .{ .value = (try body.claimStream()) orelse return error.MissingBody };
     }
 };
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 fn testContext(body: RequestBody) struct { request: struct { body: RequestBody } } {
     return .{ .request = .{ .body = body } };

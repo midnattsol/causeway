@@ -1,7 +1,7 @@
 //! Configurable security response headers.
 
 const std = @import("std");
-const Response = @import("../response.zig").Response;
+const Response = @import("../message/response.zig").Response;
 const header_helpers = @import("header_helpers.zig");
 
 /// Values are borrowed for the lifetime of the program. Set a field to `null`
@@ -45,6 +45,10 @@ pub fn SecurityHeaders(comptime options: Options) type {
         }
     };
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 const TestContext = struct {
     execution: struct { allocator: std.mem.Allocator },

@@ -7,8 +7,8 @@
 //! loaded. Neither the middleware nor this module provides storage or locking.
 
 const std = @import("std");
-const cookies = @import("../cookies.zig");
-const Response = @import("../response.zig").Response;
+const cookies = @import("../semantics/cookies.zig");
+const Response = @import("../message/response.zig").Response;
 
 /// Session cookie policy defaults.
 ///
@@ -172,6 +172,10 @@ pub fn Session(comptime options: anytype) type {
     };
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 const TestValue = struct { count: usize };
 const TestLocals = struct { session: ?TestValue = null };
 
@@ -189,7 +193,7 @@ const TestContext = struct {
     locals: *TestLocals,
     request: struct {
         method: std.http.Method = .GET,
-        headers: @import("../headers.zig").Headers,
+        headers: @import("../message/headers.zig").Headers,
     },
     execution: struct { allocator: std.mem.Allocator },
     backend: *TestBackend,
@@ -231,7 +235,7 @@ const TestNext = struct {
     expected_before: ?TestValue,
     action: Action = .keep,
     value: TestValue = .{ .count = 0 },
-    headers: @import("../headers.zig").Headers = .empty,
+    headers: @import("../message/headers.zig").Headers = .empty,
 
     pub fn run(self: @This(), context: *TestContext) !Response {
         try std.testing.expectEqualDeep(self.expected_before, context.locals.session);
@@ -262,7 +266,7 @@ fn testContext(
     backend: *TestBackend,
     cookie_header: ?[]const u8,
 ) TestContext {
-    const Headers = @import("../headers.zig").Headers;
+    const Headers = @import("../message/headers.zig").Headers;
     return .{
         .locals = locals,
         .request = .{ .headers = if (cookie_header) |value|
@@ -375,7 +379,7 @@ test "Session refreshes a loaded cookie and preserves existing Set-Cookie fields
     var locals = TestLocals{};
     var backend = TestBackend{ .stored_id = "existing", .stored_value = .{ .count = 2 } };
     var context = testContext(arena.allocator(), &locals, &backend, "__Host-causeway_session=existing");
-    const existing_headers = @import("../headers.zig").Headers{ .items = &.{.{ .name = "set-cookie", .value = "theme=dark" }} };
+    const existing_headers = @import("../message/headers.zig").Headers{ .items = &.{.{ .name = "set-cookie", .value = "theme=dark" }} };
 
     const response = try sessionMiddleware(.{ .Store = TestStore, .generate = generated, .refresh = true }).handle(
         &context,

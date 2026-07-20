@@ -1,7 +1,7 @@
 //! Buffered raw HTTP request-body extraction.
 
 const std = @import("std");
-const RequestBody = @import("../request_body.zig").RequestBody;
+const RequestBody = @import("../message/request_body.zig").RequestBody;
 
 /// Lazily extracts and caches the complete raw request body.
 pub const Body = struct {
@@ -22,6 +22,10 @@ pub const Body = struct {
 fn requestBody(context: anytype) RequestBody {
     return context.request.body;
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 fn testContext(body: RequestBody) struct { request: struct { body: RequestBody } } {
     return .{ .request = .{ .body = body } };

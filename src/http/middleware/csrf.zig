@@ -6,8 +6,8 @@
 //! invoking the downstream chain.
 
 const std = @import("std");
-const cookies = @import("../cookies.zig");
-const Response = @import("../response.zig").Response;
+const cookies = @import("../semantics/cookies.zig");
+const Response = @import("../message/response.zig").Response;
 
 /// CSRF policy defaults.
 ///
@@ -203,7 +203,11 @@ fn isValidAttribute(value: []const u8) bool {
     return true;
 }
 
-const Headers = @import("../headers.zig").Headers;
+const Headers = @import("../message/headers.zig").Headers;
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 const TestContext = struct {
     execution: struct { allocator: std.mem.Allocator },
@@ -268,7 +272,7 @@ test "Csrf safe request preserves an existing valid cookie without setting one" 
     try std.testing.expectEqualStrings("body", response.body.asBytes().?);
     try std.testing.expectEqualStrings("preserved", response.headers.get("x-downstream").?);
     try std.testing.expect(response.headers.get("set-cookie") == null);
-    try std.testing.expectEqual(@import("../response.zig").Connection.close, response.connection);
+    try std.testing.expectEqual(@import("../message/response.zig").Connection.close, response.connection);
 }
 
 test "Csrf safe request generates a token and appends its cookie" {

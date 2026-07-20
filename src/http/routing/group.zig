@@ -4,7 +4,7 @@ const std = @import("std");
 const Pattern = @import("pattern.zig").Pattern;
 const route_module = @import("route.zig");
 const router_module = @import("router.zig");
-const Response = @import("../response.zig").Response;
+const Response = @import("../message/response.zig").Response;
 
 /// Prefixes every route in `routes` and returns ordinary routes for `Router`.
 ///
@@ -116,6 +116,10 @@ fn prefixedPattern(comptime prefix: []const u8, comptime pattern: []const u8) []
     if (std.mem.eql(u8, prefix, "/")) return pattern;
     return std.fmt.comptimePrint("{s}{s}", .{ prefix, pattern });
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 const TestContext = struct {
     request: struct {

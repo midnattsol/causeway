@@ -1,14 +1,21 @@
 //! Compile-time configured HTTP request router.
 
 const std = @import("std");
-const Response = @import("../response.zig").Response;
+const Response = @import("../message/response.zig").Response;
+const Header = @import("../message/headers.zig").Header;
 const HttpContext = @import("../context.zig").Context;
-const Request = @import("../request.zig").Request;
-const RequestBody = @import("../request_body.zig").RequestBody;
+const request_module = @import("../message/request.zig");
+const Request = request_module.Request;
+const Target = request_module.Target;
+const RequestBody = @import("../message/request_body.zig").RequestBody;
 const Params = @import("params.zig").Params;
 const Pattern = @import("pattern.zig").Pattern;
 const handler_module = @import("../handlers/handler.zig");
 const route_module = @import("route.zig");
+
+// -----------------------------------------------------------------------------
+// Public router API
+// -----------------------------------------------------------------------------
 
 /// Controls the response when a path matches but its HTTP method does not.
 pub const MethodMismatchPolicy = enum {
@@ -55,6 +62,10 @@ pub fn RouterWithOptions(comptime routes: anytype, comptime options: anytype) ty
         options.method_mismatch
     else
         .not_found;
+    const server_options_headers = [_]Header{.{
+        .name = "allow",
+        .value = serverAllowHeaderValue(routes),
+    }};
 
     return struct {
         /// Returns the matched route's body limit without executing middleware or handlers.
@@ -79,6 +90,13 @@ pub fn RouterWithOptions(comptime routes: anytype, comptime options: anytype) ty
 
         /// Dispatches a request context to the most specific matching route.
         pub fn dispatch(context: anytype) !Response {
+            if (context.request.method == .OPTIONS and isAsteriskTarget(context.request)) {
+                return .{
+                    .status = .no_content,
+                    .headers = .{ .items = &server_options_headers },
+                };
+            }
+
             inline for (0..maximum_specificity + 1) |offset| {
                 const specificity = maximum_specificity - offset;
                 if (try dispatchRoutes(routes, specificity, context.request.method, context)) |response| {
@@ -118,6 +136,10 @@ pub fn RouterWithOptions(comptime routes: anytype, comptime options: anytype) ty
         }
     };
 }
+
+// -----------------------------------------------------------------------------
+// Compile-time validation and runtime dispatch helpers
+// -----------------------------------------------------------------------------
 
 fn validateTuple(comptime routes: anytype) void {
     const routes_info = switch (@typeInfo(@TypeOf(routes))) {
@@ -277,10 +299,15 @@ fn automaticResponse(
         if (comptime RoutePattern.static_segment_count != specificity) continue;
 
         if (RoutePattern.match(path) != null) {
-            const allow = allowHeaderValue(routes, route_value.pattern);
+            const Storage = struct {
+                const headers = [_]Header{.{
+                    .name = "allow",
+                    .value = allowHeaderValue(routes, route_value.pattern),
+                }};
+            };
             return .{
                 .status = status,
-                .headers = .{ .items = &.{.{ .name = "allow", .value = allow }} },
+                .headers = .{ .items = &Storage.headers },
             };
         }
     }
@@ -319,6 +346,34 @@ fn hasMethod(
     return false;
 }
 
+fn serverAllowHeaderValue(comptime routes: anytype) []const u8 {
+    comptime var value: []const u8 = "";
+    inline for (routes) |route_value| {
+        if (comptime !containsMethod(value, route_value.method)) {
+            value = comptime appendMethod(value, route_value.method);
+        }
+        if (comptime route_value.method == .GET and !containsMethod(value, .HEAD)) {
+            value = comptime appendMethod(value, .HEAD);
+        }
+    }
+    if (comptime !containsMethod(value, .OPTIONS)) value = comptime appendMethod(value, .OPTIONS);
+    return value;
+}
+
+fn containsMethod(comptime value: []const u8, comptime method: std.http.Method) bool {
+    var tokens = std.mem.splitSequence(u8, value, ", ");
+    while (tokens.next()) |token| {
+        if (std.mem.eql(u8, token, @tagName(method))) return true;
+    }
+    return false;
+}
+
+fn isAsteriskTarget(request: anytype) bool {
+    if (comptime !@hasField(@TypeOf(request), "target")) return false;
+    const target: Target = request.target;
+    return target == .asterisk;
+}
+
 fn appendMethod(comptime value: []const u8, comptime method: std.http.Method) []const u8 {
     return if (value.len == 0)
         @tagName(method)
@@ -333,8 +388,13 @@ fn fallbackResponse(comptime options: anytype, context: anytype) !Response {
     return .{ .status = .not_found };
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 const TestRequest = struct {
     method: std.http.Method,
+    target: Target = .{ .origin = .{ .path = "/", .query = null } },
     path: []const u8,
     query: ?[]const u8 = null,
     body: ?[]const u8 = null,
@@ -593,6 +653,22 @@ test "automatic OPTIONS returns 204 with Allow and skips route middleware" {
     try std.testing.expectEqual(.no_content, response.status);
     try std.testing.expectEqualStrings("POST, GET, HEAD, DELETE, OPTIONS", response.headers.get("allow").?);
     try std.testing.expectEqual(@as(usize, 0), route_calls);
+}
+
+test "OPTIONS asterisk reports methods supported by the server" {
+    const AppRouter = Router(.{
+        route_module.route(.POST, "/items", otherHandler),
+        route_module.route(.GET, "/health", staticHandler),
+    });
+    const context = TestContext{ .request = .{
+        .method = .OPTIONS,
+        .target = .asterisk,
+        .path = "",
+    } };
+    const response = try AppRouter.dispatch(&context);
+
+    try std.testing.expectEqual(.no_content, response.status);
+    try std.testing.expectEqualStrings("POST, GET, HEAD, OPTIONS", response.headers.get("allow").?);
 }
 
 test "Allow preserves explicit order without duplicating HEAD or OPTIONS" {

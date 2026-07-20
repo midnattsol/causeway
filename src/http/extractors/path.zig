@@ -35,6 +35,10 @@ pub fn Path(comptime T: type, comptime name: []const u8) type {
     };
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 const TestParams = struct {
     name: []const u8,
     raw: ?[]const u8,

@@ -1,0 +1,1135 @@
+//! Adapts one TCP stream to Causeway requests, contexts, dispatch, and responses.
+
+const std = @import("std");
+const Header = @import("../../message/headers.zig").Header;
+const Headers = @import("../../message/headers.zig").Headers;
+const context_module = @import("../../context.zig");
+const HttpContext = context_module.Context;
+const Request = @import("../../message/request.zig").Request;
+const RequestBody = @import("../../message/request_body.zig").RequestBody;
+const response_module = @import("../../message/response.zig");
+const Response = response_module.Response;
+const Stream = response_module.Stream;
+const Takeover = response_module.Takeover;
+const extractor_errors = @import("../../extractors/errors.zig");
+const Exchange = @import("../../exchange.zig").Exchange;
+const exchange_adapter = @import("exchange.zig");
+const request_body_adapter = @import("request_body.zig");
+const request_head = @import("request_head.zig");
+const response_writer = @import("response_writer.zig");
+const Io = std.Io;
+const net = Io.net;
+
+// -----------------------------------------------------------------------------
+// Public API
+// -----------------------------------------------------------------------------
+
+/// Selects how an error returned by a handler affects the connection.
+pub const HandlerErrorPolicy = enum {
+    /// Send a generic 500 response and continue when keep-alive permits it.
+    internal_server_error,
+    /// Close the connection and propagate the error to the transport server.
+    propagate,
+};
+
+/// HTTP protocol resources and limits applied to each connection.
+pub const Options = struct {
+    /// Maximum complete request-head size and stream read-buffer capacity.
+    max_header_size: usize = 16 * 1024,
+    /// Maximum buffered request-body size.
+    max_body_size: usize = 1024 * 1024,
+    /// Buffer used while decoding transfer framing such as chunked bodies.
+    transfer_buffer_size: usize = 8 * 1024,
+    /// Buffered socket output capacity.
+    write_buffer_size: usize = 8 * 1024,
+    /// Maximum requests served by one keep-alive connection, or no limit.
+    max_requests: ?usize = null,
+    /// Maximum time to receive the first complete request head.
+    request_head_timeout: ?Io.Duration = null,
+    /// Maximum idle time waiting for the next keep-alive request head.
+    keep_alive_timeout: ?Io.Duration = null,
+    /// Maximum idle duration of each request-body read operation.
+    request_body_timeout: ?Io.Duration = null,
+    /// Default maximum duration for emitting a response.
+    response_write_timeout: ?Io.Duration = null,
+    /// Action taken when application dispatch returns an error.
+    handler_error_policy: HandlerErrorPolicy = .internal_server_error,
+};
+
+pub const ConfigurationError = error{
+    InvalidHeaderSize,
+    InvalidBodySize,
+    InvalidTransferBufferSize,
+    InvalidWriteBufferSize,
+    InvalidRequestLimit,
+    InvalidRequestHeadTimeout,
+    InvalidKeepAliveTimeout,
+    InvalidRequestBodyTimeout,
+    InvalidResponseWriteTimeout,
+};
+
+/// Returns a connection-handler type specialized for application state and a dispatcher.
+///
+/// `Dispatcher` must expose `dispatch(*const http.Context(State)) !Response`.
+/// The handler owns no state: it borrows `state`, while each call to `handle`
+/// owns and closes its accepted stream.
+pub fn Handler(comptime State: type, comptime Dispatcher: type) type {
+    return HandlerType(State, null, Dispatcher);
+}
+
+/// Returns a connection handler whose contexts include typed request locals.
+pub fn HandlerWithLocals(
+    comptime State: type,
+    comptime Locals: type,
+    comptime Dispatcher: type,
+) type {
+    return HandlerType(State, Locals, Dispatcher);
+}
+
+// -----------------------------------------------------------------------------
+// Connection lifecycle
+// -----------------------------------------------------------------------------
+
+fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher: type) type {
+    return struct {
+        allocator: std.mem.Allocator,
+        state: *State,
+        options: Options = .{},
+
+        const Self = @This();
+        const Context = if (Locals) |RequestLocals|
+            context_module.ContextWithLocals(State, RequestLocals)
+        else
+            HttpContext(State);
+
+        pub fn init(allocator: std.mem.Allocator, state: *State, options: Options) Self {
+            return .{
+                .allocator = allocator,
+                .state = state,
+                .options = options,
+            };
+        }
+
+        /// Serves HTTP requests on `stream` until keep-alive ends or an error occurs.
+        /// The stream is closed exactly once when this function returns.
+        pub fn handle(self: *Self, stream: net.Stream, io: Io) !void {
+            defer stream.close(io);
+            try validateOptions(self.options);
+
+            const read_buffer = try self.allocator.alloc(u8, self.options.max_header_size);
+            defer self.allocator.free(read_buffer);
+            const write_buffer = try self.allocator.alloc(u8, self.options.write_buffer_size);
+            defer self.allocator.free(write_buffer);
+
+            var stream_reader = stream.reader(io, read_buffer);
+            var stream_writer = stream.writer(io, write_buffer);
+            try self.serve(&stream_reader.interface, &stream_writer.interface, io);
+        }
+
+        const RequestOutcome = enum { keep_alive, close };
+        const PreparedRequest = union(enum) { request: Request, close };
+
+        fn serve(self: *Self, input: *Io.Reader, output: *Io.Writer, io: Io) !void {
+            try validateOptions(self.options);
+            const transfer_buffer = try self.allocator.alloc(u8, self.options.transfer_buffer_size);
+            defer self.allocator.free(transfer_buffer);
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            var http_server = std.http.Server.init(input, output);
+            var request_count: usize = 0;
+
+            while (true) {
+                const outcome = try self.serveRequest(
+                    &http_server,
+                    output,
+                    io,
+                    transfer_buffer,
+                    arena.allocator(),
+                    request_count,
+                );
+                if (outcome == .close) return;
+                request_count += 1;
+                _ = arena.reset(.retain_capacity);
+            }
+        }
+
+        fn serveRequest(
+            self: *Self,
+            http_server: *std.http.Server,
+            output: *Io.Writer,
+            io: Io,
+            transfer_buffer: []u8,
+            request_allocator: std.mem.Allocator,
+            completed_requests: usize,
+        ) !RequestOutcome {
+            const head_timeout = if (completed_requests == 0)
+                self.options.request_head_timeout
+            else
+                self.options.keep_alive_timeout orelse self.options.request_head_timeout;
+            var incoming = switch (try request_head.receive(
+                io,
+                http_server,
+                output,
+                head_timeout,
+                completed_requests != 0,
+            )) {
+                .request => |request| request,
+                .close => return .close,
+            };
+            const request_count = completed_requests + 1;
+            const request = switch (try self.prepareRequest(
+                &incoming,
+                request_allocator,
+                transfer_buffer,
+                io,
+            )) {
+                .request => |request| request,
+                .close => return .close,
+            };
+
+            var http1_exchange: exchange_adapter.Adapter = .{
+                .output = output,
+                .version = incoming.head.version,
+            };
+            var exchange = Exchange.borrowed(&http1_exchange);
+            var locals: if (Locals) |RequestLocals| RequestLocals else void = if (Locals != null) .{} else {};
+            const context = if (Locals) |_| Context{
+                .execution = .{ .state = self.state, .allocator = request_allocator, .io = io },
+                .request = request,
+                .locals = &locals,
+                .exchange = &exchange,
+            } else Context{
+                .execution = .{ .state = self.state, .allocator = request_allocator, .io = io },
+                .request = request,
+                .exchange = &exchange,
+            };
+
+            const connection_keep_alive = incoming.head.keep_alive and
+                !requestLimitReached(self.options.max_requests, request_count);
+            var response = Dispatcher.dispatch(&context) catch |err| {
+                const failure = dispatchFailure(err, self.options.handler_error_policy) orelse return err;
+                const keep_alive = connection_keep_alive and requestBodyComplete(request.body);
+                suppressUnusedExpectation(&incoming, request.body);
+                try incoming.respond(failure.body, .{
+                    .version = incoming.head.version,
+                    .status = failure.status,
+                    .keep_alive = keep_alive,
+                });
+                return if (keep_alive) .keep_alive else .close;
+            };
+
+            exchange.beginFinal();
+            if (response.write_deadline == null) {
+                if (self.options.response_write_timeout) |timeout| {
+                    response.write_deadline = .fromNow(io, .{ .raw = timeout, .clock = .awake });
+                }
+            }
+            const body_complete = requestBodyComplete(request.body);
+            suppressUnusedExpectation(&incoming, request.body);
+            const outcome = response_writer.write(
+                io,
+                &incoming,
+                &response,
+                request_allocator,
+                transfer_buffer,
+                .{
+                    .keep_alive = connection_keep_alive and body_complete and response.connection == .keep_alive,
+                    .request_body_complete = body_complete,
+                },
+            ) catch |err| {
+                response.body.finalize();
+                if (response.takeover) |*takeover| takeover.finalize();
+                response.complete(.{ .failure = err });
+                return err;
+            };
+            response.complete(.success);
+            return if (outcome.keep_alive and !outcome.taken_over) .keep_alive else .close;
+        }
+
+        fn prepareRequest(
+            self: *Self,
+            incoming: *std.http.Server.Request,
+            allocator: std.mem.Allocator,
+            transfer_buffer: []u8,
+            io: Io,
+        ) !PreparedRequest {
+            if (!expectationSupported(incoming.head.expect)) {
+                incoming.head.expect = null;
+                try incoming.respond("expectation failed", .{
+                    .version = incoming.head.version,
+                    .status = .expectation_failed,
+                    .keep_alive = false,
+                });
+                return .close;
+            }
+            if (incoming.head.expect) |expect| {
+                if (!std.mem.eql(u8, expect, "100-continue")) incoming.head.expect = "100-continue";
+            }
+
+            const raw = try allocator.dupe(u8, incoming.head.target);
+            const headers = try copyHeaders(incoming, allocator);
+            const body_state = try allocator.create(RequestBody.State);
+            body_state.* = .initAbsent();
+            const request = Request.initVersion(
+                raw,
+                incoming.head.method,
+                switch (incoming.head.version) {
+                    .@"HTTP/1.0" => .http_1_0,
+                    .@"HTTP/1.1" => .http_1_1,
+                },
+                headers,
+                .init(body_state),
+            ) catch {
+                incoming.head.expect = null;
+                try incoming.respond("bad request", .{
+                    .version = incoming.head.version,
+                    .status = .bad_request,
+                    .keep_alive = false,
+                });
+                return .close;
+            };
+            const body_limit = if (requestHasFramedBody(incoming))
+                effectiveBodyLimit(Dispatcher, request.method, request.path, self.options.max_body_size)
+            else
+                self.options.max_body_size;
+            if (incoming.head.transfer_compression == .identity and
+                bodyExceedsKnownLimit(incoming.head.content_length, body_limit))
+            {
+                incoming.head.expect = null;
+                try incoming.respond("request body too large", .{
+                    .version = incoming.head.version,
+                    .status = .payload_too_large,
+                    .keep_alive = false,
+                });
+                return .close;
+            }
+            if (requestHasFramedBody(incoming)) {
+                const adapter = try allocator.create(request_body_adapter.Adapter);
+                adapter.* = .{ .incoming = incoming, .transfer_buffer = transfer_buffer };
+                body_state.* = request_body_adapter.initState(
+                    adapter,
+                    allocator,
+                    body_limit,
+                    io,
+                    self.options.request_body_timeout,
+                );
+            }
+            return .{ .request = request };
+        }
+    };
+}
+
+// -----------------------------------------------------------------------------
+// Connection policy helpers
+// -----------------------------------------------------------------------------
+
+fn validateOptions(options: Options) ConfigurationError!void {
+    if (options.max_header_size == 0) return error.InvalidHeaderSize;
+    if (options.max_body_size == 0) return error.InvalidBodySize;
+    if (options.transfer_buffer_size == 0) return error.InvalidTransferBufferSize;
+    if (options.write_buffer_size == 0) return error.InvalidWriteBufferSize;
+    if (options.max_requests == 0) return error.InvalidRequestLimit;
+    if (options.request_head_timeout) |timeout| {
+        if (timeout.nanoseconds <= 0) return error.InvalidRequestHeadTimeout;
+    }
+    if (options.keep_alive_timeout) |timeout| {
+        if (timeout.nanoseconds <= 0) return error.InvalidKeepAliveTimeout;
+    }
+    if (options.request_body_timeout) |timeout| {
+        if (timeout.nanoseconds <= 0) return error.InvalidRequestBodyTimeout;
+    }
+    if (options.response_write_timeout) |timeout| {
+        if (timeout.nanoseconds <= 0) return error.InvalidResponseWriteTimeout;
+    }
+}
+
+fn copyHeaders(incoming: *const std.http.Server.Request, allocator: std.mem.Allocator) !Headers {
+    var items: std.ArrayList(Header) = .empty;
+    var iterator = incoming.iterateHeaders();
+    while (iterator.next()) |header| {
+        try items.append(allocator, .{
+            .name = try allocator.dupe(u8, header.name),
+            .value = try allocator.dupe(u8, header.value),
+        });
+    }
+    return .{ .items = items.items };
+}
+
+fn requestHasFraming(incoming: *const std.http.Server.Request) bool {
+    return incoming.head.content_length != null or incoming.head.transfer_encoding == .chunked;
+}
+
+fn requestHasFramedBody(incoming: *const std.http.Server.Request) bool {
+    return requestHasFraming(incoming);
+}
+
+fn effectiveBodyLimit(
+    comptime Dispatcher: type,
+    method: std.http.Method,
+    path: []const u8,
+    global_maximum: usize,
+) usize {
+    if (comptime @hasDecl(Dispatcher, "bodyLimit")) {
+        if (Dispatcher.bodyLimit(method, path)) |route_maximum| {
+            return @min(global_maximum, route_maximum);
+        }
+    }
+    return global_maximum;
+}
+
+fn bodyExceedsKnownLimit(content_length: ?u64, maximum: usize) bool {
+    const length = content_length orelse return false;
+    return length > maximum;
+}
+
+fn requestLimitReached(maximum: ?usize, count: usize) bool {
+    return if (maximum) |limit| count >= limit else false;
+}
+
+fn expectationSupported(expect: ?[]const u8) bool {
+    const value = expect orelse return true;
+    return std.ascii.eqlIgnoreCase(value, "100-continue");
+}
+
+fn requestBodyComplete(body: RequestBody) bool {
+    return switch (body.status()) {
+        .absent, .buffered, .consumed => true,
+        .pending, .streaming, .failed => false,
+    };
+}
+
+fn suppressUnusedExpectation(incoming: *std.http.Server.Request, body: RequestBody) void {
+    if (!requestBodyComplete(body)) incoming.head.expect = null;
+}
+
+const DispatchFailure = struct {
+    status: std.http.Status,
+    body: []const u8,
+};
+
+fn dispatchFailure(err: anyerror, policy: HandlerErrorPolicy) ?DispatchFailure {
+    if (err == error.StreamTooLong) {
+        return .{ .status = .payload_too_large, .body = "request body too large" };
+    }
+    if (err == error.HttpExpectationFailed) {
+        return .{ .status = .expectation_failed, .body = "expectation failed" };
+    }
+    if (err == error.RequestBodyTimeout) {
+        return .{ .status = .request_timeout, .body = "request body timeout" };
+    }
+    if (extractor_errors.status(err)) |status| {
+        return .{ .status = status, .body = "bad request" };
+    }
+    return switch (policy) {
+        .internal_server_error => .{
+            .status = .internal_server_error,
+            .body = "internal server error",
+        },
+        .propagate => null,
+    };
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+const SlowInput = struct {
+    io: Io,
+    reader: Io.Reader,
+
+    fn init(io: Io, buffer: []u8, buffered: usize) SlowInput {
+        return .{
+            .io = io,
+            .reader = .{
+                .vtable = &.{ .stream = stream },
+                .buffer = buffer,
+                .seek = 0,
+                .end = buffered,
+            },
+        };
+    }
+
+    fn stream(interface: *Io.Reader, _: *Io.Writer, _: Io.Limit) Io.Reader.StreamError!usize {
+        const self: *SlowInput = @fieldParentPtr("reader", interface);
+        Io.sleep(self.io, .fromSeconds(60), .awake) catch return error.ReadFailed;
+        return error.EndOfStream;
+    }
+};
+
+const TestState = struct {
+    requests: usize = 0,
+    produced: usize = 0,
+    finalized: usize = 0,
+};
+
+const TestProducer = struct {
+    state: *TestState,
+
+    pub fn produce(self: *@This(), writer: *Io.Writer) !void {
+        self.state.produced += 1;
+        try writer.writeAll("streamed");
+    }
+
+    pub fn finalize(self: *@This()) void {
+        self.state.finalized += 1;
+    }
+};
+
+const TrailerTestProducer = struct {
+    pub fn produce(_: *@This(), writer: *Io.Writer) !void {
+        try writer.writeAll("payload");
+    }
+
+    pub fn trailers(_: *@This()) Headers {
+        return .{ .items = &.{.{ .name = "Digest", .value = "sha-256=test" }} };
+    }
+};
+
+const TestTakeover = struct {
+    expected: []const u8,
+    reply: []const u8,
+
+    pub fn run(self: *@This(), input: *Io.Reader, output: *Io.Writer) !void {
+        var buffer: [32]u8 = undefined;
+        if (self.expected.len > buffer.len) return error.TakeoverInputTooLarge;
+        try input.readSliceAll(buffer[0..self.expected.len]);
+        if (!std.mem.eql(u8, buffer[0..self.expected.len], self.expected)) return error.UnexpectedTakeoverInput;
+        try output.writeAll(self.reply);
+        try output.flush();
+    }
+};
+
+const SlowTestProducer = struct {
+    state: *TestState,
+    io: Io,
+
+    pub fn produce(self: *@This(), _: *Io.Writer) !void {
+        try Io.sleep(self.io, .fromSeconds(60), .awake);
+    }
+
+    pub fn finalize(self: *@This()) void {
+        self.state.finalized += 1;
+    }
+};
+
+const TestDispatcher = struct {
+    pub fn bodyLimit(method: std.http.Method, path: []const u8) ?usize {
+        if (method == .POST and std.mem.eql(u8, path, "/limited")) return 5;
+        return null;
+    }
+
+    fn dispatch(context: *const HttpContext(TestState)) !Response {
+        context.execution.state.requests += 1;
+        if (context.request.method == .CONNECT) {
+            const takeover = try Takeover.init(
+                context.execution.allocator,
+                TestTakeover{ .expected = "ping", .reply = "tunneled" },
+            );
+            return Response.tunnel(.ok, .empty, takeover);
+        }
+        if (std.mem.eql(u8, context.request.path, "/fail")) return error.HandlerFailed;
+        if (std.mem.eql(u8, context.request.path, "/bad-request")) return error.InvalidQuery;
+        if (std.mem.eql(u8, context.request.path, "/close")) {
+            return .{ .status = .ok, .body = .{ .bytes = "close" }, .connection = .close };
+        }
+        if (std.mem.eql(u8, context.request.path, "/ignore")) {
+            return .{ .status = .unauthorized, .connection = .close };
+        }
+        if (std.mem.eql(u8, context.request.path, "/not-modified")) {
+            return .{ .status = .not_modified };
+        }
+        if (std.mem.eql(u8, context.request.path, "/reset")) {
+            return .{ .status = .reset_content, .body = .{ .bytes = "must be omitted" } };
+        }
+        if (std.mem.eql(u8, context.request.path, "/early")) {
+            try context.informational(.early_hints, .{ .items = &.{.{
+                .name = "Link",
+                .value = "</app.css>; rel=preload",
+            }} });
+            return .{ .status = .ok, .body = .{ .bytes = "final" } };
+        }
+        if (std.mem.eql(u8, context.request.path, "/unknown-stream")) {
+            return Response.streaming(
+                .ok,
+                .empty,
+                try Stream.init(context.execution.allocator, TestProducer{ .state = context.execution.state }, .{}),
+            );
+        }
+        if (std.mem.eql(u8, context.request.path, "/trailers")) {
+            return Response.streaming(
+                .ok,
+                .{ .items = &.{.{ .name = "content-type", .value = "text/plain" }} },
+                try Stream.init(context.execution.allocator, TrailerTestProducer{}, .{
+                    .trailer_names = &.{"Digest"},
+                }),
+            );
+        }
+        if (std.mem.eql(u8, context.request.path, "/request-trailers")) {
+            _ = try context.request.body.readAll();
+            const trailers = try context.request.body.trailers();
+            return .{ .status = .ok, .body = .{ .bytes = trailers.get("digest") orelse "missing" } };
+        }
+        if (std.mem.eql(u8, context.request.path, "/upgrade")) {
+            const takeover = try Takeover.init(
+                context.execution.allocator,
+                TestTakeover{ .expected = "ping", .reply = "upgraded" },
+            );
+            return Response.upgrade(.empty, "causeway-test", takeover);
+        }
+        if (std.mem.eql(u8, context.request.path, "/slow-stream") or
+            std.mem.eql(u8, context.request.path, "/option-slow-stream"))
+        {
+            const stream = try Stream.init(
+                context.execution.allocator,
+                SlowTestProducer{
+                    .state = context.execution.state,
+                    .io = context.execution.io,
+                },
+                .{},
+            );
+            var response = Response.streaming(.ok, .empty, stream);
+            if (std.mem.eql(u8, context.request.path, "/slow-stream")) {
+                response.write_deadline = .fromNow(context.execution.io, .{
+                    .raw = .fromMilliseconds(1),
+                    .clock = .awake,
+                });
+            }
+            return response;
+        }
+        if (std.mem.eql(u8, context.request.path, "/stream") or
+            std.mem.eql(u8, context.request.path, "/no-content-stream"))
+        {
+            const stream = try Stream.init(
+                context.execution.allocator,
+                TestProducer{ .state = context.execution.state },
+                .{ .content_length = "streamed".len },
+            );
+            return Response.streaming(
+                if (std.mem.eql(u8, context.request.path, "/stream")) .ok else .no_content,
+                .empty,
+                stream,
+            );
+        }
+        return .{
+            .status = .ok,
+            .headers = .{ .items = &.{.{ .name = "x-causeway", .value = "test" }} },
+            .body = .{ .bytes = (try context.request.body.readAll()) orelse context.request.path },
+        };
+    }
+};
+
+fn gzipTestBytes(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var output: Io.Writer.Allocating = try .initCapacity(allocator, 64);
+    defer output.deinit();
+    var history: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&output.writer, &history, .gzip, .default);
+    try compressor.writer.writeAll(bytes);
+    try compressor.finish();
+    return output.toOwnedSlice();
+}
+
+fn serveTest(input_bytes: []const u8, options: Options, state: *TestState) ![]u8 {
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    var input = Io.Reader.fixed(input_bytes);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    errdefer output.deinit();
+
+    var handler = Handler(TestState, TestDispatcher).init(std.testing.allocator, state, options);
+    try handler.serve(&input, &output.writer, threaded.io());
+    return output.toOwnedSlice();
+}
+
+test "HandlerWithLocals creates fresh default-initialized locals for a request" {
+    const Locals = struct { request_id: []const u8 = "" };
+    const LocalDispatcher = struct {
+        pub fn dispatch(context: anytype) error{}!Response {
+            std.debug.assert(context.locals.request_id.len == 0);
+            context.locals.request_id = "request-local";
+            return .{ .status = .ok, .body = .{ .bytes = context.locals.request_id } };
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var input = Io.Reader.fixed("GET / HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n");
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: TestState = .{};
+    var handler = HandlerWithLocals(TestState, Locals, LocalDispatcher).init(
+        std.testing.allocator,
+        &state,
+        .{},
+    );
+
+    try handler.serve(&input, &output.writer, threaded.io());
+    try std.testing.expect(std.mem.endsWith(u8, output.written(), "request-local"));
+}
+
+test "connection dispatches a request and writes its response" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "GET /hello HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqual(@as(usize, 1), state.requests);
+    try std.testing.expect(std.mem.find(u8, output, "HTTP/1.1 200 OK") != null);
+    try std.testing.expect(std.mem.find(u8, output, "x-causeway: test") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "/hello"));
+}
+
+test "connection emits informational responses before the final response" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "GET /early HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    const early = std.mem.find(u8, output, "HTTP/1.1 103 Early Hints") orelse return error.MissingEarlyHints;
+    const final = std.mem.find(u8, output, "HTTP/1.1 200 OK") orelse return error.MissingFinalResponse;
+    try std.testing.expect(early < final);
+    try std.testing.expect(std.mem.find(u8, output, "Link: </app.css>; rel=preload") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "final"));
+}
+
+test "connection writes and receives chunked trailers" {
+    var response_state: TestState = .{};
+    const response_output = try serveTest(
+        "GET /trailers HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &response_state,
+    );
+    defer std.testing.allocator.free(response_output);
+
+    try std.testing.expect(std.mem.find(u8, response_output, "trailer: Digest") != null);
+    try std.testing.expect(std.mem.find(u8, response_output, "payload") != null);
+    try std.testing.expect(std.mem.find(u8, response_output, "0\r\nDigest: sha-256=test\r\n\r\n") != null);
+
+    var request_state: TestState = .{};
+    const request_output = try serveTest(
+        "POST /request-trailers HTTP/1.1\r\nhost: example.com\r\ntransfer-encoding: chunked\r\ntrailer: Digest\r\nconnection: close\r\n\r\n" ++
+            "7\r\npayload\r\n0\r\nDigest: sha-256=request\r\n\r\n",
+        .{},
+        &request_state,
+    );
+    defer std.testing.allocator.free(request_output);
+    try std.testing.expect(std.mem.endsWith(u8, request_output, "sha-256=request"));
+}
+
+test "connection transfers control after Upgrade and CONNECT handshakes" {
+    var upgrade_state: TestState = .{};
+    const upgrade_output = try serveTest(
+        "GET /upgrade HTTP/1.1\r\nhost: example.com\r\nconnection: upgrade\r\nupgrade: causeway-test\r\n\r\nping",
+        .{},
+        &upgrade_state,
+    );
+    defer std.testing.allocator.free(upgrade_output);
+    try std.testing.expect(std.mem.find(u8, upgrade_output, "101 Switching Protocols") != null);
+    try std.testing.expect(std.mem.find(u8, upgrade_output, "connection: upgrade") != null);
+    try std.testing.expect(std.mem.endsWith(u8, upgrade_output, "upgraded"));
+
+    var tunnel_state: TestState = .{};
+    const tunnel_output = try serveTest(
+        "CONNECT example.com:443 HTTP/1.1\r\nhost: example.com:443\r\n\r\nping",
+        .{},
+        &tunnel_state,
+    );
+    defer std.testing.allocator.free(tunnel_output);
+    try std.testing.expect(std.mem.find(u8, tunnel_output, "200 OK") != null);
+    try std.testing.expect(std.mem.find(u8, tunnel_output, "content-length") == null);
+    try std.testing.expect(std.mem.endsWith(u8, tunnel_output, "tunneled"));
+}
+
+test "connection reads a bounded request body" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "POST /echo HTTP/1.1\r\nhost: example.com\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello",
+        .{ .max_body_size = 5 },
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqual(@as(usize, 1), state.requests);
+    try std.testing.expect(std.mem.endsWith(u8, output, "hello"));
+}
+
+test "connection decodes gzip request content before enforcing the body limit" {
+    const compressed = try gzipTestBytes(std.testing.allocator, "hello");
+    defer std.testing.allocator.free(compressed);
+    var request: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer request.deinit();
+    try request.writer.print(
+        "POST /echo HTTP/1.1\r\nhost: example.com\r\ncontent-encoding: gzip\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n",
+        .{compressed.len},
+    );
+    try request.writer.writeAll(compressed);
+
+    var state: TestState = .{};
+    const output = try serveTest(request.written(), .{ .max_body_size = 5 }, &state);
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.find(u8, output, "200 OK") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "hello"));
+}
+
+test "connection streams responses and finalizes their producers" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "GET /stream HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.endsWith(u8, output, "streamed"));
+    try std.testing.expectEqual(@as(usize, 1), state.produced);
+    try std.testing.expectEqual(@as(usize, 1), state.finalized);
+}
+
+test "204 and 304 preserve keep-alive without body framing" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "GET /no-content-stream HTTP/1.1\r\nhost: example.com\r\n\r\n" ++
+            "GET /not-modified HTTP/1.1\r\nhost: example.com\r\n\r\n" ++
+            "GET /next HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    const second_start = std.mem.findPosLinear(u8, output, 1, "HTTP/1.1") orelse
+        return error.MissingSecondResponse;
+    const third_start = std.mem.findPosLinear(u8, output, second_start + 1, "HTTP/1.1") orelse
+        return error.MissingThirdResponse;
+    const no_content = output[0..second_start];
+    const not_modified = output[second_start..third_start];
+
+    try std.testing.expect(std.mem.find(u8, no_content, "204 No Content") != null);
+    try std.testing.expect(std.mem.find(u8, not_modified, "304 Not Modified") != null);
+    try std.testing.expect(std.mem.find(u8, no_content, "content-length") == null);
+    try std.testing.expect(std.mem.find(u8, no_content, "transfer-encoding") == null);
+    try std.testing.expect(std.mem.find(u8, not_modified, "content-length") == null);
+    try std.testing.expect(std.mem.find(u8, not_modified, "transfer-encoding") == null);
+    try std.testing.expectEqual(@as(usize, 3), state.requests);
+}
+
+test "HTTP 205 suppresses content and uses an explicit zero length" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "GET /reset HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.find(u8, output, "205 Reset Content") != null);
+    try std.testing.expect(std.mem.find(u8, output, "content-length: 0") != null);
+    try std.testing.expect(std.mem.find(u8, output, "must be omitted") == null);
+}
+
+test "HTTP 1.0 responses preserve the version and close-delimit unknown streams" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "GET /unknown-stream HTTP/1.0\r\nhost: example.com\r\nconnection: keep-alive\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.startsWith(u8, output, "HTTP/1.0 200 OK"));
+    try std.testing.expect(std.mem.find(u8, output, "transfer-encoding") == null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "streamed"));
+}
+
+test "unsupported HTTP versions receive 505" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "GET / HTTP/2.0\r\nhost: example.com\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.find(u8, output, "505 HTTP Version Not Supported") != null);
+}
+
+test "connection request-head and keep-alive phase timeouts cancel blocked reads" {
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(4));
+    const io = threaded.io();
+    var state: TestState = .{};
+    var handler = Handler(TestState, TestDispatcher).init(std.testing.allocator, &state, .{
+        .request_head_timeout = .fromMilliseconds(1),
+        .keep_alive_timeout = .fromMilliseconds(1),
+    });
+
+    var empty_buffer: [256]u8 = undefined;
+    var blocked_head = SlowInput.init(io, &empty_buffer, 0);
+    var head_output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer head_output.deinit();
+    try std.testing.expectError(
+        error.RequestHeadTimeout,
+        handler.serve(&blocked_head.reader, &head_output.writer, io),
+    );
+
+    const first_request = "GET / HTTP/1.1\r\nhost: example.com\r\n\r\n";
+    var keep_alive_buffer: [256]u8 = undefined;
+    @memcpy(keep_alive_buffer[0..first_request.len], first_request);
+    var blocked_keep_alive = SlowInput.init(io, &keep_alive_buffer, first_request.len);
+    var keep_alive_output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer keep_alive_output.deinit();
+    try std.testing.expectError(
+        error.KeepAliveTimeout,
+        handler.serve(&blocked_keep_alive.reader, &keep_alive_output.writer, io),
+    );
+    try std.testing.expect(std.mem.find(u8, keep_alive_output.written(), "200 OK") != null);
+}
+
+test "connection request-body idle timeout becomes 408" {
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(4));
+    const io = threaded.io();
+    const head = "POST /echo HTTP/1.1\r\nhost: example.com\r\ncontent-length: 5\r\n\r\n";
+    var input_buffer: [256]u8 = undefined;
+    @memcpy(input_buffer[0..head.len], head);
+    var input = SlowInput.init(io, &input_buffer, head.len);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: TestState = .{};
+    var handler = Handler(TestState, TestDispatcher).init(std.testing.allocator, &state, .{
+        .request_body_timeout = .fromMilliseconds(1),
+    });
+
+    try handler.serve(&input.reader, &output.writer, io);
+    try std.testing.expect(std.mem.find(u8, output.written(), "408 Request Timeout") != null);
+}
+
+test "default response-write timeout cancels and finalizes a slow stream" {
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(4));
+    const io = threaded.io();
+    var input = Io.Reader.fixed(
+        "GET /option-slow-stream HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+    );
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: TestState = .{};
+    var handler = Handler(TestState, TestDispatcher).init(std.testing.allocator, &state, .{
+        .response_write_timeout = .fromMilliseconds(1),
+    });
+
+    try std.testing.expectError(error.ResponseTimeout, handler.serve(&input, &output.writer, io));
+    try std.testing.expectEqual(@as(usize, 1), state.finalized);
+}
+
+test "connection deadline cancels and finalizes a slow response stream" {
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(2));
+    var input = Io.Reader.fixed(
+        "GET /slow-stream HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+    );
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: TestState = .{};
+    var handler = Handler(TestState, TestDispatcher).init(std.testing.allocator, &state, .{});
+
+    try std.testing.expectError(
+        error.ResponseTimeout,
+        handler.serve(&input, &output.writer, threaded.io()),
+    );
+    try std.testing.expectEqual(@as(usize, 1), state.finalized);
+}
+
+test "HEAD and bodyless statuses skip production but finalize streams" {
+    var head_state: TestState = .{};
+    const head_output = try serveTest(
+        "HEAD /stream HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &head_state,
+    );
+    defer std.testing.allocator.free(head_output);
+    try std.testing.expect(std.mem.find(u8, head_output, "content-length: 8") != null);
+    try std.testing.expect(std.mem.find(u8, head_output, "transfer-encoding") == null);
+    try std.testing.expect(!std.mem.endsWith(u8, head_output, "streamed"));
+    try std.testing.expectEqual(@as(usize, 0), head_state.produced);
+    try std.testing.expectEqual(@as(usize, 1), head_state.finalized);
+
+    var no_content_state: TestState = .{};
+    const no_content_output = try serveTest(
+        "GET /no-content-stream HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &no_content_state,
+    );
+    defer std.testing.allocator.free(no_content_output);
+    try std.testing.expect(std.mem.find(u8, no_content_output, "204 No Content") != null);
+    try std.testing.expect(std.mem.find(u8, no_content_output, "content-length") == null);
+    try std.testing.expect(std.mem.find(u8, no_content_output, "transfer-encoding") == null);
+    try std.testing.expect(!std.mem.endsWith(u8, no_content_output, "streamed"));
+    try std.testing.expectEqual(@as(usize, 0), no_content_state.produced);
+    try std.testing.expectEqual(@as(usize, 1), no_content_state.finalized);
+}
+
+test "unread Expect body is rejected without sending 100 Continue" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "POST /ignore HTTP/1.1\r\nhost: example.com\r\ncontent-length: 7\r\nexpect: 100-continue\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.find(u8, output, "401 Unauthorized") != null);
+    try std.testing.expect(std.mem.find(u8, output, "100 Continue") == null);
+    try std.testing.expect(std.mem.find(u8, output, "connection: close") != null);
+}
+
+test "mixed-case 100-continue is normalized before lazy body reads" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "POST /echo HTTP/1.1\r\nhost: example.com\r\ncontent-length: 5\r\nexpect: 100-Continue\r\nconnection: close\r\n\r\nhello",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.find(u8, output, "100 Continue") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "hello"));
+}
+
+test "framed request bodies are available independently of the method" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "DELETE /echo HTTP/1.1\r\nhost: example.com\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.find(u8, output, "200 OK") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "hello"));
+    try std.testing.expectEqual(@as(usize, 1), state.requests);
+}
+
+test "unsupported request content codings return 415" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "POST /echo HTTP/1.1\r\nhost: example.com\r\ncontent-encoding: magic\r\ncontent-length: 1\r\n\r\nx",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.find(u8, output, "415 Unsupported Media Type") != null);
+    try std.testing.expectEqual(@as(usize, 0), state.requests);
+}
+
+test "connection rejects unsupported expectations" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "POST /ignore HTTP/1.1\r\nhost: example.com\r\ncontent-length: 1\r\nexpect: magic\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.find(u8, output, "417 Expectation Failed") != null);
+    try std.testing.expectEqual(@as(usize, 0), state.requests);
+}
+
+test "connection applies a stricter route body limit before dispatch" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "POST /limited HTTP/1.1\r\nhost: example.com\r\ncontent-length: 6\r\nexpect: 100-continue\r\n\r\nhello!",
+        .{ .max_body_size = 100 },
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqual(@as(usize, 0), state.requests);
+    try std.testing.expect(std.mem.find(u8, output, "413 Payload Too Large") != null);
+    try std.testing.expect(std.mem.find(u8, output, "100 Continue") == null);
+}
+
+test "connection rejects a known oversized body before dispatch" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "POST /echo HTTP/1.1\r\nhost: example.com\r\ncontent-length: 6\r\n\r\nhello!",
+        .{ .max_body_size = 5 },
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqual(@as(usize, 0), state.requests);
+    try std.testing.expect(std.mem.find(u8, output, "413 Payload Too Large") != null);
+}
+
+test "response can close a keep-alive connection before the next request" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "GET /close HTTP/1.1\r\nhost: example.com\r\n\r\n" ++
+            "GET /never HTTP/1.1\r\nhost: example.com\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqual(@as(usize, 1), state.requests);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "HTTP/1.1 200 OK"));
+    try std.testing.expect(std.mem.find(u8, output, "connection: close") != null);
+}
+
+test "connection serves multiple keep-alive requests" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "GET /one HTTP/1.1\r\nhost: example.com\r\n\r\n" ++
+            "GET /two HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqual(@as(usize, 2), state.requests);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, output, "HTTP/1.1 200 OK"));
+}
+
+test "connection converts handler errors to internal server errors" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "GET /fail HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.find(u8, output, "500 Internal Server Error") != null);
+}
+
+test "connection converts extractor failures to bad requests" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "GET /bad-request HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.find(u8, output, "400 Bad Request") != null);
+}
+
+test "connection returns bad request for malformed input" {
+    var state: TestState = .{};
+    const output = try serveTest("not http\r\n\r\n", .{}, &state);
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqual(@as(usize, 0), state.requests);
+    try std.testing.expect(std.mem.find(u8, output, "400 Bad Request") != null);
+}

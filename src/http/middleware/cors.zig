@@ -1,8 +1,8 @@
 //! Cross-Origin Resource Sharing middleware.
 
 const std = @import("std");
-const Headers = @import("../headers.zig").Headers;
-const Response = @import("../response.zig").Response;
+const Headers = @import("../message/headers.zig").Headers;
+const Response = @import("../message/response.zig").Response;
 const header_helpers = @import("header_helpers.zig");
 
 /// Compile-time CORS policy. Origin and method matching is exact; requested
@@ -238,6 +238,10 @@ fn join(comptime values: []const []const u8) [joinedLength(values)]u8 {
     }
     return result;
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 const TestContext = struct {
     execution: struct { allocator: std.mem.Allocator },

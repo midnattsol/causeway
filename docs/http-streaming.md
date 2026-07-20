@@ -90,7 +90,9 @@ const route = causeway.http.routing.route
     .withBodyLimit(8 * 1024 * 1024);
 ```
 
-Known oversized `Content-Length` values are rejected before dispatch. Chunked or unknown-length bodies are counted during reads. `100 Continue` is emitted only on the first real read; authentication, rate limiting, or another early rejection can return a final response without requesting the upload.
+Known oversized identity `Content-Length` values are rejected before dispatch. Chunked, compressed, or unknown-length bodies are counted during reads. Request `Content-Encoding` values `gzip`, `deflate`, and `zstd` are decoded lazily while streaming, and limits apply to decompressed bytes. Unsupported content codings return `415`. `100 Continue` is emitted only on the first real read; authentication, rate limiting, or another early rejection can return a final response without requesting the upload.
+
+After a chunked body reaches EOF, `context.request.body.trailers()` returns validated request trailers copied into request-owned memory. Access before complete consumption fails.
 
 ## Response bodies
 
@@ -140,7 +142,9 @@ fn stream(context: *const AppContext) !causeway.http.response.Response {
 }
 ```
 
-When `content_length` is omitted, Causeway uses HTTP/1.1 chunked transfer encoding. The producer is invoked once for the whole response, not once per chunk.
+When `content_length` is omitted, Causeway uses HTTP/1.1 chunked transfer encoding. HTTP/1.0 falls back to a close-delimited stream and disables keep-alive. The producer is invoked once for the whole response, not once per chunk.
+
+A producer can advertise `Stream.Options.trailer_names` and implement `trailers()` to emit validated fields after a chunked body. Trailers are forbidden with a known content length and with HTTP/1.0.
 
 ### Producer cleanup
 

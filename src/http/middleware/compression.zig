@@ -6,8 +6,8 @@
 //! implementation until the standard library provides a zstd compressor.
 
 const std = @import("std");
-const Headers = @import("../headers.zig").Headers;
-const response_mod = @import("../response.zig");
+const Headers = @import("../message/headers.zig").Headers;
+const response_mod = @import("../message/response.zig");
 const Response = response_mod.Response;
 const ResponseBody = response_mod.ResponseBody;
 const Stream = response_mod.Stream;
@@ -328,6 +328,10 @@ fn compressGzip(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     try compressor.finish();
     return output.toOwnedSlice();
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 const TestRequestHeaders = struct {
     accept_encoding: ?[]const u8,

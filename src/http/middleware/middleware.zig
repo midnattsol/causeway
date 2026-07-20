@@ -1,7 +1,7 @@
 //! Compile-time contract validation for HTTP middleware types.
 
 const std = @import("std");
-const Response = @import("../response.zig").Response;
+const Response = @import("../message/response.zig").Response;
 
 const Problem = enum {
     not_type,
@@ -67,6 +67,10 @@ const WrongCount = struct {
 const WrongReturn = struct {
     pub fn handle(_: usize, _: usize) void {}
 };
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 test "middleware validation accepts the static handle contract" {
     validate(Valid);

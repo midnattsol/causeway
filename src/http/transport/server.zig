@@ -1,13 +1,14 @@
-//! Coordinates the one-shot HTTP server lifecycle, hot listener management,
-//! connection admission, graceful shutdown, and listener failure policies.
-//! This module owns transport-level tasks and accounting; request parsing and
-//! response handling remain the responsibility of `connection.zig`.
+//! Coordinates TCP listener lifecycle, connection admission, graceful shutdown,
+//! and listener failure policies. Wire parsing and response handling remain the
+//! responsibility of the selected protocol driver.
 
 const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 
+// -----------------------------------------------------------------------------
 // Public API
+// -----------------------------------------------------------------------------
 
 /// A server-assigned, opaque listener identifier.
 pub const ListenerId = enum(u64) { _ };
@@ -186,7 +187,9 @@ pub const ServerStatus = struct {
     shutdown_timeout: ?Io.Duration,
 };
 
+// -----------------------------------------------------------------------------
 // Internal state
+// -----------------------------------------------------------------------------
 
 const Listener = struct {
     id: ListenerId,
@@ -224,7 +227,9 @@ const Listener = struct {
     }
 };
 
+// -----------------------------------------------------------------------------
 // Controller messages
+// -----------------------------------------------------------------------------
 
 const Completion = struct {
     done: Io.Event = .unset,
@@ -985,7 +990,9 @@ pub const Server = struct {
     }
 };
 
+// -----------------------------------------------------------------------------
 // Tests
+// -----------------------------------------------------------------------------
 
 fn testAddress(port: u16) net.IpAddress {
     return .{ .ip4 = net.Ip4Address.loopback(port) };

@@ -1,8 +1,8 @@
 //! Static HTTP handler invocation with context and typed extractors.
 
 const std = @import("std");
-const Response = @import("../response.zig").Response;
-const RequestBody = @import("../request_body.zig").RequestBody;
+const Response = @import("../message/response.zig").Response;
+const RequestBody = @import("../message/request_body.zig").RequestBody;
 const signature = @import("signature.zig");
 
 /// Validates and invokes a handler using the supplied context.
@@ -32,6 +32,10 @@ pub fn invoke(comptime handler: anytype, context: anytype) !Response {
 
     return @call(.auto, handler, args);
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 const TestContext = struct {
     fail: bool = false,
@@ -80,7 +84,7 @@ const Header = @import("../extractors/header.zig").Header;
 const Query = @import("../extractors/query.zig").Query;
 const Body = @import("../extractors/body.zig").Body;
 const State = @import("../extractors/state.zig").State;
-const Headers = @import("../headers.zig").Headers;
+const Headers = @import("../message/headers.zig").Headers;
 const Params = @import("../routing/params.zig").Params;
 
 const ExtractedQuery = struct {

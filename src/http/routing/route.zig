@@ -1,7 +1,7 @@
 //! Statically typed HTTP route definitions and route-local middleware.
 
 const std = @import("std");
-const Response = @import("../response.zig").Response;
+const Response = @import("../message/response.zig").Response;
 const handler = @import("../handlers/handler.zig");
 const middleware_chain = @import("../middleware/chain.zig");
 
@@ -90,6 +90,10 @@ pub fn withMiddleware(comptime route_value: anytype, comptime middlewares: anyty
 pub fn withBodyLimit(comptime route_value: anytype, comptime maximum: usize) @TypeOf(route_value.withBodyLimit(maximum)) {
     return route_value.withBodyLimit(maximum);
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 const TestContext = struct {
     events: *std.ArrayList(u8),

@@ -1,9 +1,9 @@
 //! Bearer-token authentication middleware.
 
 const std = @import("std");
-const Response = @import("../response.zig").Response;
+const Response = @import("../message/response.zig").Response;
 
-const unauthorized_headers = @import("../headers.zig").Headers{ .items = &.{
+const unauthorized_headers = @import("../message/headers.zig").Headers{ .items = &.{
     .{ .name = "www-authenticate", .value = "Bearer" },
 } };
 
@@ -48,7 +48,11 @@ fn unauthorized() Response {
     return .{ .status = .unauthorized, .headers = unauthorized_headers };
 }
 
-const Headers = @import("../headers.zig").Headers;
+const Headers = @import("../message/headers.zig").Headers;
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 const TestContext = struct {
     request: struct { headers: Headers },
     verifier_called: bool = false,

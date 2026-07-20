@@ -1,7 +1,7 @@
 //! Zero-allocation compile-time middleware composition.
 
 const std = @import("std");
-const Response = @import("../response.zig").Response;
+const Response = @import("../message/response.zig").Response;
 const middleware = @import("middleware.zig");
 
 /// Returns a dispatcher that wraps `Dispatcher` in `middlewares`.
@@ -77,6 +77,10 @@ fn validateTuple(comptime middlewares: anytype) void {
 fn validateAll(comptime middlewares: anytype) void {
     inline for (middlewares) |Middleware| middleware.validate(Middleware);
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 const TestContext = struct {
     events: *std.ArrayList(u8),

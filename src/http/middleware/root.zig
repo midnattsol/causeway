@@ -14,6 +14,7 @@ pub const timeout = @import("timeout.zig");
 pub const compression = @import("compression.zig");
 pub const rate_limit = @import("rate_limit.zig");
 pub const etag = @import("etag.zig");
+pub const conditional = @import("conditional.zig");
 pub const session = @import("session.zig");
 pub const csrf = @import("csrf.zig");
 
@@ -29,11 +30,12 @@ pub const Compression = compression.Compression;
 pub const RateLimit = rate_limit.RateLimit;
 pub const RateLimitDecision = rate_limit.Decision;
 pub const ETag = etag.ETag;
+pub const Conditional = conditional.Conditional;
 pub const Session = session.Session;
 pub const Csrf = csrf.Csrf;
 
-const Response = @import("../response.zig").Response;
-const Headers = @import("../headers.zig").Headers;
+const Response = @import("../message/response.zig").Response;
+const Headers = @import("../message/headers.zig").Headers;
 
 const IntegrationContext = struct {
     execution: struct { allocator: std.mem.Allocator },
@@ -122,6 +124,10 @@ test "built-in middleware compose in one static chain" {
     try std.testing.expectEqual(.service_unavailable, mapped.status);
     try std.testing.expectEqualStrings("nosniff", mapped.headers.get("x-content-type-options").?);
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 test {
     std.testing.refAllDecls(@This());

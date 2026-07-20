@@ -126,6 +126,10 @@ fn isParameter(segment: []const u8) bool {
     return segment.len > 0 and segment[0] == ':';
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 test "Pattern matches root and exact static paths" {
     const Root = Pattern("/");
     const Health = Pattern("/health");

@@ -3,17 +3,84 @@
 const std = @import("std");
 const Io = std.Io;
 
+const Headers = @import("headers.zig").Headers;
+
+// -----------------------------------------------------------------------------
+// Public API and lifecycle
+// -----------------------------------------------------------------------------
+
+/// Protocol adapter for lazy body activation and optional trailers.
+pub const Source = struct {
+    context: *anyopaque,
+    activate_fn: *const fn (*anyopaque, std.mem.Allocator) anyerror!*Io.Reader,
+    trailers_fn: ?*const fn (*anyopaque, std.mem.Allocator) anyerror!Headers = null,
+
+    pub fn borrowed(adapter: anytype) Source {
+        const Pointer = @TypeOf(adapter);
+        const pointer = switch (@typeInfo(Pointer)) {
+            .pointer => |info| info,
+            else => @compileError("request body source must be a mutable single-item pointer"),
+        };
+        if (pointer.size != .one or pointer.attrs.@"const") {
+            @compileError("request body source must be a mutable single-item pointer");
+        }
+        const Adapter = pointer.child;
+        if (!@hasDecl(Adapter, "activate")) {
+            @compileError("request body source must declare activate(allocator)");
+        }
+        const Bridge = struct {
+            fn activate(raw: *anyopaque, allocator: std.mem.Allocator) anyerror!*Io.Reader {
+                const typed: *Adapter = @ptrCast(@alignCast(raw));
+                return typed.activate(allocator);
+            }
+
+            fn trailers(raw: *anyopaque, allocator: std.mem.Allocator) anyerror!Headers {
+                const typed: *Adapter = @ptrCast(@alignCast(raw));
+                return typed.trailers(allocator);
+            }
+        };
+        return .{
+            .context = adapter,
+            .activate_fn = Bridge.activate,
+            .trailers_fn = if (@hasDecl(Adapter, "trailers")) Bridge.trailers else null,
+        };
+    }
+
+    pub fn fromReader(reader: *Io.Reader) Source {
+        return .{
+            .context = reader,
+            .activate_fn = struct {
+                fn activate(raw: *anyopaque, _: std.mem.Allocator) anyerror!*Io.Reader {
+                    return @ptrCast(@alignCast(raw));
+                }
+            }.activate,
+        };
+    }
+
+    fn activate(self: Source, allocator: std.mem.Allocator) !*Io.Reader {
+        return self.activate_fn(self.context, allocator);
+    }
+
+    fn trailers(self: Source, allocator: std.mem.Allocator) !Headers {
+        const trailers_fn = self.trailers_fn orelse return .empty;
+        return trailers_fn(self.context, allocator);
+    }
+};
+
 /// A small copyable handle to request-scoped mutable body state.
 ///
 /// Copies share claims, cached bytes, failures, and consumption through the
-/// internal pointer. The pointed-to `State`, transfer buffer, incoming request,
-/// and allocator must all remain valid for the request lifetime.
+/// internal pointer. The pointed-to `State`, source adapter, and allocator must
+/// all remain valid for the request lifetime.
 pub const RequestBody = struct {
     state: *State,
 
     /// Mutable request-scoped storage shared by every `RequestBody` copy.
     pub const State = struct {
         status: Status,
+        source: ?Source = null,
+        allocator: ?std.mem.Allocator = null,
+        trailers_cache: ?Headers = null,
 
         pub const Status = union(enum) {
             absent,
@@ -28,20 +95,25 @@ pub const RequestBody = struct {
             return .{ .status = .absent };
         }
 
-        /// Creates a lazy body backed by Zig's HTTP server request.
-        /// `readerExpectContinue` is not called until bytes are first read.
+        /// Creates a lazy body backed by a protocol-specific source.
         pub fn initPending(
-            incoming: *std.http.Server.Request,
+            source: Source,
             allocator: std.mem.Allocator,
-            transfer_buffer: []u8,
             maximum: usize,
+            io: Io,
+            read_timeout: ?Io.Duration,
         ) State {
-            return .{ .status = .{ .pending = .{
-                .source = .{ .server = incoming },
+            return .{
+                .status = .{ .pending = .{
+                    .source = source,
+                    .allocator = allocator,
+                    .maximum = maximum,
+                    .io = io,
+                    .read_timeout = read_timeout,
+                } },
+                .source = source,
                 .allocator = allocator,
-                .transfer_buffer = transfer_buffer,
-                .maximum = maximum,
-            } } };
+            };
         }
 
         /// Creates a body whose bytes are already buffered in request-owned memory.
@@ -51,32 +123,33 @@ pub const RequestBody = struct {
 
         /// Creates a lazy body from an already-created reader.
         ///
-        /// This is useful for adapters and tests which do not use
-        /// `std.http.Server.Request`; no Expect handling is performed.
+        /// This is useful for protocol adapters and tests with an existing reader.
         pub fn initReader(
             reader: *Io.Reader,
             allocator: std.mem.Allocator,
             maximum: usize,
         ) State {
-            return .{ .status = .{ .pending = .{
-                .source = .{ .reader = reader },
+            const source = Source.fromReader(reader);
+            return .{
+                .status = .{ .pending = .{
+                    .source = source,
+                    .allocator = allocator,
+                    .maximum = maximum,
+                    .io = null,
+                    .read_timeout = null,
+                } },
+                .source = source,
                 .allocator = allocator,
-                .transfer_buffer = &.{},
-                .maximum = maximum,
-            } } };
+            };
         }
-    };
-
-    const Source = union(enum) {
-        server: *std.http.Server.Request,
-        reader: *Io.Reader,
     };
 
     const Pending = struct {
         source: Source,
         allocator: std.mem.Allocator,
-        transfer_buffer: []u8,
         maximum: usize,
+        io: ?Io,
+        read_timeout: ?Io.Duration,
     };
 
     const Streaming = struct {
@@ -111,10 +184,7 @@ pub const RequestBody = struct {
                     self.state.status = .{ .failed = err };
                     return err;
                 };
-                const bytes = reader.allocRemaining(
-                    pending.allocator,
-                    readAllLimit(pending.maximum),
-                ) catch |err| {
+                const bytes = readRemaining(reader, pending) catch |err| {
                     self.state.status = .{ .failed = err };
                     return err;
                 };
@@ -150,6 +220,23 @@ pub const RequestBody = struct {
     /// Consumes and discards a pending body without allocating, allowing the
     /// connection to remain reusable. A stream already claimed elsewhere
     /// remains exclusive and cannot be discarded through this handle.
+    /// Returns request trailers after the body has been fully consumed.
+    /// Trailer names and values are copied into request-owned memory.
+    pub fn trailers(self: RequestBody) !Headers {
+        switch (self.state.status) {
+            .absent => return .empty,
+            .buffered, .consumed => {},
+            .pending, .streaming => return error.BodyNotConsumed,
+            .failed => |err| return err,
+        }
+        if (self.state.trailers_cache) |headers| return headers;
+        const source = self.state.source orelse return .empty;
+        const allocator = self.state.allocator orelse return .empty;
+        const headers = try source.trailers(allocator);
+        self.state.trailers_cache = headers;
+        return headers;
+    }
+
     pub fn discard(self: RequestBody) !void {
         switch (self.state.status) {
             .absent, .buffered, .consumed => return,
@@ -204,7 +291,7 @@ pub const BodyStream = struct {
 
                 if (stream.read_count == stream.pending.maximum) {
                     var probe: [1]u8 = undefined;
-                    const n = source_reader.readSliceShort(&probe) catch |err| {
+                    const n = readSource(source_reader, &probe, stream.pending) catch |err| {
                         self.state.status = .{ .failed = err };
                         return err;
                     };
@@ -217,7 +304,7 @@ pub const BodyStream = struct {
                 }
 
                 const remaining = stream.pending.maximum - stream.read_count;
-                const n = source_reader.readSliceShort(buffer[0..@min(buffer.len, remaining)]) catch |err| {
+                const n = readSource(source_reader, buffer[0..@min(buffer.len, remaining)], stream.pending) catch |err| {
                     self.state.status = .{ .failed = err };
                     return err;
                 };
@@ -273,16 +360,75 @@ pub const BodyReader = struct {
     }
 };
 
+// -----------------------------------------------------------------------------
+// Source activation, timed reads, and trailer validation
+// -----------------------------------------------------------------------------
+
 fn activate(pending: RequestBody.Pending) !*Io.Reader {
-    return switch (pending.source) {
-        .server => |incoming| try incoming.readerExpectContinue(pending.transfer_buffer),
-        .reader => |reader| reader,
+    return pending.source.activate(pending.allocator);
+}
+
+fn readRemaining(reader: *Io.Reader, pending: RequestBody.Pending) ![]u8 {
+    if (pending.read_timeout == null) {
+        return reader.allocRemaining(pending.allocator, readAllLimit(pending.maximum));
+    }
+
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(pending.allocator);
+    var buffer: [4096]u8 = undefined;
+    while (bytes.items.len <= pending.maximum) {
+        const remaining = if (pending.maximum == std.math.maxInt(usize))
+            std.math.maxInt(usize) - bytes.items.len
+        else
+            pending.maximum + 1 - bytes.items.len;
+        const n = try readSource(reader, buffer[0..@min(buffer.len, remaining)], pending);
+        if (n == 0) break;
+        try bytes.appendSlice(pending.allocator, buffer[0..n]);
+    }
+    return bytes.toOwnedSlice(pending.allocator);
+}
+
+fn readSource(reader: *Io.Reader, buffer: []u8, pending: RequestBody.Pending) !usize {
+    const duration = pending.read_timeout orelse return reader.readSliceShort(buffer);
+    const io = pending.io orelse return reader.readSliceShort(buffer);
+    const Result = union(enum) {
+        read: anyerror!usize,
+        timeout: anyerror!void,
     };
+    const Runner = struct {
+        fn run(source: *Io.Reader, destination: []u8) anyerror!usize {
+            return source.readSliceShort(destination);
+        }
+    };
+    var results: [2]Result = undefined;
+    var select = Io.Select(Result).init(io, &results);
+    select.async(.read, Runner.run, .{ reader, buffer });
+    select.async(.timeout, waitForBodyTimeout, .{ io, duration });
+    const result = select.await() catch |err| {
+        select.cancelDiscard();
+        return err;
+    };
+    defer select.cancelDiscard();
+    return switch (result) {
+        .read => |read_result| try read_result,
+        .timeout => |timeout_result| blk: {
+            try timeout_result;
+            break :blk error.RequestBodyTimeout;
+        },
+    };
+}
+
+fn waitForBodyTimeout(io: Io, duration: Io.Duration) anyerror!void {
+    try Io.sleep(io, duration, .awake);
 }
 
 fn readAllLimit(maximum: usize) Io.Limit {
     return if (maximum == std.math.maxInt(usize)) .unlimited else .limited(maximum + 1);
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 test "RequestBody is a one-pointer shared handle and caches buffered bytes" {
     try std.testing.expectEqual(@sizeOf(*anyopaque), @sizeOf(RequestBody));

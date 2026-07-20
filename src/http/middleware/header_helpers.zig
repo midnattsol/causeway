@@ -1,7 +1,7 @@
 //! Private response-header mutation helpers used by built-in middleware.
 
 const std = @import("std");
-const headers_module = @import("../headers.zig");
+const headers_module = @import("../message/headers.zig");
 
 const Header = headers_module.Header;
 pub const Headers = headers_module.Headers;
@@ -67,6 +67,10 @@ pub fn isManaged(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "content-length") or
         std.ascii.eqlIgnoreCase(name, "transfer-encoding");
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 test "set replaces case-insensitively and preserves unrelated borrowed headers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

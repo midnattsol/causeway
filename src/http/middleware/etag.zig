@@ -1,8 +1,8 @@
 //! Strong response ETag generation and `If-None-Match` handling.
 
 const std = @import("std");
-const Headers = @import("../headers.zig").Headers;
-const response_module = @import("../response.zig");
+const Headers = @import("../message/headers.zig").Headers;
+const response_module = @import("../message/response.zig");
 const Response = response_module.Response;
 const Stream = response_module.Stream;
 const header_helpers = @import("header_helpers.zig");
@@ -139,6 +139,10 @@ fn skipToComma(value: []const u8, cursor: *usize) void {
     while (cursor.* < value.len and value[cursor.*] != ',') cursor.* += 1;
     if (cursor.* < value.len) cursor.* += 1;
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 const TestContext = struct {
     execution: struct { allocator: std.mem.Allocator },

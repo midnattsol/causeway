@@ -2,9 +2,10 @@
 
 const std = @import("std");
 const CoreContext = @import("../core/context.zig").Context;
-const Request = @import("request.zig").Request;
-const RequestBody = @import("request_body.zig").RequestBody;
+const Request = @import("message/request.zig").Request;
+const RequestBody = @import("message/request_body.zig").RequestBody;
 const Params = @import("routing/params.zig").Params;
+const Exchange = @import("exchange.zig").Exchange;
 
 /// Returns the HTTP handler-context type for an application's `State`.
 ///
@@ -20,6 +21,14 @@ pub fn Context(comptime State: type) type {
 
         /// Path parameters extracted by routing, or an empty view.
         params: Params = .empty,
+
+        /// Request-scoped protocol control supplied by a live connection.
+        exchange: ?*Exchange = null,
+
+        pub fn informational(self: *const @This(), status: std.http.Status, headers: @import("message/headers.zig").Headers) !void {
+            const exchange = self.exchange orelse return error.ExchangeUnavailable;
+            return exchange.informational(status, headers);
+        }
     };
 }
 
@@ -35,8 +44,18 @@ pub fn ContextWithLocals(comptime State: type, comptime Locals: type) type {
         request: Request,
         params: Params = .empty,
         locals: *Locals,
+        exchange: ?*Exchange = null,
+
+        pub fn informational(self: *const @This(), status: std.http.Status, headers: @import("message/headers.zig").Headers) !void {
+            const exchange = self.exchange orelse return error.ExchangeUnavailable;
+            return exchange.informational(status, headers);
+        }
     };
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 test "HTTP Context carries execution state and request data" {
     const AppState = struct {

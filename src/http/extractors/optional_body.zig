@@ -1,7 +1,7 @@
 //! Optional buffered raw HTTP request-body extraction.
 
 const std = @import("std");
-const RequestBody = @import("../request_body.zig").RequestBody;
+const RequestBody = @import("../message/request_body.zig").RequestBody;
 
 /// Lazily extracts and caches the complete raw body when one is present.
 pub const OptionalBody = struct {
@@ -15,6 +15,10 @@ pub const OptionalBody = struct {
         return .{ .value = try body.readAll() };
     }
 };
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 fn testContext(body: RequestBody) struct { request: struct { body: RequestBody } } {
     return .{ .request = .{ .body = body } };

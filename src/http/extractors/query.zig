@@ -94,6 +94,10 @@ fn parseStruct(comptime T: type, raw_query: []const u8, allocator: std.mem.Alloc
     return result;
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 fn testContext(query: ?[]const u8, allocator: std.mem.Allocator) struct {
     request: struct { query: ?[]const u8 },
     execution: struct { allocator: std.mem.Allocator },

@@ -13,6 +13,10 @@ const Io = std.Io;
 const net = Io.net;
 const testing = std.testing;
 
+// -----------------------------------------------------------------------------
+// Test infrastructure
+// -----------------------------------------------------------------------------
+
 const max_response_size = 1024 * 1024;
 const server_options: server_module.ServerOptions = .{
     .connection_timeout = .fromSeconds(5),
@@ -267,6 +271,10 @@ fn cookiePair(set_cookie: []const u8) []const u8 {
     return set_cookie[0..end];
 }
 
+// -----------------------------------------------------------------------------
+// Typed routing, middleware, and extractors
+// -----------------------------------------------------------------------------
+
 const FlowState = struct {
     called: usize = 0,
     id: u32 = 0,
@@ -351,6 +359,10 @@ test "end-to-end app composes request id, route auth, router, and typed extracto
     try testing.expect(state.header_ok and state.body_ok and state.local_ok);
 }
 
+// -----------------------------------------------------------------------------
+// Keep-alive and request admission
+// -----------------------------------------------------------------------------
+
 const KeepAliveState = struct { count: usize = 0 };
 
 fn keepAliveHandler(state: extractors.State(KeepAliveState)) Response {
@@ -429,6 +441,10 @@ test "end-to-end route body limit rejects Expect request before 100 Continue" {
     try testing.expectEqual(@as(usize, 0), state.handler_calls);
 }
 
+// -----------------------------------------------------------------------------
+// ETags and compression
+// -----------------------------------------------------------------------------
+
 const EncodingState = struct {};
 const encoding_body =
     "Causeway compression integration payload. " ++
@@ -490,6 +506,10 @@ test "end-to-end ETag outside gzip hashes encoded bytes and returns 304" {
 
 const SessionValue = struct { count: usize };
 const SessionLocals = struct { session: ?SessionValue = null };
+// -----------------------------------------------------------------------------
+// Sessions and CSRF
+// -----------------------------------------------------------------------------
+
 const SessionState = struct {
     stored: ?SessionValue = null,
     loads: usize = 0,
@@ -597,6 +617,10 @@ test "end-to-end session and CSRF cookies round-trip through sequential requests
     try testing.expectEqual(@as(usize, 2), state.saves);
     try testing.expectEqual(@as(usize, 2), state.stored.?.count);
 }
+
+// -----------------------------------------------------------------------------
+// Request and response streaming
+// -----------------------------------------------------------------------------
 
 const StreamingState = struct {
     request_bytes: usize = 0,
@@ -709,6 +733,10 @@ test "end-to-end request and response bodies stream through the real connection"
     try testing.expectEqual(@as(usize, 2), state.completed_responses);
     try testing.expect(state.completion_param_ok);
 }
+
+// -----------------------------------------------------------------------------
+// Unknown-length and compressed streams
+// -----------------------------------------------------------------------------
 
 const UnknownStreamState = struct {
     stream_calls: usize = 0,
@@ -905,6 +933,10 @@ test "end-to-end chunked BodyStream exceeding route limit returns 413 and closes
     try testing.expectEqual(@as(usize, 0), state.completed_responses);
 }
 
+// -----------------------------------------------------------------------------
+// Graceful shutdown with active streams
+// -----------------------------------------------------------------------------
+
 const ShutdownStreamState = struct {
     started: Io.Event = .unset,
     block: Io.Event = .unset,
@@ -994,6 +1026,10 @@ test "graceful shutdown times out and cancels an active long stream without live
     try testing.expectEqual(@as(usize, 1), state.producer_calls.load(.acquire));
     try testing.expectEqual(@as(usize, 1), state.finalize_calls.load(.acquire));
 }
+
+// -----------------------------------------------------------------------------
+// Files, ranges, and conditional requests
+// -----------------------------------------------------------------------------
 
 const FileState = struct { dir: Io.Dir };
 const FileContext = causeway.http.context.Context(FileState);
@@ -1085,6 +1121,19 @@ test "end-to-end file responses support sendfile ranges validators and HEAD" {
     try testing.expect(partial.header("content-encoding") == null);
     try testing.expectEqualStrings("\"asset-v1\"", partial.header("etag").?);
 
+    const multipart_raw = try rawRequest(
+        testing.allocator,
+        io,
+        harness.address,
+        "GET /asset HTTP/1.1\r\nHost: localhost\r\nRange: bytes=0-1,8-9\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
+    );
+    defer testing.allocator.free(multipart_raw);
+    const multipart = try parseResponse(multipart_raw, 0);
+    try testing.expectEqual(@as(u16, 206), multipart.status);
+    try testing.expect(std.mem.startsWith(u8, multipart.header("content-type").?, "multipart/byteranges; boundary="));
+    try testing.expect(std.mem.find(u8, multipart.body, "content-range: bytes 0-1/10\r\n\r\n01") != null);
+    try testing.expect(std.mem.find(u8, multipart.body, "content-range: bytes 8-9/10\r\n\r\n89") != null);
+
     const unsatisfied_raw = try rawRequest(
         testing.allocator,
         io,
@@ -1127,6 +1176,17 @@ test "end-to-end file responses support sendfile ranges validators and HEAD" {
     const if_range = try parseResponse(if_range_raw, 0);
     try testing.expectEqual(@as(u16, 200), if_range.status);
     try testing.expectEqualStrings("0123456789", if_range.body);
+
+    const options_raw = try rawRequest(
+        testing.allocator,
+        io,
+        harness.address,
+        "OPTIONS * HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    defer testing.allocator.free(options_raw);
+    const options = try parseResponse(options_raw, 0);
+    try testing.expectEqual(@as(u16, 204), options.status);
+    try testing.expectEqualStrings("GET, HEAD, OPTIONS", options.header("allow").?);
 
     const head_raw = try rawRequest(
         testing.allocator,
