@@ -7,6 +7,7 @@ pub const query = @import("query.zig");
 pub const body = @import("body.zig");
 pub const optional_body = @import("optional_body.zig");
 pub const body_stream = @import("body_stream.zig");
+pub const form = @import("form.zig");
 pub const header = @import("header.zig");
 pub const state = @import("state.zig");
 pub const errors = @import("errors.zig");
@@ -19,6 +20,7 @@ pub const Header = header.Header;
 pub const Body = body.Body;
 pub const OptionalBody = optional_body.OptionalBody;
 pub const BodyStream = body_stream.BodyStream;
+pub const Form = form.Form;
 pub const State = state.State;
 pub const Local = local.Local;
 

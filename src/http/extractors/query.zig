@@ -1,7 +1,7 @@
 //! Raw and typed HTTP query-string extraction.
 
 const std = @import("std");
-const value = @import("value.zig");
+const url_encoded = @import("url_encoded.zig");
 
 /// Returns an extractor for either a raw query string (`[]const u8`) or a
 /// struct populated from URL-encoded `key=value` pairs.
@@ -10,7 +10,7 @@ const value = @import("value.zig");
 /// known duplicate keys fail, and optional fields default to `null`. Percent
 /// escapes and `+` are decoded with the execution allocator only when needed.
 pub fn Query(comptime T: type) type {
-    validateQueryType(T);
+    if (T != []const u8) url_encoded.validateType(T, "Query");
 
     return struct {
         value: T,
@@ -23,75 +23,19 @@ pub fn Query(comptime T: type) type {
             }
 
             return .{
-                .value = try parseStruct(
+                .value = url_encoded.parseStruct(
                     T,
                     context.request.query orelse "",
                     context.execution.allocator,
-                ),
+                ) catch |err| switch (err) {
+                    error.MissingField => return error.MissingQueryField,
+                    error.DuplicateField => return error.DuplicateQueryField,
+                    error.InvalidEncoding, error.InvalidValue => return error.InvalidQuery,
+                    error.OutOfMemory => return err,
+                },
             };
         }
     };
-}
-
-fn validateQueryType(comptime T: type) void {
-    if (T == []const u8) return;
-
-    const info = switch (@typeInfo(T)) {
-        .@"struct" => |struct_info| struct_info,
-        else => @compileError("Query supports only []const u8 or a struct"),
-    };
-    if (info.is_tuple) @compileError("Query does not support tuple structs");
-
-    inline for (info.field_types) |FieldType| {
-        value.validate(FieldType, "Query struct fields");
-    }
-}
-
-fn parseStruct(comptime T: type, raw_query: []const u8, allocator: std.mem.Allocator) !T {
-    const info = @typeInfo(T).@"struct";
-    var result: T = undefined;
-    var seen: [info.field_names.len]bool = @splat(false);
-
-    inline for (info.field_names, info.field_types, info.field_attrs) |field_name, FieldType, attributes| {
-        if (attributes.defaultValue(FieldType)) |default_value| {
-            @field(result, field_name) = default_value;
-        } else if (@typeInfo(FieldType) == .optional) {
-            @field(result, field_name) = null;
-        }
-    }
-
-    var pairs = std.mem.splitScalar(u8, raw_query, '&');
-    while (pairs.next()) |pair| {
-        const separator = std.mem.findScalar(u8, pair, '=');
-        const encoded_key = if (separator) |index| pair[0..index] else pair;
-        const encoded_value = if (separator) |index| pair[index + 1 ..] else "";
-        const key = value.percentDecode(encoded_key, allocator, true) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return error.InvalidQuery,
-        };
-        const raw_value = value.percentDecode(encoded_value, allocator, true) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return error.InvalidQuery,
-        };
-
-        inline for (info.field_names, info.field_types, 0..) |field_name, FieldType, field_index| {
-            if (std.mem.eql(u8, key, field_name)) {
-                if (seen[field_index]) return error.DuplicateQueryField;
-                seen[field_index] = true;
-                @field(result, field_name) = value.parse(FieldType, raw_value) catch return error.InvalidQuery;
-            }
-        }
-    }
-
-    inline for (info.field_types, info.field_attrs, 0..) |FieldType, attributes, field_index| {
-        if (!seen[field_index] and
-            @typeInfo(FieldType) != .optional and
-            attributes.defaultValue(FieldType) == null)
-        {
-            return error.MissingQueryField;
-        }
-    }
-    return result;
 }
 
 // -----------------------------------------------------------------------------

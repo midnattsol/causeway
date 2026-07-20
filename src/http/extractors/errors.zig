@@ -13,6 +13,10 @@ pub const Error = error{
     MissingQueryField,
     DuplicateQueryField,
     InvalidQuery,
+    MissingFormField,
+    DuplicateFormField,
+    InvalidForm,
+    UnsupportedMediaType,
 };
 
 /// Returns the HTTP status for a request-extraction error, or `null` when the
@@ -28,7 +32,11 @@ pub fn status(err: anyerror) ?std.http.Status {
         error.MissingQueryField,
         error.DuplicateQueryField,
         error.InvalidQuery,
+        error.MissingFormField,
+        error.DuplicateFormField,
+        error.InvalidForm,
         => .bad_request,
+        error.UnsupportedMediaType => .unsupported_media_type,
         else => null,
     };
 }
