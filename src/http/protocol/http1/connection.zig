@@ -40,8 +40,20 @@ pub const HandlerErrorPolicy = enum {
 pub const Options = struct {
     /// Maximum complete request-head size and stream read-buffer capacity.
     max_header_size: usize = 16 * 1024,
-    /// Maximum buffered request-body size.
+    /// Maximum request-line size, excluding CRLF.
+    max_request_line_size: usize = 8 * 1024,
+    /// Maximum number of request header fields.
+    max_header_count: usize = 100,
+    /// Maximum request header-name size.
+    max_header_name_size: usize = 256,
+    /// Maximum request header-value size after optional whitespace is trimmed.
+    max_header_value_size: usize = 8 * 1024,
+    /// Maximum decoded request-body size. Route limits may reduce it further.
     max_body_size: usize = 1024 * 1024,
+    /// Maximum number of request trailer fields.
+    max_trailer_count: usize = 32,
+    /// Maximum total request-trailer wire size.
+    max_trailer_size: usize = 8 * 1024,
     /// Buffer used while decoding transfer framing such as chunked bodies.
     transfer_buffer_size: usize = 8 * 1024,
     /// Buffered socket output capacity.
@@ -64,7 +76,13 @@ pub const Options = struct {
 
 pub const ConfigurationError = error{
     InvalidHeaderSize,
+    InvalidRequestLineSize,
+    InvalidHeaderCount,
+    InvalidHeaderNameSize,
+    InvalidHeaderValueSize,
     InvalidBodySize,
+    InvalidTrailerCount,
+    InvalidTrailerSize,
     InvalidTransferBufferSize,
     InvalidWriteBufferSize,
     InvalidRequestLimit,
@@ -177,6 +195,12 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 http_server,
                 output,
                 request_allocator,
+                .{
+                    .request_line_size = self.options.max_request_line_size,
+                    .header_count = self.options.max_header_count,
+                    .header_name_size = self.options.max_header_name_size,
+                    .header_value_size = self.options.max_header_value_size,
+                },
                 self.options.automatic_date,
                 head_timeout,
                 completed_requests != 0,
@@ -309,7 +333,12 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
             if (requestHasFramedBody(incoming)) {
                 const adapter = try allocator.create(request_body_adapter.Adapter);
-                adapter.* = .{ .incoming = incoming, .transfer_buffer = transfer_buffer };
+                adapter.* = .{
+                    .incoming = incoming,
+                    .transfer_buffer = transfer_buffer,
+                    .max_trailer_count = self.options.max_trailer_count,
+                    .max_trailer_size = self.options.max_trailer_size,
+                };
                 body_state.* = request_body_adapter.initState(
                     adapter,
                     allocator,
@@ -351,7 +380,19 @@ fn respondGeneratedError(
 
 fn validateOptions(options: Options) ConfigurationError!void {
     if (options.max_header_size == 0) return error.InvalidHeaderSize;
+    if (options.max_request_line_size == 0 or options.max_request_line_size > options.max_header_size) {
+        return error.InvalidRequestLineSize;
+    }
+    if (options.max_header_count == 0) return error.InvalidHeaderCount;
+    if (options.max_header_name_size == 0 or options.max_header_name_size > options.max_header_size) {
+        return error.InvalidHeaderNameSize;
+    }
+    if (options.max_header_value_size == 0 or options.max_header_value_size > options.max_header_size) {
+        return error.InvalidHeaderValueSize;
+    }
     if (options.max_body_size == 0) return error.InvalidBodySize;
+    if (options.max_trailer_count == 0) return error.InvalidTrailerCount;
+    if (options.max_trailer_size == 0) return error.InvalidTrailerSize;
     if (options.transfer_buffer_size == 0) return error.InvalidTransferBufferSize;
     if (options.write_buffer_size == 0) return error.InvalidWriteBufferSize;
     if (options.max_requests == 0) return error.InvalidRequestLimit;
@@ -442,6 +483,12 @@ fn dispatchFailure(err: anyerror, policy: HandlerErrorPolicy) ?DispatchFailure {
     }
     if (err == error.RequestBodyTimeout) {
         return .{ .status = .request_timeout, .body = "request body timeout" };
+    }
+    if (err == error.TrailersTooLarge or err == error.TooManyTrailers) {
+        return .{ .status = .request_header_fields_too_large, .body = "request trailers too large" };
+    }
+    if (err == error.InvalidTrailer or err == error.ForbiddenTrailer) {
+        return .{ .status = .bad_request, .body = "invalid request trailers" };
     }
     if (extractor_errors.status(err)) |status| {
         return .{ .status = status, .body = "bad request" };
@@ -757,6 +804,21 @@ test "connection writes and receives chunked trailers" {
     try std.testing.expect(std.mem.endsWith(u8, request_output, "sha-256=request"));
 }
 
+test "request trailer limits are enforced after body consumption" {
+    const request = "POST /request-trailers HTTP/1.1\r\nhost: example.com\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n" ++
+        "1\r\nx\r\n0\r\nDigest: first\r\nX-Other: second\r\n\r\n";
+
+    var count_state: TestState = .{};
+    const count_output = try serveTest(request, .{ .max_trailer_count = 1 }, &count_state);
+    defer std.testing.allocator.free(count_output);
+    try std.testing.expect(std.mem.find(u8, count_output, "431 Request Header Fields Too Large") != null);
+
+    var size_state: TestState = .{};
+    const size_output = try serveTest(request, .{ .max_trailer_size = 8 }, &size_state);
+    defer std.testing.allocator.free(size_output);
+    try std.testing.expect(std.mem.find(u8, size_output, "431 Request Header Fields Too Large") != null);
+}
+
 test "connection transfers control after Upgrade and CONNECT handshakes" {
     var upgrade_state: TestState = .{};
     const upgrade_output = try serveTest(
@@ -880,6 +942,41 @@ test "HTTP 1.0 responses preserve the version and close-delimit unknown streams"
     try std.testing.expect(std.mem.startsWith(u8, output, "HTTP/1.0 200 OK"));
     try std.testing.expect(std.mem.find(u8, output, "transfer-encoding") == null);
     try std.testing.expect(std.mem.endsWith(u8, output, "streamed"));
+}
+
+test "granular request-head limits return specific protocol errors" {
+    var state: TestState = .{};
+    const long_line = try serveTest(
+        "GET /long HTTP/1.1\r\nhost: example.com\r\n\r\n",
+        .{ .max_request_line_size = 8 },
+        &state,
+    );
+    defer std.testing.allocator.free(long_line);
+    try std.testing.expect(std.mem.find(u8, long_line, "414 URI Too Long") != null);
+
+    const too_many = try serveTest(
+        "GET / HTTP/1.1\r\nhost: example.com\r\nx-test: value\r\n\r\n",
+        .{ .max_header_count = 1 },
+        &state,
+    );
+    defer std.testing.allocator.free(too_many);
+    try std.testing.expect(std.mem.find(u8, too_many, "431 Request Header Fields Too Large") != null);
+
+    const long_name = try serveTest(
+        "GET / HTTP/1.1\r\nhost: example.com\r\n\r\n",
+        .{ .max_header_name_size = 3 },
+        &state,
+    );
+    defer std.testing.allocator.free(long_name);
+    try std.testing.expect(std.mem.find(u8, long_name, "431 Request Header Fields Too Large") != null);
+
+    const long_value = try serveTest(
+        "GET / HTTP/1.1\r\nhost: example.com\r\n\r\n",
+        .{ .max_header_value_size = 5 },
+        &state,
+    );
+    defer std.testing.allocator.free(long_value);
+    try std.testing.expect(std.mem.find(u8, long_value, "431 Request Header Fields Too Large") != null);
 }
 
 test "responses generate Date without overriding an explicit field" {

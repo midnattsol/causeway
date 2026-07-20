@@ -23,6 +23,7 @@ pub fn receive(
     server: *std.http.Server,
     output: *Io.Writer,
     allocator: std.mem.Allocator,
+    limits: validation.Limits,
     automatic_date: bool,
     timeout: ?Io.Duration,
     keep_alive: bool,
@@ -39,12 +40,19 @@ pub fn receive(
         },
         else => return err,
     };
-    const validated = validation.validate(head_buffer) catch |err| {
-        const status: std.http.Status = if (err == error.UnsupportedHttpVersion)
-            .http_version_not_supported
-        else
-            .bad_request;
-        const body = if (err == error.UnsupportedHttpVersion) "HTTP version not supported" else "bad request";
+    const validated = validation.validateWithLimits(head_buffer, limits) catch |err| {
+        const status: std.http.Status = switch (err) {
+            error.UnsupportedHttpVersion => .http_version_not_supported,
+            error.RequestLineTooLong => .uri_too_long,
+            error.TooManyHeaders, error.HeaderNameTooLong, error.HeaderValueTooLong => .request_header_fields_too_large,
+            error.InvalidRequestHead => .bad_request,
+        };
+        const body = switch (status) {
+            .http_version_not_supported => "HTTP version not supported",
+            .uri_too_long => "request line too long",
+            .request_header_fields_too_large => "request headers too large",
+            else => "bad request",
+        };
         try writeProtocolError(io, output, automatic_date, status, body);
         return .close;
     };

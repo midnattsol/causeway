@@ -10,6 +10,8 @@ const Io = std.Io;
 pub const Adapter = struct {
     incoming: *std.http.Server.Request,
     transfer_buffer: []u8,
+    max_trailer_count: usize,
+    max_trailer_size: usize,
 
     pub fn activate(self: *Adapter, allocator: std.mem.Allocator) !*Io.Reader {
         try self.incoming.writeExpectContinue();
@@ -27,13 +29,17 @@ pub const Adapter = struct {
     }
 
     pub fn trailers(self: *Adapter, allocator: std.mem.Allocator) !Headers {
-        var lines = std.mem.splitSequence(u8, self.incoming.server.reader.trailers, "\r\n");
+        const raw = self.incoming.server.reader.trailers;
+        if (raw.len > self.max_trailer_size) return error.TrailersTooLarge;
+        var lines = std.mem.splitSequence(u8, raw, "\r\n");
         var items: std.ArrayList(Header) = .empty;
         while (lines.next()) |line| {
             if (line.len == 0) break;
+            if (items.items.len == self.max_trailer_count) return error.TooManyTrailers;
             const colon = std.mem.findScalar(u8, line, ':') orelse return error.InvalidTrailer;
             const name = line[0..colon];
             const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            if (!validToken(name) or !validFieldValue(value)) return error.InvalidTrailer;
             if (forbiddenTrailer(name)) return error.ForbiddenTrailer;
             try items.append(allocator, .{
                 .name = try allocator.dupe(u8, name),
@@ -58,6 +64,25 @@ pub fn initState(
         io,
         read_timeout,
     );
+}
+
+fn validToken(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and
+            byte != '!' and byte != '#' and byte != '$' and byte != '%' and
+            byte != '&' and byte != '\'' and byte != '*' and byte != '+' and
+            byte != '-' and byte != '.' and byte != '^' and byte != '_' and
+            byte != '`' and byte != '|' and byte != '~') return false;
+    }
+    return true;
+}
+
+fn validFieldValue(value: []const u8) bool {
+    for (value) |byte| {
+        if ((byte < 0x20 and byte != '\t') or byte == 0x7f) return false;
+    }
+    return true;
 }
 
 fn forbiddenTrailer(name: []const u8) bool {

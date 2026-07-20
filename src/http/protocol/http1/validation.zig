@@ -2,33 +2,62 @@
 
 const std = @import("std");
 
+pub const Limits = struct {
+    request_line_size: usize,
+    header_count: usize,
+    header_name_size: usize,
+    header_value_size: usize,
+};
+
 pub const Result = struct {
     connection_close: bool = false,
     connection_keep_alive: bool = false,
 };
 
-pub const Error = error{ InvalidRequestHead, UnsupportedHttpVersion };
+pub const Error = error{
+    InvalidRequestHead,
+    UnsupportedHttpVersion,
+    RequestLineTooLong,
+    TooManyHeaders,
+    HeaderNameTooLong,
+    HeaderValueTooLong,
+};
 
 pub fn validate(head: []const u8) Error!Result {
+    return validateWithLimits(head, .{
+        .request_line_size = std.math.maxInt(usize),
+        .header_count = std.math.maxInt(usize),
+        .header_name_size = std.math.maxInt(usize),
+        .header_value_size = std.math.maxInt(usize),
+    });
+}
+
+pub fn validateWithLimits(head: []const u8, limits: Limits) Error!Result {
     if (!std.mem.endsWith(u8, head, "\r\n\r\n")) return error.InvalidRequestHead;
 
     var lines = std.mem.splitSequence(u8, head, "\r\n");
     const request_line = lines.next() orelse return error.InvalidRequestHead;
+    if (request_line.len > limits.request_line_size) return error.RequestLineTooLong;
     const version = try validateRequestLine(request_line);
 
     var host_count: usize = 0;
     var has_content_length = false;
     var has_transfer_encoding = false;
     var result: Result = .{};
+    var header_count: usize = 0;
 
     while (lines.next()) |line| {
         if (line.len == 0) break;
+        header_count += 1;
+        if (header_count > limits.header_count) return error.TooManyHeaders;
         if (line[0] == ' ' or line[0] == '\t') return error.InvalidRequestHead;
 
         const colon = std.mem.findScalar(u8, line, ':') orelse return error.InvalidRequestHead;
         const name = line[0..colon];
+        if (name.len > limits.header_name_size) return error.HeaderNameTooLong;
         if (!validToken(name)) return error.InvalidRequestHead;
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (value.len > limits.header_value_size) return error.HeaderValueTooLong;
         if (!validFieldValue(value)) return error.InvalidRequestHead;
 
         if (std.ascii.eqlIgnoreCase(name, "host")) {
@@ -130,6 +159,30 @@ test "validation rejects whitespace and invalid field names" {
         "GET / HTTP/1.1\r\nBad(Name): value\r\nHost: example.com\r\n\r\n",
     };
     for (invalid) |head| try std.testing.expectError(error.InvalidRequestHead, validate(head));
+}
+
+test "validation enforces granular line and field limits" {
+    const head = "GET /long HTTP/1.1\r\nHost: example.com\r\nX-Test: value\r\n\r\n";
+    const generous: Limits = .{
+        .request_line_size = 18,
+        .header_count = 2,
+        .header_name_size = 6,
+        .header_value_size = 11,
+    };
+    _ = try validateWithLimits(head, generous);
+
+    var limits = generous;
+    limits.request_line_size -= 1;
+    try std.testing.expectError(error.RequestLineTooLong, validateWithLimits(head, limits));
+    limits = generous;
+    limits.header_count -= 1;
+    try std.testing.expectError(error.TooManyHeaders, validateWithLimits(head, limits));
+    limits = generous;
+    limits.header_name_size -= 1;
+    try std.testing.expectError(error.HeaderNameTooLong, validateWithLimits(head, limits));
+    limits = generous;
+    limits.header_value_size -= 1;
+    try std.testing.expectError(error.HeaderValueTooLong, validateWithLimits(head, limits));
 }
 
 test "validation recognizes Connection tokens" {
