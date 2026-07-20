@@ -15,6 +15,7 @@ pub const handlers = @import("handlers/root.zig");
 pub const extractors = @import("extractors/root.zig");
 pub const middleware = @import("middleware/root.zig");
 pub const files = @import("files.zig");
+pub const sse = @import("sse.zig");
 
 // Convenient module aliases for application code.
 pub const headers = message.headers;

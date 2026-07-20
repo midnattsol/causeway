@@ -73,6 +73,13 @@ test "public HTTP API exposes request and response bodies" {
     try std.testing.expect(true);
 }
 
+test "public HTTP API exposes streaming event responses" {
+    _ = causeway.http.sse.Event;
+    _ = causeway.http.sse.response;
+    _ = causeway.http.sse.writeEvent;
+    try std.testing.expect(true);
+}
+
 test "public HTTP API exposes files ranges and conditional requests" {
     _ = causeway.http.files.response;
     _ = causeway.http.files.FileBody;

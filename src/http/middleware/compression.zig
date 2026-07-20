@@ -239,6 +239,9 @@ fn parseQuality(value: []const u8) ?u16 {
 }
 
 fn eligible(comptime options: Options, method: Method, response: Response) bool {
+    if (response.headers.get("content-type")) |content_type| {
+        if (startsWithIgnoreCase(content_type, "text/event-stream")) return false;
+    }
     switch (response.body) {
         .empty => return false,
         .bytes => |bytes| if (bytes.len < options.minimum_size) return false,
