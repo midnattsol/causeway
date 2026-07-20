@@ -11,9 +11,12 @@ const Headers = headers_module.Headers;
 const Io = std.Io;
 
 pub const Adapter = struct {
-    incoming: *std.http.Server.Request,
+    input: *Io.Reader,
+    output: *Io.Writer,
     transfer_buffer: []u8,
     framing: head_module.Framing,
+    content_encoding: std.http.ContentEncoding,
+    expect_continue: bool,
     max_encoded_body_size: usize,
     max_chunk_count: usize,
     max_chunk_extension_size: usize,
@@ -23,15 +26,17 @@ pub const Adapter = struct {
     chunked: ?*body_reader.Chunked = null,
 
     pub fn activate(self: *Adapter, allocator: std.mem.Allocator) !*Io.Reader {
-        try self.incoming.writeExpectContinue();
+        if (self.expect_continue) {
+            try self.output.writeAll("HTTP/1.1 100 Continue\r\n\r\n");
+            try self.output.flush();
+        }
         const transfer_reader = switch (self.framing) {
             .none => return error.MissingBodyFraming,
             .content_length => |length| blk: {
                 const fixed = try allocator.create(body_reader.Fixed);
                 self.fixed = fixed;
                 break :blk fixed.init(
-                    self.incoming.server.reader.in,
-                    &self.incoming.server.reader,
+                    self.input,
                     length,
                     self.max_encoded_body_size,
                     self.transfer_buffer,
@@ -45,8 +50,7 @@ pub const Adapter = struct {
                 );
                 self.chunked = chunked;
                 break :blk chunked.init(
-                    self.incoming.server.reader.in,
-                    &self.incoming.server.reader,
+                    self.input,
                     allocator,
                     .{
                         .encoded_size = self.max_encoded_body_size,
@@ -61,13 +65,13 @@ pub const Adapter = struct {
             },
         };
         const decompress = try allocator.create(std.http.Decompress);
-        const capacity = self.incoming.head.transfer_compression.minBufferCapacity();
+        const capacity = self.content_encoding.minBufferCapacity();
         const decompress_buffer = try allocator.alloc(u8, capacity);
         return std.http.Decompress.init(
             decompress,
             transfer_reader,
             decompress_buffer,
-            self.incoming.head.transfer_compression,
+            self.content_encoding,
         );
     }
 

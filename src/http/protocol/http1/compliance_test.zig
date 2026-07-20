@@ -33,11 +33,7 @@ test "HTTP/1 request-head compliance matrix" {
     }
 }
 
-test "ambiguous framing is rejected before std.http parsing" {
+test "ambiguous request framing is rejected" {
     const head = "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n";
-
-    const parsed = try std.http.Server.Request.Head.parse(head);
-    try std.testing.expectEqual(@as(?u64, 4), parsed.content_length);
-    try std.testing.expectEqual(std.http.TransferEncoding.chunked, parsed.transfer_encoding);
     try std.testing.expectError(error.InvalidRequestHead, validation.validate(head));
 }

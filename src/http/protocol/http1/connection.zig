@@ -1,7 +1,7 @@
 //! Adapts one TCP stream to Causeway requests, contexts, dispatch, and responses.
 
 const std = @import("std");
-const Header = @import("../../message/headers.zig").Header;
+
 const Headers = @import("../../message/headers.zig").Headers;
 const context_module = @import("../../context.zig");
 const HttpContext = context_module.Context;
@@ -184,12 +184,11 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             defer self.allocator.free(transfer_buffer);
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
-            var http_server = std.http.Server.init(input, output);
             var request_count: usize = 0;
 
             while (true) {
                 const outcome = try self.serveRequest(
-                    &http_server,
+                    input,
                     output,
                     io,
                     transfer_buffer,
@@ -204,7 +203,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         fn serveRequest(
             self: *Self,
-            http_server: *std.http.Server,
+            input: *Io.Reader,
             output: *Io.Writer,
             io: Io,
             transfer_buffer: []u8,
@@ -215,11 +214,12 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 self.options.request_head_timeout
             else
                 self.options.keep_alive_timeout orelse self.options.request_head_timeout;
-            const received = switch (try request_head.receive(
+            const head = switch (try request_head.receive(
                 io,
-                http_server,
+                input,
                 output,
                 request_allocator,
+                self.options.max_header_size,
                 .{
                     .request_line_size = self.options.max_request_line_size,
                     .header_count = self.options.max_header_count,
@@ -230,14 +230,15 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 head_timeout,
                 completed_requests != 0,
             )) {
-                .request => |request| request,
+                .request => |request_head_value| request_head_value,
                 .close => return .close,
             };
-            var incoming = received.request;
+            const version = wireVersion(head.version);
             const request_count = completed_requests + 1;
             const request = switch (try self.prepareRequest(
-                &incoming,
-                received.head,
+                input,
+                output,
+                head,
                 request_allocator,
                 transfer_buffer,
                 io,
@@ -248,7 +249,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
             var http1_exchange: exchange_adapter.Adapter = .{
                 .output = output,
-                .version = incoming.head.version,
+                .version = version,
             };
             var exchange = Exchange.borrowed(&http1_exchange);
             var locals: if (Locals) |RequestLocals| RequestLocals else void = if (Locals != null) .{} else {};
@@ -263,16 +264,16 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 .exchange = &exchange,
             };
 
-            const connection_keep_alive = incoming.head.keep_alive and
+            const connection_keep_alive = head.keep_alive and
                 !requestLimitReached(self.options.max_requests, request_count);
             var response = Dispatcher.dispatch(&context) catch |err| {
                 const failure = dispatchFailure(err, self.options.handler_error_policy) orelse return err;
-                const body_complete = self.finishRequestBody(&incoming, request.body);
+                const body_complete = self.finishRequestBody(head.expect_continue, request.body);
                 const keep_alive = connection_keep_alive and body_complete;
-                suppressUnusedExpectation(&incoming, request.body);
                 try respondGeneratedError(
                     io,
-                    &incoming,
+                    output,
+                    version,
                     self.options.automatic_date,
                     failure.body,
                     failure.status,
@@ -287,11 +288,13 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     response.write_deadline = .fromNow(io, .{ .raw = timeout, .clock = .awake });
                 }
             }
-            const body_complete = self.finishRequestBody(&incoming, request.body);
-            suppressUnusedExpectation(&incoming, request.body);
+            const body_complete = self.finishRequestBody(head.expect_continue, request.body);
             const outcome = response_writer.write(
                 io,
-                &incoming,
+                input,
+                output,
+                version,
+                request.headers,
                 &response,
                 request_allocator,
                 transfer_buffer,
@@ -313,62 +316,55 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         fn prepareRequest(
             self: *Self,
-            incoming: *std.http.Server.Request,
-            logical_head: head_module.Head,
+            input: *Io.Reader,
+            output: *Io.Writer,
+            head: head_module.Head,
             allocator: std.mem.Allocator,
             transfer_buffer: []u8,
             io: Io,
         ) !PreparedRequest {
-            if (!expectationSupported(incoming.head.expect)) {
-                incoming.head.expect = null;
-                try respondGeneratedError(io, incoming, self.options.automatic_date, "expectation failed", .expectation_failed, false);
-                return .close;
-            }
-            if (incoming.head.expect) |expect| {
-                if (!std.mem.eql(u8, expect, "100-continue")) incoming.head.expect = "100-continue";
-            }
-
-            const raw = try allocator.dupe(u8, incoming.head.target);
-            const headers = try copyHeaders(incoming, allocator);
             const body_state = try allocator.create(RequestBody.State);
             body_state.* = .initAbsent();
-            var request = Request.initVersion(
-                raw,
-                logical_head.method,
-                switch (incoming.head.version) {
-                    .@"HTTP/1.0" => .http_1_0,
-                    .@"HTTP/1.1" => .http_1_1,
-                },
-                headers,
-                .init(body_state),
-            ) catch {
-                incoming.head.expect = null;
-                try respondGeneratedError(io, incoming, self.options.automatic_date, "bad request", .bad_request, false);
-                return .close;
+            const request: Request = .{
+                .raw = head.raw_target,
+                .method = head.method,
+                .version = head.version,
+                .target = head.target,
+                .path = head.target.path() orelse "",
+                .query = head.target.query(),
+                .headers = head.headers,
+                .effective_authority = head.effective_authority,
+                .body = .init(body_state),
             };
-            request.effective_authority = switch (request.target) {
-                .absolute => |absolute| absolute.authority,
-                .authority => |value| value,
-                .origin, .asterisk => headers.get("host"),
-            };
-            const body_limit = if (requestHasFramedBody(incoming))
+            const framed = requestHasFramedBody(head.framing);
+            const body_limit = if (framed)
                 effectiveBodyLimit(Dispatcher, request.method, request.path, self.options.max_body_size)
             else
                 self.options.max_body_size;
-            if (bodyExceedsKnownLimit(incoming.head.content_length, self.options.max_encoded_body_size) or
-                (incoming.head.transfer_compression == .identity and
-                    bodyExceedsKnownLimit(incoming.head.content_length, body_limit)))
+            const content_length = framingContentLength(head.framing);
+            if (bodyExceedsKnownLimit(content_length, self.options.max_encoded_body_size) or
+                (head.content_encoding == .identity and bodyExceedsKnownLimit(content_length, body_limit)))
             {
-                incoming.head.expect = null;
-                try respondGeneratedError(io, incoming, self.options.automatic_date, "request body too large", .payload_too_large, false);
+                try respondGeneratedError(
+                    io,
+                    output,
+                    wireVersion(head.version),
+                    self.options.automatic_date,
+                    "request body too large",
+                    .payload_too_large,
+                    false,
+                );
                 return .close;
             }
-            if (requestHasFramedBody(incoming)) {
+            if (framed) {
                 const adapter = try allocator.create(request_body_adapter.Adapter);
                 adapter.* = .{
-                    .incoming = incoming,
+                    .input = input,
+                    .output = output,
                     .transfer_buffer = transfer_buffer,
-                    .framing = logical_head.framing,
+                    .framing = head.framing,
+                    .content_encoding = head.content_encoding,
+                    .expect_continue = head.expect_continue,
                     .max_encoded_body_size = self.options.max_encoded_body_size,
                     .max_chunk_count = self.options.max_chunk_count,
                     .max_chunk_extension_size = self.options.max_chunk_extension_size,
@@ -386,14 +382,10 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             return .{ .request = request };
         }
 
-        fn finishRequestBody(
-            self: *Self,
-            incoming: *const std.http.Server.Request,
-            body: RequestBody,
-        ) bool {
+        fn finishRequestBody(self: *Self, expect_continue: bool, body: RequestBody) bool {
             if (requestBodyComplete(body)) return true;
             if (self.options.unread_body_policy == .close) return false;
-            if (incoming.head.expect != null and body.status() == .pending) return false;
+            if (expect_continue and body.status() == .pending) return false;
 
             const timeout = self.options.unread_body_drain_timeout orelse self.options.request_body_timeout;
             return body.discardUpTo(self.options.max_unread_body_drain_size, timeout) catch false;
@@ -407,22 +399,14 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
 fn respondGeneratedError(
     io: Io,
-    incoming: *std.http.Server.Request,
+    output: *Io.Writer,
+    version: std.http.Version,
     automatic_date: bool,
     body: []const u8,
     status: std.http.Status,
     keep_alive: bool,
 ) !void {
-    try protocol_error.write(
-        io,
-        incoming.server.out,
-        automatic_date,
-        incoming.head.version,
-        status,
-        body,
-        keep_alive,
-    );
-    incoming.server.reader.state = if (keep_alive) .ready else .closing;
+    try protocol_error.write(io, output, automatic_date, version, status, body, keep_alive);
 }
 
 fn validateOptions(options: Options) ConfigurationError!void {
@@ -464,24 +448,23 @@ fn validateOptions(options: Options) ConfigurationError!void {
     }
 }
 
-fn copyHeaders(incoming: *const std.http.Server.Request, allocator: std.mem.Allocator) !Headers {
-    var items: std.ArrayList(Header) = .empty;
-    var iterator = incoming.iterateHeaders();
-    while (iterator.next()) |header| {
-        try items.append(allocator, .{
-            .name = try allocator.dupe(u8, header.name),
-            .value = try allocator.dupe(u8, header.value),
-        });
-    }
-    return .{ .items = items.items };
+fn wireVersion(version: request_module.Version) std.http.Version {
+    return switch (version) {
+        .http_1_0 => .@"HTTP/1.0",
+        .http_1_1 => .@"HTTP/1.1",
+        .http_2, .http_3 => unreachable,
+    };
 }
 
-fn requestHasFraming(incoming: *const std.http.Server.Request) bool {
-    return incoming.head.content_length != null or incoming.head.transfer_encoding == .chunked;
+fn requestHasFramedBody(framing: head_module.Framing) bool {
+    return framing != .none;
 }
 
-fn requestHasFramedBody(incoming: *const std.http.Server.Request) bool {
-    return requestHasFraming(incoming);
+fn framingContentLength(framing: head_module.Framing) ?u64 {
+    return switch (framing) {
+        .content_length => |length| length,
+        .none, .chunked => null,
+    };
 }
 
 fn effectiveBodyLimit(
@@ -507,20 +490,11 @@ fn requestLimitReached(maximum: ?usize, count: usize) bool {
     return if (maximum) |limit| count >= limit else false;
 }
 
-fn expectationSupported(expect: ?[]const u8) bool {
-    const value = expect orelse return true;
-    return std.ascii.eqlIgnoreCase(value, "100-continue");
-}
-
 fn requestBodyComplete(body: RequestBody) bool {
     return switch (body.status()) {
         .absent, .buffered, .consumed => true,
         .pending, .streaming, .failed => false,
     };
-}
-
-fn suppressUnusedExpectation(incoming: *std.http.Server.Request, body: RequestBody) void {
-    if (!requestBodyComplete(body)) incoming.head.expect = null;
 }
 
 const DispatchFailure = struct {

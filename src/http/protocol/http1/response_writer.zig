@@ -9,7 +9,6 @@ const response_head = @import("response_head.zig");
 const response_plan = @import("response_plan.zig");
 const response_module = @import("../../message/response.zig");
 const Response = response_module.Response;
-const Stream = response_module.Stream;
 const Takeover = response_module.Takeover;
 const Io = std.Io;
 
@@ -29,14 +28,16 @@ pub const Outcome = struct {
 /// its HTTP handshake has been flushed successfully.
 pub fn write(
     io: Io,
-    incoming: *std.http.Server.Request,
+    input: *Io.Reader,
+    output: *Io.Writer,
+    version: std.http.Version,
+    request_headers: Headers,
     response: *Response,
     allocator: std.mem.Allocator,
     stream_buffer: []u8,
     options: Options,
 ) !Outcome {
     _ = allocator;
-    const version = incoming.head.version;
     const plan = try response_plan.Plan.init(response.*, .{
         .version = version,
         .method = options.method,
@@ -55,7 +56,9 @@ pub fn write(
         defer takeover.finalize();
         try writeTakeoverWithDeadline(
             io,
-            incoming,
+            output,
+            version,
+            request_headers,
             options.method,
             response.status,
             response.headers,
@@ -63,19 +66,19 @@ pub fn write(
             takeover.kind,
             response.write_deadline,
         );
-        try takeover.run(incoming.server.reader.in, incoming.server.out);
+        try takeover.run(input, output);
         return .{ .keep_alive = false, .taken_over = true };
     }
 
     try writeResponseWithDeadline(
         io,
-        incoming,
+        output,
+        version,
         response,
         stream_buffer,
         generated_date,
         plan,
     );
-    incoming.server.reader.state = if (plan.keep_alive) .ready else .closing;
     return .{ .keep_alive = plan.keep_alive };
 }
 
@@ -85,7 +88,9 @@ pub fn write(
 
 fn writeTakeoverWithDeadline(
     io: Io,
-    incoming: *std.http.Server.Request,
+    output: *Io.Writer,
+    version: std.http.Version,
+    request_headers: Headers,
     method: Method,
     status: std.http.Status,
     headers: Headers,
@@ -94,7 +99,9 @@ fn writeTakeoverWithDeadline(
     deadline: ?Io.Clock.Timestamp,
 ) !void {
     const target = deadline orelse return writeTakeoverHead(
-        incoming,
+        output,
+        version,
+        request_headers,
         method,
         status,
         headers,
@@ -107,7 +114,9 @@ fn writeTakeoverWithDeadline(
     };
     const Runner = struct {
         fn run(
-            request: *std.http.Server.Request,
+            destination: *Io.Writer,
+            request_version: std.http.Version,
+            incoming_headers: Headers,
             request_method: Method,
             response_status: std.http.Status,
             response_headers: Headers,
@@ -115,7 +124,9 @@ fn writeTakeoverWithDeadline(
             takeover_kind: Takeover.Kind,
         ) anyerror!void {
             return writeTakeoverHead(
-                request,
+                destination,
+                request_version,
+                incoming_headers,
                 request_method,
                 response_status,
                 response_headers,
@@ -127,7 +138,16 @@ fn writeTakeoverWithDeadline(
 
     var results: [2]Result = undefined;
     var select = Io.Select(Result).init(io, &results);
-    select.async(.write, Runner.run, .{ incoming, method, status, headers, generated_date, kind });
+    select.async(.write, Runner.run, .{
+        output,
+        version,
+        request_headers,
+        method,
+        status,
+        headers,
+        generated_date,
+        kind,
+    });
     select.async(.timeout, waitUntil, .{ io, target });
     const result = select.await() catch |err| {
         select.cancelDiscard();
@@ -144,20 +164,22 @@ fn writeTakeoverWithDeadline(
 }
 
 fn writeTakeoverHead(
-    incoming: *std.http.Server.Request,
+    output: *Io.Writer,
+    version: std.http.Version,
+    request_headers: Headers,
     method: Method,
     status: std.http.Status,
     headers: Headers,
     generated_date: ?[]const u8,
     kind: Takeover.Kind,
 ) !void {
-    const output = incoming.server.out;
     switch (kind) {
         .upgrade => |protocol| {
-            if (incoming.head.version != .@"HTTP/1.1" or
+            if (version != .@"HTTP/1.1" or
                 !method.is(.GET) or
                 status != .switching_protocols or
-                !upgradeRequested(incoming, protocol)) return error.InvalidUpgrade;
+                !upgradeRequested(request_headers, protocol) or
+                headers.contains("upgrade")) return error.InvalidUpgrade;
             try response_head.writeStatusLine(output, .@"HTTP/1.1", status);
             try output.print("connection: upgrade\r\nupgrade: {s}\r\n", .{protocol});
         },
@@ -165,7 +187,7 @@ fn writeTakeoverHead(
             if (!method.is(.CONNECT) or status.class() != .success) {
                 return error.InvalidTunnel;
             }
-            try response_head.writeStatusLine(output, incoming.head.version, status);
+            try response_head.writeStatusLine(output, version, status);
         },
     }
     try response_head.writeFields(output, headers);
@@ -174,11 +196,10 @@ fn writeTakeoverHead(
     try output.flush();
 }
 
-fn upgradeRequested(incoming: *const std.http.Server.Request, protocol: []const u8) bool {
+fn upgradeRequested(headers: Headers, protocol: []const u8) bool {
     var connection_upgrade = false;
     var requested_protocol = false;
-    var iterator = incoming.iterateHeaders();
-    while (iterator.next()) |header| {
+    for (headers.items) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "connection")) {
             var tokens = std.mem.splitScalar(u8, header.value, ',');
             while (tokens.next()) |token| {
@@ -204,14 +225,16 @@ fn upgradeRequested(incoming: *const std.http.Server.Request, protocol: []const 
 
 fn writeResponseWithDeadline(
     io: Io,
-    incoming: *std.http.Server.Request,
+    output: *Io.Writer,
+    version: std.http.Version,
     response: *Response,
     stream_buffer: []u8,
     generated_date: ?[]const u8,
     plan: response_plan.Plan,
 ) !void {
     const deadline = response.write_deadline orelse return writeResponse(
-        incoming,
+        output,
+        version,
         response,
         stream_buffer,
         generated_date,
@@ -223,19 +246,20 @@ fn writeResponseWithDeadline(
     };
     const Runner = struct {
         fn run(
-            request: *std.http.Server.Request,
+            destination: *Io.Writer,
+            response_version: std.http.Version,
             value: *Response,
             buffer: []u8,
             response_date: ?[]const u8,
             response_plan_value: response_plan.Plan,
         ) anyerror!void {
-            return writeResponse(request, value, buffer, response_date, response_plan_value);
+            return writeResponse(destination, response_version, value, buffer, response_date, response_plan_value);
         }
     };
 
     var results: [2]Race = undefined;
     var select = Io.Select(Race).init(io, &results);
-    select.async(.write, Runner.run, .{ incoming, response, stream_buffer, generated_date, plan });
+    select.async(.write, Runner.run, .{ output, version, response, stream_buffer, generated_date, plan });
     select.async(.timeout, waitUntil, .{ io, deadline });
     const result = select.await() catch |err| {
         select.cancelDiscard();
@@ -256,15 +280,15 @@ fn waitUntil(io: Io, deadline: Io.Clock.Timestamp) anyerror!void {
 }
 
 fn writeResponse(
-    incoming: *std.http.Server.Request,
+    output: *Io.Writer,
+    version: std.http.Version,
     response: *Response,
     stream_buffer: []u8,
     generated_date: ?[]const u8,
     plan: response_plan.Plan,
 ) !void {
-    const output = incoming.server.out;
     try response_head.write(output, .{
-        .version = incoming.head.version,
+        .version = version,
         .status = response.status,
         .headers = response.headers,
         .generated_date = generated_date,

@@ -1,19 +1,13 @@
-//! Timed HTTP request-head reception, parsing, and protocol-error responses.
+//! Timed HTTP/1 request-head reception, parsing, and protocol-error responses.
 
 const std = @import("std");
-const Method = @import("../../message/request.zig").Method;
 const head_module = @import("head.zig");
 const protocol_error = @import("protocol_error.zig");
 const validation = @import("validation.zig");
 const Io = std.Io;
 
-pub const Received = struct {
-    request: std.http.Server.Request,
-    head: head_module.Head,
-};
-
 pub const Outcome = union(enum) {
-    request: Received,
+    request: head_module.Head,
     close,
 };
 
@@ -21,15 +15,16 @@ pub const Outcome = union(enum) {
 /// returning `.close`; transport and timeout errors are propagated.
 pub fn receive(
     io: Io,
-    server: *std.http.Server,
+    input: *Io.Reader,
     output: *Io.Writer,
     allocator: std.mem.Allocator,
+    maximum: usize,
     limits: validation.Limits,
     automatic_date: bool,
     timeout: ?Io.Duration,
     keep_alive: bool,
 ) !Outcome {
-    const head_buffer = receiveWithTimeout(io, &server.reader, timeout, keep_alive) catch |err| switch (err) {
+    const head_buffer = receiveWithTimeout(io, input, allocator, maximum, timeout, keep_alive) catch |err| switch (err) {
         error.HttpConnectionClosing => return .close,
         error.HttpHeadersOversize => {
             try writeProtocolError(io, output, automatic_date, .request_header_fields_too_large, "request headers too large");
@@ -41,61 +36,27 @@ pub fn receive(
         },
         else => return err,
     };
-    const logical_head = head_module.parse(head_buffer, allocator, limits) catch |err| {
+    return .{ .request = head_module.parse(head_buffer, allocator, limits) catch |err| {
         const status: std.http.Status = switch (err) {
             error.UnsupportedHttpVersion => .http_version_not_supported,
             error.RequestLineTooLong => .uri_too_long,
             error.TooManyHeaders, error.HeaderNameTooLong, error.HeaderValueTooLong => .request_header_fields_too_large,
             error.UnsupportedExpectation => .expectation_failed,
             error.UnsupportedTransferCoding => .not_implemented,
+            error.UnsupportedContentEncoding => .unsupported_media_type,
             else => .bad_request,
         };
         const body = switch (status) {
             .http_version_not_supported => "HTTP version not supported",
             .uri_too_long => "request line too long",
             .request_header_fields_too_large => "request headers too large",
+            .expectation_failed => "expectation failed",
+            .not_implemented => "transfer coding not implemented",
+            .unsupported_media_type => "unsupported content encoding",
             else => "bad request",
         };
         try writeProtocolError(io, output, automatic_date, status, body);
         return .close;
-    };
-
-    var parsed_buffer = head_buffer;
-    var head = std.http.Server.Request.Head.parse(head_buffer) catch |err| switch (err) {
-        error.UnknownHttpMethod => blk: {
-            const raw_method = requestMethod(head_buffer) orelse {
-                try writeProtocolError(io, output, automatic_date, .bad_request, "invalid method");
-                return .close;
-            };
-            _ = Method.parse(raw_method) catch {
-                try writeProtocolError(io, output, automatic_date, .bad_request, "invalid method");
-                return .close;
-            };
-            parsed_buffer = try normalizeExtensionMethod(allocator, head_buffer, raw_method.len);
-            break :blk std.http.Server.Request.Head.parse(parsed_buffer) catch |normalized_err| {
-                const failure = parseFailure(normalized_err, parsed_buffer);
-                try writeProtocolError(io, output, automatic_date, failure.status, failure.body);
-                return .close;
-            };
-        },
-        else => {
-            const failure = parseFailure(err, head_buffer);
-            try writeProtocolError(io, output, automatic_date, failure.status, failure.body);
-            return .close;
-        },
-    };
-    head.keep_alive = logical_head.keep_alive;
-    if (head.transfer_compression == .compress) {
-        try writeProtocolError(io, output, automatic_date, .unsupported_media_type, "unsupported content encoding");
-        return .close;
-    }
-    return .{ .request = .{
-        .request = .{
-            .server = server,
-            .head_buffer = parsed_buffer,
-            .head = head,
-        },
-        .head = logical_head,
     } };
 }
 
@@ -105,24 +66,26 @@ pub fn receive(
 
 fn receiveWithTimeout(
     io: Io,
-    reader: *std.http.Reader,
+    input: *Io.Reader,
+    allocator: std.mem.Allocator,
+    maximum: usize,
     timeout: ?Io.Duration,
     keep_alive: bool,
 ) anyerror![]const u8 {
-    const duration = timeout orelse return reader.receiveHead();
+    const duration = timeout orelse return receiveHead(input, allocator, maximum);
     const Result = union(enum) {
         receive: anyerror![]const u8,
         timeout: anyerror!void,
     };
     const Runner = struct {
-        fn run(source: *std.http.Reader) anyerror![]const u8 {
-            return source.receiveHead();
+        fn run(source: *Io.Reader, arena: std.mem.Allocator, limit: usize) anyerror![]const u8 {
+            return receiveHead(source, arena, limit);
         }
     };
 
     var results: [2]Result = undefined;
     var select = Io.Select(Result).init(io, &results);
-    select.async(.receive, Runner.run, .{reader});
+    select.async(.receive, Runner.run, .{ input, allocator, maximum });
     select.async(.timeout, waitForTimeout, .{ io, duration });
     const result = select.await() catch |err| {
         select.cancelDiscard();
@@ -138,78 +101,31 @@ fn receiveWithTimeout(
     };
 }
 
+fn receiveHead(input: *Io.Reader, allocator: std.mem.Allocator, maximum: usize) ![]const u8 {
+    var scan_start: usize = 0;
+    while (true) {
+        const buffered = input.buffered();
+        if (std.mem.find(u8, buffered[scan_start..], "\r\n\r\n")) |relative| {
+            const length = scan_start + relative + 4;
+            if (length > maximum) return error.HttpHeadersOversize;
+            const owned = try allocator.dupe(u8, buffered[0..length]);
+            input.toss(length);
+            return owned;
+        }
+        if (buffered.len >= maximum) return error.HttpHeadersOversize;
+        scan_start = buffered.len -| 3;
+        input.fillMore() catch |err| switch (err) {
+            error.EndOfStream => return if (buffered.len == 0)
+                error.HttpConnectionClosing
+            else
+                error.HttpRequestTruncated,
+            else => return err,
+        };
+    }
+}
+
 fn waitForTimeout(io: Io, duration: Io.Duration) anyerror!void {
     try Io.sleep(io, duration, .awake);
-}
-
-fn requestMethod(head_buffer: []const u8) ?[]const u8 {
-    const line_end = std.mem.find(u8, head_buffer, "\r\n") orelse return null;
-    const method_end = std.mem.findScalar(u8, head_buffer[0..line_end], ' ') orelse return null;
-    if (method_end == 0) return null;
-    return head_buffer[0..method_end];
-}
-
-/// `std.http` currently models methods as a closed enum. For an extension
-/// method, parse an arena-owned copy with a known method while preserving the
-/// original token separately in Causeway's request model.
-fn normalizeExtensionMethod(
-    allocator: std.mem.Allocator,
-    head_buffer: []const u8,
-    method_len: usize,
-) ![]const u8 {
-    const normalized = try allocator.alloc(u8, head_buffer.len - method_len + 3);
-    @memcpy(normalized[0..3], "GET");
-    @memcpy(normalized[3..], head_buffer[method_len..]);
-    return normalized;
-}
-
-// -----------------------------------------------------------------------------
-// Parse diagnostics and wire errors
-// -----------------------------------------------------------------------------
-
-const Failure = struct {
-    status: std.http.Status,
-    body: []const u8,
-};
-
-fn parseFailure(
-    err: std.http.Server.Request.Head.ParseError,
-    head_buffer: []const u8,
-) Failure {
-    if (err == error.HttpHeadersInvalid and hasUnsupportedHttpVersion(head_buffer)) {
-        return .{ .status = .http_version_not_supported, .body = "HTTP version not supported" };
-    }
-    return switch (err) {
-        error.UnknownHttpMethod => .{ .status = .not_implemented, .body = "method not implemented" },
-        error.HttpTransferEncodingUnsupported,
-        error.CompressionUnsupported,
-        => if (containsHeaderName(head_buffer, "content-encoding"))
-            .{ .status = .unsupported_media_type, .body = "unsupported content encoding" }
-        else
-            .{ .status = .not_implemented, .body = "transfer coding not implemented" },
-        else => .{ .status = .bad_request, .body = "bad request" },
-    };
-}
-
-fn hasUnsupportedHttpVersion(head_buffer: []const u8) bool {
-    const line_end = std.mem.find(u8, head_buffer, "\r\n") orelse return false;
-    const request_line = head_buffer[0..line_end];
-    const separator = std.mem.lastIndexOfScalar(u8, request_line, ' ') orelse return false;
-    const version = request_line[separator + 1 ..];
-    return std.mem.startsWith(u8, version, "HTTP/") and
-        !std.mem.eql(u8, version, "HTTP/1.0") and
-        !std.mem.eql(u8, version, "HTTP/1.1");
-}
-
-fn containsHeaderName(head_buffer: []const u8, name: []const u8) bool {
-    var lines = std.mem.splitSequence(u8, head_buffer, "\r\n");
-    _ = lines.next();
-    while (lines.next()) |line| {
-        if (line.len == 0) break;
-        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
-        if (std.ascii.eqlIgnoreCase(line[0..colon], name)) return true;
-    }
-    return false;
 }
 
 fn writeProtocolError(
@@ -228,4 +144,20 @@ fn writeProtocolError(
         body,
         false,
     );
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+test "request-head receiver consumes exactly one pipelined head" {
+    var input: Io.Reader = .fixed(
+        "GET /one HTTP/1.1\r\nHost: example.com\r\n\r\nGET /two HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    );
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const first = try receiveHead(&input, arena.allocator(), 1024);
+    try std.testing.expectEqualStrings("GET /one HTTP/1.1\r\nHost: example.com\r\n\r\n", first);
+    const second = try receiveHead(&input, arena.allocator(), 1024);
+    try std.testing.expectEqualStrings("GET /two HTTP/1.1\r\nHost: example.com\r\n\r\n", second);
 }

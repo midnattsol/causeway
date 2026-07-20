@@ -17,32 +17,26 @@ pub const Limits = struct {
 
 pub const Fixed = struct {
     source: *Io.Reader,
-    protocol_reader: *std.http.Reader,
     remaining: u64,
     encoded: usize = 0,
     maximum: usize,
     failure: ?anyerror = null,
     interface: Io.Reader,
 
-    pub fn init(self: *Fixed, source: *Io.Reader, protocol_reader: *std.http.Reader, length: u64, maximum: usize, buffer: []u8) *Io.Reader {
+    pub fn init(self: *Fixed, source: *Io.Reader, length: u64, maximum: usize, buffer: []u8) *Io.Reader {
         self.* = .{
             .source = source,
-            .protocol_reader = protocol_reader,
             .remaining = length,
             .maximum = maximum,
             .interface = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .seek = 0, .end = 0 },
         };
-        protocol_reader.state = .body_none;
         return &self.interface;
     }
 
     fn stream(interface: *Io.Reader, writer: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
         const self: *Fixed = @fieldParentPtr("interface", interface);
         if (self.failure != null) return error.ReadFailed;
-        if (self.remaining == 0) {
-            self.protocol_reader.state = .ready;
-            return error.EndOfStream;
-        }
+        if (self.remaining == 0) return error.EndOfStream;
         var buffer: [4096]u8 = undefined;
         const limited = limit.slice(&buffer);
         if (limited.len == 0) return 0;
@@ -68,7 +62,6 @@ pub const Fixed = struct {
 
 pub const Chunked = struct {
     source: *Io.Reader,
-    protocol_reader: *std.http.Reader,
     allocator: std.mem.Allocator,
     limits: Limits,
     remaining: u64 = 0,
@@ -84,7 +77,6 @@ pub const Chunked = struct {
     pub fn init(
         self: *Chunked,
         source: *Io.Reader,
-        protocol_reader: *std.http.Reader,
         allocator: std.mem.Allocator,
         limits: Limits,
         transfer_buffer: []u8,
@@ -92,13 +84,11 @@ pub const Chunked = struct {
     ) *Io.Reader {
         self.* = .{
             .source = source,
-            .protocol_reader = protocol_reader,
             .allocator = allocator,
             .limits = limits,
             .line_buffer = line_buffer,
             .interface = .{ .vtable = &.{ .stream = stream }, .buffer = transfer_buffer, .seek = 0, .end = 0 },
         };
-        protocol_reader.state = .body_none;
         return &self.interface;
     }
 
@@ -129,7 +119,6 @@ pub const Chunked = struct {
             if (self.remaining == 0) {
                 try self.readTrailers();
                 self.done = true;
-                self.protocol_reader.state = .ready;
                 return 0;
             }
             self.chunks += 1;
@@ -242,26 +231,15 @@ const test_limits: Limits = .{
     .trailer_count = 16,
 };
 
-fn testProtocolReader(source: *Io.Reader) std.http.Reader {
-    return .{
-        .in = source,
-        .interface = undefined,
-        .state = .ready,
-        .max_head_len = 4096,
-    };
-}
-
 test "fixed reader consumes exactly the declared content length" {
     var source: Io.Reader = .fixed("bodyGET /next HTTP/1.1\r\n");
-    var protocol_reader = testProtocolReader(&source);
     var fixed: Fixed = undefined;
     var transfer_buffer: [3]u8 = undefined;
-    const reader = fixed.init(&source, &protocol_reader, 4, 4, &transfer_buffer);
+    const reader = fixed.init(&source, 4, 4, &transfer_buffer);
 
     const body = try reader.allocRemaining(std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(body);
     try std.testing.expectEqualStrings("body", body);
-    try std.testing.expect(protocol_reader.state == .ready);
 
     const pipeline = try source.allocRemaining(std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(pipeline);
@@ -270,10 +248,9 @@ test "fixed reader consumes exactly the declared content length" {
 
 test "fixed reader reports truncation and encoded-size overflow" {
     var truncated_source: Io.Reader = .fixed("abc");
-    var truncated_protocol = testProtocolReader(&truncated_source);
     var truncated: Fixed = undefined;
     var truncated_buffer: [4]u8 = undefined;
-    const truncated_reader = truncated.init(&truncated_source, &truncated_protocol, 4, 4, &truncated_buffer);
+    const truncated_reader = truncated.init(&truncated_source, 4, 4, &truncated_buffer);
     try std.testing.expectError(
         error.ReadFailed,
         truncated_reader.allocRemaining(std.testing.allocator, .unlimited),
@@ -281,10 +258,9 @@ test "fixed reader reports truncation and encoded-size overflow" {
     try std.testing.expect(truncated.failure.? == error.TruncatedBody);
 
     var oversized_source: Io.Reader = .fixed("abcd");
-    var oversized_protocol = testProtocolReader(&oversized_source);
     var oversized: Fixed = undefined;
     var oversized_buffer: [4]u8 = undefined;
-    const oversized_reader = oversized.init(&oversized_source, &oversized_protocol, 4, 3, &oversized_buffer);
+    const oversized_reader = oversized.init(&oversized_source, 4, 3, &oversized_buffer);
     try std.testing.expectError(
         error.ReadFailed,
         oversized_reader.allocRemaining(std.testing.allocator, .unlimited),
@@ -298,13 +274,11 @@ test "chunked reader decodes strict framing, trailers, and preserves pipelining"
     var source: Io.Reader = .fixed(
         "4;note=\"quoted value\"\r\nWiki\r\n0\r\nDigest: ok\r\n\r\nGET /next HTTP/1.1\r\n",
     );
-    var protocol_reader = testProtocolReader(&source);
     var chunked: Chunked = undefined;
     var transfer_buffer: [3]u8 = undefined;
     var line_buffer: [1024]u8 = undefined;
     const reader = chunked.init(
         &source,
-        &protocol_reader,
         arena.allocator(),
         test_limits,
         &transfer_buffer,
@@ -314,7 +288,6 @@ test "chunked reader decodes strict framing, trailers, and preserves pipelining"
     const body = try reader.allocRemaining(arena.allocator(), .unlimited);
     try std.testing.expectEqualStrings("Wiki", body);
     try std.testing.expectEqualStrings("ok", chunked.trailers().get("digest").?);
-    try std.testing.expect(protocol_reader.state == .ready);
 
     const pipeline = try source.allocRemaining(arena.allocator(), .unlimited);
     try std.testing.expectEqualStrings("GET /next HTTP/1.1\r\n", pipeline);
@@ -325,13 +298,11 @@ test "chunked reader rejects non-hex sizes and bare LF framing" {
     defer arena.deinit();
 
     var non_hex_source: Io.Reader = .fixed("G\r\n0\r\n\r\n");
-    var non_hex_protocol = testProtocolReader(&non_hex_source);
     var non_hex: Chunked = undefined;
     var non_hex_transfer: [8]u8 = undefined;
     var non_hex_line: [128]u8 = undefined;
     const non_hex_reader = non_hex.init(
         &non_hex_source,
-        &non_hex_protocol,
         arena.allocator(),
         test_limits,
         &non_hex_transfer,
@@ -344,13 +315,11 @@ test "chunked reader rejects non-hex sizes and bare LF framing" {
     try std.testing.expect(non_hex.failure.? == error.InvalidChunkSize);
 
     var bare_lf_source: Io.Reader = .fixed("1\na\n0\n\n");
-    var bare_lf_protocol = testProtocolReader(&bare_lf_source);
     var bare_lf: Chunked = undefined;
     var bare_lf_transfer: [8]u8 = undefined;
     var bare_lf_line: [128]u8 = undefined;
     const bare_lf_reader = bare_lf.init(
         &bare_lf_source,
-        &bare_lf_protocol,
         arena.allocator(),
         test_limits,
         &bare_lf_transfer,
