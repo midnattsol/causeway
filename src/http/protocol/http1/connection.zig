@@ -68,6 +68,10 @@ pub const Options = struct {
     max_trailer_count: usize = 32,
     /// Maximum total request-trailer wire size.
     max_trailer_size: usize = 8 * 1024,
+    /// Maximum number of response trailer fields and announced names.
+    max_response_trailer_count: usize = 32,
+    /// Maximum response trailer bytes and announced-name bytes.
+    max_response_trailer_size: usize = 8 * 1024,
     /// Buffer used while decoding transfer framing such as chunked bodies.
     transfer_buffer_size: usize = 8 * 1024,
     /// Buffered socket output capacity.
@@ -106,6 +110,8 @@ pub const ConfigurationError = error{
     InvalidChunkExtensionSize,
     InvalidTrailerCount,
     InvalidTrailerSize,
+    InvalidResponseTrailerCount,
+    InvalidResponseTrailerSize,
     InvalidTransferBufferSize,
     InvalidWriteBufferSize,
     InvalidRequestLimit,
@@ -278,6 +284,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     failure.body,
                     failure.status,
                     keep_alive,
+                    request.method.is(.HEAD),
                 );
                 return if (keep_alive) .keep_alive else .close;
             };
@@ -303,6 +310,8 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     .automatic_date = self.options.automatic_date,
                     .keep_alive = connection_keep_alive and body_complete and response.connection == .keep_alive,
                     .request_body_complete = body_complete,
+                    .max_trailer_count = self.options.max_response_trailer_count,
+                    .max_trailer_size = self.options.max_response_trailer_size,
                 },
             ) catch |err| {
                 response.body.finalize();
@@ -353,6 +362,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     "request body too large",
                     .payload_too_large,
                     false,
+                    head.method.is(.HEAD),
                 );
                 return .close;
             }
@@ -365,6 +375,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     .framing = head.framing,
                     .content_encoding = head.content_encoding,
                     .expect_continue = head.expect_continue,
+                    .trailer_names = head.trailer_names,
                     .max_encoded_body_size = self.options.max_encoded_body_size,
                     .max_chunk_count = self.options.max_chunk_count,
                     .max_chunk_extension_size = self.options.max_chunk_extension_size,
@@ -405,8 +416,9 @@ fn respondGeneratedError(
     body: []const u8,
     status: std.http.Status,
     keep_alive: bool,
+    suppress_body: bool,
 ) !void {
-    try protocol_error.write(io, output, automatic_date, version, status, body, keep_alive);
+    try protocol_error.write(io, output, automatic_date, version, status, body, keep_alive, suppress_body);
 }
 
 fn validateOptions(options: Options) ConfigurationError!void {
@@ -427,6 +439,8 @@ fn validateOptions(options: Options) ConfigurationError!void {
     if (options.max_chunk_extension_size == 0) return error.InvalidChunkExtensionSize;
     if (options.max_trailer_count == 0) return error.InvalidTrailerCount;
     if (options.max_trailer_size == 0) return error.InvalidTrailerSize;
+    if (options.max_response_trailer_count == 0) return error.InvalidResponseTrailerCount;
+    if (options.max_response_trailer_size == 0) return error.InvalidResponseTrailerSize;
     if (options.transfer_buffer_size == 0) return error.InvalidTransferBufferSize;
     if (options.write_buffer_size == 0) return error.InvalidWriteBufferSize;
     if (options.max_requests == 0) return error.InvalidRequestLimit;
@@ -847,7 +861,7 @@ test "connection writes and receives chunked trailers" {
 }
 
 test "request trailer limits are enforced after body consumption" {
-    const request = "POST /request-trailers HTTP/1.1\r\nhost: example.com\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n" ++
+    const request = "POST /request-trailers HTTP/1.1\r\nhost: example.com\r\ntransfer-encoding: chunked\r\ntrailer: Digest, X-Other\r\nconnection: close\r\n\r\n" ++
         "1\r\nx\r\n0\r\nDigest: first\r\nX-Other: second\r\n\r\n";
 
     var count_state: TestState = .{};
@@ -861,10 +875,22 @@ test "request trailer limits are enforced after body consumption" {
     try std.testing.expect(std.mem.find(u8, size_output, "431 Request Header Fields Too Large") != null);
 }
 
+test "connection rejects an upgrade protocol not offered by the client" {
+    var state: TestState = .{};
+    try std.testing.expectError(
+        error.InvalidUpgrade,
+        serveTest(
+            "GET /upgrade HTTP/1.1\r\nhost: example.com\r\nconnection: upgrade\r\nupgrade: other\r\n\r\nping",
+            .{},
+            &state,
+        ),
+    );
+}
+
 test "connection transfers control after Upgrade and CONNECT handshakes" {
     var upgrade_state: TestState = .{};
     const upgrade_output = try serveTest(
-        "GET /upgrade HTTP/1.1\r\nhost: example.com\r\nconnection: upgrade\r\nupgrade: causeway-test\r\n\r\nping",
+        "GET /upgrade HTTP/1.1\r\nhost: example.com\r\nconnection: upgrade\r\nupgrade: other, causeway-test\r\n\r\nping",
         .{},
         &upgrade_state,
     );
@@ -1357,6 +1383,21 @@ test "connection serves multiple keep-alive requests" {
 
     try std.testing.expectEqual(@as(usize, 2), state.requests);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, output, "HTTP/1.1 200 OK"));
+}
+
+test "generated handler errors preserve HEAD body suppression" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "HEAD /fail HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    const head_end = std.mem.find(u8, output, "\r\n\r\n") orelse return error.MissingResponseHead;
+    try std.testing.expect(std.mem.find(u8, output, "500 Internal Server Error") != null);
+    try std.testing.expect(std.mem.find(u8, output, "content-length: 21") != null);
+    try std.testing.expectEqual(head_end + 4, output.len);
 }
 
 test "connection converts handler errors to internal server errors" {

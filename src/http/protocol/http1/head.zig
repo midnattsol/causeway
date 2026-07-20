@@ -10,6 +10,7 @@ const Target = request.Target;
 const syntax = @import("syntax.zig");
 const authority = @import("authority.zig");
 const validation = @import("validation.zig");
+const trailer_policy = @import("trailers.zig");
 
 pub const Framing = union(enum) {
     none,
@@ -26,6 +27,7 @@ pub const Head = struct {
     framing: Framing,
     content_encoding: std.http.ContentEncoding,
     expect_continue: bool,
+    trailer_names: []const []const u8,
     keep_alive: bool,
     effective_authority: ?[]const u8,
 };
@@ -52,6 +54,7 @@ pub fn parse(
     var content_encoding: std.http.ContentEncoding = .identity;
     var has_content_encoding = false;
     var expect_continue = false;
+    var trailer_names: std.ArrayList([]const u8) = .empty;
     while (lines.next()) |field_line| {
         if (field_line.len == 0) break;
         const colon = std.mem.findScalar(u8, field_line, ':').?;
@@ -73,6 +76,12 @@ pub fn parse(
             if (!std.ascii.eqlIgnoreCase(value, "100-continue")) return error.UnsupportedExpectation;
             expect_continue = true;
         }
+        if (std.ascii.eqlIgnoreCase(name, "trailer")) {
+            var names = std.mem.splitScalar(u8, value, ',');
+            while (names.next()) |raw_name| {
+                try trailer_names.append(allocator, std.mem.trim(u8, raw_name, " \t"));
+            }
+        }
     }
 
     if (expect_continue and version != .http_1_1) return error.UnsupportedExpectation;
@@ -81,6 +90,11 @@ pub fn parse(
         if (!validChunkedTransferEncoding(value)) return error.UnsupportedTransferCoding;
         break :blk .chunked;
     } else if (content_length) |length| .{ .content_length = length } else .none;
+    try trailer_policy.validateNames(trailer_names.items);
+    if (trailer_names.items.len != 0) {
+        if (version != .http_1_1) return error.TrailersRequireHttp11;
+        if (framing != .chunked) return error.TrailersRequireChunkedRequest;
+    }
 
     const effective_authority = switch (target) {
         .absolute => |absolute| blk: {
@@ -102,6 +116,7 @@ pub fn parse(
         .framing = framing,
         .content_encoding = content_encoding,
         .expect_continue = expect_continue,
+        .trailer_names = trailer_names.items,
         .keep_alive = if (validated.connection_close)
             false
         else if (version == .http_1_0)
@@ -175,6 +190,33 @@ test "Head rejects unsupported expectations and content encodings" {
     ));
     try std.testing.expectError(error.InvalidContentEncoding, parse(
         "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Encoding: identity\r\nContent-Encoding: gzip\r\nContent-Length: 1\r\n\r\n",
+        arena.allocator(),
+        limits,
+    ));
+}
+
+test "Head requires request trailers to use announced HTTP/1.1 chunked framing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const limits: validation.Limits = .{
+        .request_line_size = 1024,
+        .header_count = 16,
+        .header_name_size = 64,
+        .header_value_size = 1024,
+    };
+    const valid = try parse(
+        "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nTrailer: Digest\r\n\r\n",
+        arena.allocator(),
+        limits,
+    );
+    try std.testing.expectEqualStrings("Digest", valid.trailer_names[0]);
+    try std.testing.expectError(error.TrailersRequireChunkedRequest, parse(
+        "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\nTrailer: Digest\r\n\r\n",
+        arena.allocator(),
+        limits,
+    ));
+    try std.testing.expectError(error.TrailersRequireHttp11, parse(
+        "POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\nTrailer: Digest\r\n\r\n",
         arena.allocator(),
         limits,
     ));

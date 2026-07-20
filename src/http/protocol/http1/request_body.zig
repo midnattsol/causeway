@@ -17,6 +17,7 @@ pub const Adapter = struct {
     framing: head_module.Framing,
     content_encoding: std.http.ContentEncoding,
     expect_continue: bool,
+    trailer_names: []const []const u8,
     max_encoded_body_size: usize,
     max_chunk_count: usize,
     max_chunk_extension_size: usize,
@@ -59,6 +60,7 @@ pub const Adapter = struct {
                         .trailer_size = self.max_trailer_size,
                         .trailer_count = self.max_trailer_count,
                     },
+                    self.trailer_names,
                     self.transfer_buffer,
                     line_buffer,
                 );

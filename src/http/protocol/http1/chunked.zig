@@ -13,6 +13,7 @@ pub const Limits = struct {
     chunk_extension_size: usize,
     trailer_size: usize,
     trailer_count: usize,
+    trailer_names: []const []const u8 = &.{},
 };
 
 pub const Result = struct {
@@ -61,7 +62,9 @@ pub fn decode(allocator: std.mem.Allocator, encoded: []const u8, limits: Limits)
         if (trailer_policy.isForbidden(name)) return error.ForbiddenTrailer;
         try trailers.append(allocator, .{ .name = name, .value = value });
     }
-    return .{ .body = body.items, .trailers = .{ .items = trailers.items }, .consumed = cursor };
+    const fields: Headers = .{ .items = trailers.items };
+    try trailer_policy.validateFields(limits.trailer_names, fields);
+    return .{ .body = body.items, .trailers = fields, .consumed = cursor };
 }
 
 fn takeCrlfLine(encoded: []const u8, cursor: *usize, maximum: usize) ![]const u8 {
@@ -118,6 +121,7 @@ const test_limits: Limits = .{
     .chunk_extension_size = 128,
     .trailer_size = 1024,
     .trailer_count = 16,
+    .trailer_names = &.{"digest"},
 };
 
 test "chunked decoder preserves pipelined bytes" {

@@ -7,6 +7,7 @@ const date = @import("date.zig");
 const body_writer = @import("body_writer.zig");
 const response_head = @import("response_head.zig");
 const response_plan = @import("response_plan.zig");
+const syntax = @import("syntax.zig");
 const response_module = @import("../../message/response.zig");
 const Response = response_module.Response;
 const Takeover = response_module.Takeover;
@@ -17,6 +18,8 @@ pub const Options = struct {
     automatic_date: bool = true,
     keep_alive: bool,
     request_body_complete: bool,
+    max_trailer_count: usize,
+    max_trailer_size: usize,
 };
 
 pub const Outcome = struct {
@@ -45,6 +48,11 @@ pub fn write(
         .request_body_complete = options.request_body_complete,
     });
     try response_head.validate(response.headers);
+    const trailer_limits: body_writer.TrailerLimits = .{
+        .count = options.max_trailer_count,
+        .size = options.max_trailer_size,
+    };
+    try validateAnnouncedTrailers(plan.trailer_names, trailer_limits);
 
     var date_buffer: [29]u8 = undefined;
     const generated_date = if (options.automatic_date and !response.headers.contains("date"))
@@ -78,6 +86,7 @@ pub fn write(
         stream_buffer,
         generated_date,
         plan,
+        trailer_limits,
     );
     return .{ .keep_alive = plan.keep_alive };
 }
@@ -175,7 +184,8 @@ fn writeTakeoverHead(
 ) !void {
     switch (kind) {
         .upgrade => |protocol| {
-            if (version != .@"HTTP/1.1" or
+            if (!syntax.isToken(protocol) or
+                version != .@"HTTP/1.1" or
                 !method.is(.GET) or
                 status != .switching_protocols or
                 !upgradeRequested(request_headers, protocol) or
@@ -219,6 +229,16 @@ fn upgradeRequested(headers: Headers, protocol: []const u8) bool {
     return connection_upgrade and requested_protocol;
 }
 
+fn validateAnnouncedTrailers(names: []const []const u8, limits: body_writer.TrailerLimits) !void {
+    if (names.len > limits.count) return error.TooManyTrailers;
+    var size: usize = 0;
+    for (names, 0..) |name, index| {
+        size = try std.math.add(usize, size, name.len);
+        if (index != 0) size = try std.math.add(usize, size, 2);
+    }
+    if (size > limits.size) return error.TrailersTooLarge;
+}
+
 // -----------------------------------------------------------------------------
 // Standard response emission
 // -----------------------------------------------------------------------------
@@ -231,6 +251,7 @@ fn writeResponseWithDeadline(
     stream_buffer: []u8,
     generated_date: ?[]const u8,
     plan: response_plan.Plan,
+    trailer_limits: body_writer.TrailerLimits,
 ) !void {
     const deadline = response.write_deadline orelse return writeResponse(
         output,
@@ -239,6 +260,7 @@ fn writeResponseWithDeadline(
         stream_buffer,
         generated_date,
         plan,
+        trailer_limits,
     );
     const Race = union(enum) {
         write: anyerror!void,
@@ -252,14 +274,15 @@ fn writeResponseWithDeadline(
             buffer: []u8,
             response_date: ?[]const u8,
             response_plan_value: response_plan.Plan,
+            limits: body_writer.TrailerLimits,
         ) anyerror!void {
-            return writeResponse(destination, response_version, value, buffer, response_date, response_plan_value);
+            return writeResponse(destination, response_version, value, buffer, response_date, response_plan_value, limits);
         }
     };
 
     var results: [2]Race = undefined;
     var select = Io.Select(Race).init(io, &results);
-    select.async(.write, Runner.run, .{ output, version, response, stream_buffer, generated_date, plan });
+    select.async(.write, Runner.run, .{ output, version, response, stream_buffer, generated_date, plan, trailer_limits });
     select.async(.timeout, waitUntil, .{ io, deadline });
     const result = select.await() catch |err| {
         select.cancelDiscard();
@@ -286,6 +309,7 @@ fn writeResponse(
     stream_buffer: []u8,
     generated_date: ?[]const u8,
     plan: response_plan.Plan,
+    trailer_limits: body_writer.TrailerLimits,
 ) !void {
     try response_head.write(output, .{
         .version = version,
@@ -298,7 +322,7 @@ fn writeResponse(
     switch (plan.body_mode) {
         .none => response.body.finalize(),
         .fixed => |length| try writeFixedBody(output, &response.body, length, stream_buffer),
-        .chunked => try writeChunkedBody(output, &response.body, plan.trailer_names, stream_buffer),
+        .chunked => try writeChunkedBody(output, &response.body, plan.trailer_names, stream_buffer, trailer_limits),
         .close_delimited => try writeCloseDelimitedBody(output, &response.body),
         .takeover => unreachable,
     }
@@ -327,6 +351,7 @@ fn writeChunkedBody(
     body: *response_module.ResponseBody,
     trailer_names: []const []const u8,
     buffer: []u8,
+    limits: body_writer.TrailerLimits,
 ) !void {
     switch (body.*) {
         .stream => |*stream| {
@@ -334,7 +359,7 @@ fn writeChunkedBody(
             var chunked: body_writer.Chunked = undefined;
             const writer = chunked.init(output, buffer);
             stream.produce(writer) catch |err| return chunked.failure orelse err;
-            try chunked.finish(trailer_names, stream.trailers());
+            try chunked.finish(trailer_names, stream.trailers(), limits);
         },
         else => unreachable,
     }

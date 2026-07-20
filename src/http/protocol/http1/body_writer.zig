@@ -5,6 +5,11 @@ const Headers = @import("../../message/headers.zig").Headers;
 const trailers = @import("trailers.zig");
 const Io = std.Io;
 
+pub const TrailerLimits = struct {
+    count: usize,
+    size: usize,
+};
+
 pub const Fixed = struct {
     output: *Io.Writer,
     remaining: u64,
@@ -63,9 +68,16 @@ pub const Chunked = struct {
         return &self.interface;
     }
 
-    pub fn finish(self: *Chunked, advertised: []const []const u8, fields: Headers) !void {
+    pub fn finish(
+        self: *Chunked,
+        advertised: []const []const u8,
+        fields: Headers,
+        limits: TrailerLimits,
+    ) !void {
         self.interface.flush() catch |err| return self.failure orelse err;
         try trailers.validateFields(advertised, fields);
+        if (fields.len() > limits.count) return error.TooManyTrailers;
+        if (try trailerWireSize(fields) > limits.size) return error.TrailersTooLarge;
         try self.output.writeAll("0\r\n");
         for (fields.items) |field| {
             var parts: [4][]const u8 = .{ field.name, ": ", field.value, "\r\n" };
@@ -104,6 +116,16 @@ pub const Chunked = struct {
     }
 };
 
+fn trailerWireSize(fields: Headers) !usize {
+    var total: usize = 2;
+    for (fields.items) |field| {
+        total = try std.math.add(usize, total, field.name.len);
+        total = try std.math.add(usize, total, field.value.len);
+        total = try std.math.add(usize, total, 4);
+    }
+    return total;
+}
+
 fn countData(data: []const []const u8, splat: usize) !usize {
     var total: usize = 0;
     for (data[0 .. data.len - 1]) |bytes| {
@@ -141,6 +163,30 @@ test "fixed writer enforces the declared response length" {
     try std.testing.expectError(error.ResponseContentLengthMismatch, short.finish());
 }
 
+test "chunked writer enforces response trailer limits" {
+    var count_output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer count_output.deinit();
+    var count_chunked: Chunked = undefined;
+    _ = count_chunked.init(&count_output.writer, &.{});
+    const fields: Headers = .{ .items = &.{
+        .{ .name = "Digest", .value = "one" },
+        .{ .name = "X-Other", .value = "two" },
+    } };
+    try std.testing.expectError(
+        error.TooManyTrailers,
+        count_chunked.finish(&.{ "digest", "x-other" }, fields, .{ .count = 1, .size = 128 }),
+    );
+
+    var size_output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer size_output.deinit();
+    var size_chunked: Chunked = undefined;
+    _ = size_chunked.init(&size_output.writer, &.{});
+    try std.testing.expectError(
+        error.TrailersTooLarge,
+        size_chunked.finish(&.{ "digest", "x-other" }, fields, .{ .count = 2, .size = 8 }),
+    );
+}
+
 test "chunked writer frames payload and validated trailers" {
     var output: Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
@@ -150,6 +196,6 @@ test "chunked writer frames payload and validated trailers" {
     try writer.writeAll("abc");
     try chunked.finish(&.{"digest"}, .{
         .items = &.{.{ .name = "Digest", .value = "ok" }},
-    });
+    }, .{ .count = 1, .size = 64 });
     try std.testing.expectEqualStrings("3\r\nabc\r\n0\r\nDigest: ok\r\n\r\n", output.written());
 }

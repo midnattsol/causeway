@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Headers = @import("../../message/headers.zig").Headers;
+const response_head = @import("response_head.zig");
 const Io = std.Io;
 
 pub const Adapter = struct {
@@ -9,6 +10,7 @@ pub const Adapter = struct {
     version: std.http.Version,
 
     pub fn informational(self: *Adapter, status: std.http.Status, headers: Headers) !void {
+        try response_head.validate(headers);
         try self.output.print(
             "{s} {d} {s}\r\n",
             .{ @tagName(self.version), @intFromEnum(status), status.phrase() orelse "" },

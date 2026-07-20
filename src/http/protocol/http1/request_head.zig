@@ -143,6 +143,7 @@ fn writeProtocolError(
         status,
         body,
         false,
+        false,
     );
 }
 

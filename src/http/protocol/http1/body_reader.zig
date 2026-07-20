@@ -64,6 +64,7 @@ pub const Chunked = struct {
     source: *Io.Reader,
     allocator: std.mem.Allocator,
     limits: Limits,
+    trailer_names: []const []const u8,
     remaining: u64 = 0,
     encoded: usize = 0,
     chunks: usize = 0,
@@ -79,6 +80,7 @@ pub const Chunked = struct {
         source: *Io.Reader,
         allocator: std.mem.Allocator,
         limits: Limits,
+        trailer_names: []const []const u8,
         transfer_buffer: []u8,
         line_buffer: []u8,
     ) *Io.Reader {
@@ -86,6 +88,7 @@ pub const Chunked = struct {
             .source = source,
             .allocator = allocator,
             .limits = limits,
+            .trailer_names = trailer_names,
             .line_buffer = line_buffer,
             .interface = .{ .vtable = &.{ .stream = stream }, .buffer = transfer_buffer, .seek = 0, .end = 0 },
         };
@@ -141,7 +144,9 @@ pub const Chunked = struct {
     fn readTrailers(self: *Chunked) !void {
         while (true) {
             const line = try self.readLine(true);
-            if (line.len == 0) return;
+            if (line.len == 0) {
+                return trailer_policy.validateFields(self.trailer_names, self.trailers());
+            }
             if (self.trailers_list.items.len == self.limits.trailer_count) return error.TooManyTrailers;
             const colon = std.mem.findScalar(u8, line, ':') orelse return error.InvalidTrailer;
             const name = line[0..colon];
@@ -281,6 +286,7 @@ test "chunked reader decodes strict framing, trailers, and preserves pipelining"
         &source,
         arena.allocator(),
         test_limits,
+        &.{"digest"},
         &transfer_buffer,
         &line_buffer,
     );
@@ -291,6 +297,28 @@ test "chunked reader decodes strict framing, trailers, and preserves pipelining"
 
     const pipeline = try source.allocRemaining(arena.allocator(), .unlimited);
     try std.testing.expectEqualStrings("GET /next HTTP/1.1\r\n", pipeline);
+}
+
+test "chunked reader rejects unannounced trailers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var source: Io.Reader = .fixed("0\r\nDigest: ok\r\n\r\n");
+    var chunked: Chunked = undefined;
+    var transfer_buffer: [8]u8 = undefined;
+    var line_buffer: [128]u8 = undefined;
+    const reader = chunked.init(
+        &source,
+        arena.allocator(),
+        test_limits,
+        &.{},
+        &transfer_buffer,
+        &line_buffer,
+    );
+    try std.testing.expectError(
+        error.ReadFailed,
+        reader.allocRemaining(arena.allocator(), .unlimited),
+    );
+    try std.testing.expect(chunked.failure.? == error.UnadvertisedTrailer);
 }
 
 test "chunked reader rejects non-hex sizes and bare LF framing" {
@@ -305,6 +333,7 @@ test "chunked reader rejects non-hex sizes and bare LF framing" {
         &non_hex_source,
         arena.allocator(),
         test_limits,
+        &.{},
         &non_hex_transfer,
         &non_hex_line,
     );
@@ -322,6 +351,7 @@ test "chunked reader rejects non-hex sizes and bare LF framing" {
         &bare_lf_source,
         arena.allocator(),
         test_limits,
+        &.{},
         &bare_lf_transfer,
         &bare_lf_line,
     );
