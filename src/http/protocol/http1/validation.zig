@@ -1,6 +1,8 @@
 //! Strict HTTP/1 request-head validation before std.http parsing.
 
 const std = @import("std");
+const syntax = @import("syntax.zig");
+const authority = @import("authority.zig");
 
 pub const Limits = struct {
     request_line_size: usize,
@@ -55,14 +57,14 @@ pub fn validateWithLimits(head: []const u8, limits: Limits) Error!Result {
         const colon = std.mem.findScalar(u8, line, ':') orelse return error.InvalidRequestHead;
         const name = line[0..colon];
         if (name.len > limits.header_name_size) return error.HeaderNameTooLong;
-        if (!validToken(name)) return error.InvalidRequestHead;
+        if (!syntax.isToken(name)) return error.InvalidRequestHead;
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
         if (value.len > limits.header_value_size) return error.HeaderValueTooLong;
-        if (!validFieldValue(value)) return error.InvalidRequestHead;
+        if (!syntax.isFieldValue(value)) return error.InvalidRequestHead;
 
         if (std.ascii.eqlIgnoreCase(name, "host")) {
             host_count += 1;
-            if (value.len == 0 or std.mem.findScalar(u8, value, ',') != null) return error.InvalidRequestHead;
+            _ = authority.parse(value, .{}) catch return error.InvalidRequestHead;
         } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             if (has_content_length) return error.InvalidRequestHead;
             has_content_length = true;
@@ -90,12 +92,13 @@ const Version = enum { http_1_0, http_1_1 };
 fn validateRequestLine(line: []const u8) Error!Version {
     if (std.mem.findScalar(u8, line, '\t') != null) return error.InvalidRequestHead;
     const method_end = std.mem.findScalar(u8, line, ' ') orelse return error.InvalidRequestHead;
-    if (method_end == 0 or !validToken(line[0..method_end])) return error.InvalidRequestHead;
+    if (method_end == 0 or !syntax.isToken(line[0..method_end])) return error.InvalidRequestHead;
 
     const target_start = method_end + 1;
     if (target_start >= line.len or line[target_start] == ' ') return error.InvalidRequestHead;
     const target_end = std.mem.findScalarPos(u8, line, target_start, ' ') orelse return error.InvalidRequestHead;
-    if (target_end == target_start or target_end + 1 >= line.len) return error.InvalidRequestHead;
+    if (target_end == target_start or target_end + 1 >= line.len or
+        !syntax.isRequestTarget(line[target_start..target_end])) return error.InvalidRequestHead;
     if (std.mem.findScalar(u8, line[target_end + 1 ..], ' ') != null) return error.InvalidRequestHead;
 
     return if (std.mem.eql(u8, line[target_end + 1 ..], "HTTP/1.1"))
@@ -104,25 +107,6 @@ fn validateRequestLine(line: []const u8) Error!Version {
         .http_1_0
     else
         error.UnsupportedHttpVersion;
-}
-
-fn validToken(value: []const u8) bool {
-    if (value.len == 0) return false;
-    for (value) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and
-            byte != '!' and byte != '#' and byte != '$' and byte != '%' and
-            byte != '&' and byte != '\'' and byte != '*' and byte != '+' and
-            byte != '-' and byte != '.' and byte != '^' and byte != '_' and
-            byte != '`' and byte != '|' and byte != '~') return false;
-    }
-    return true;
-}
-
-fn validFieldValue(value: []const u8) bool {
-    for (value) |byte| {
-        if ((byte < 0x20 and byte != '\t') or byte == 0x7f) return false;
-    }
-    return true;
 }
 
 // -----------------------------------------------------------------------------

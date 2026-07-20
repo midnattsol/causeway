@@ -3,6 +3,8 @@
 const std = @import("std");
 
 pub const connection = @import("connection.zig");
+pub const syntax = @import("syntax.zig");
+pub const authority = @import("authority.zig");
 
 /// Configuration consumed by the HTTP/1 connection driver.
 pub const Options = connection.Options;
