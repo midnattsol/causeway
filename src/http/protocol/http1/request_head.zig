@@ -4,6 +4,7 @@ const std = @import("std");
 const head_module = @import("head.zig");
 const protocol_error = @import("protocol_error.zig");
 const validation = @import("validation.zig");
+const ConnectionControl = @import("../../transport/server.zig").ConnectionControl;
 const Io = std.Io;
 
 pub const Outcome = union(enum) {
@@ -23,9 +24,10 @@ pub fn receive(
     automatic_date: bool,
     timeout: ?Io.Duration,
     keep_alive: bool,
+    control: ?ConnectionControl,
 ) !Outcome {
-    const head_buffer = receiveWithTimeout(io, input, allocator, maximum, timeout, keep_alive) catch |err| switch (err) {
-        error.HttpConnectionClosing => return .close,
+    const head_buffer = receiveWithTimeout(io, input, allocator, maximum, timeout, keep_alive, control) catch |err| switch (err) {
+        error.HttpConnectionClosing, error.ConnectionDraining => return .close,
         error.HttpHeadersOversize => {
             try writeProtocolError(io, output, automatic_date, .@"HTTP/1.1", .request_header_fields_too_large, "request headers too large");
             return .close;
@@ -71,7 +73,20 @@ fn receiveWithTimeout(
     maximum: usize,
     timeout: ?Io.Duration,
     keep_alive: bool,
+    control: ?ConnectionControl,
 ) anyerror![]const u8 {
+    if (control) |connection_control| {
+        if (connection_control.isDraining()) return error.ConnectionDraining;
+        return receiveWithDrain(
+            io,
+            input,
+            allocator,
+            maximum,
+            timeout,
+            keep_alive,
+            connection_control,
+        );
+    }
     const duration = timeout orelse return receiveHead(input, allocator, maximum);
     const Result = union(enum) {
         receive: anyerror![]const u8,
@@ -97,6 +112,49 @@ fn receiveWithTimeout(
         .timeout => |timeout_result| blk: {
             try timeout_result;
             break :blk if (keep_alive) error.KeepAliveTimeout else error.RequestHeadTimeout;
+        },
+    };
+}
+
+fn receiveWithDrain(
+    io: Io,
+    input: *Io.Reader,
+    allocator: std.mem.Allocator,
+    maximum: usize,
+    timeout: ?Io.Duration,
+    keep_alive: bool,
+    control: ConnectionControl,
+) ![]const u8 {
+    const Result = union(enum) {
+        receive: anyerror![]const u8,
+        timeout: anyerror!void,
+        drain: anyerror!void,
+    };
+    const Runner = struct {
+        fn run(source: *Io.Reader, arena: std.mem.Allocator, limit: usize) anyerror![]const u8 {
+            return receiveHead(source, arena, limit);
+        }
+    };
+
+    var results: [3]Result = undefined;
+    var select = Io.Select(Result).init(io, &results);
+    select.async(.receive, Runner.run, .{ input, allocator, maximum });
+    select.async(.drain, ConnectionControl.waitForDrain, .{ control, io });
+    if (timeout) |duration| select.async(.timeout, waitForTimeout, .{ io, duration });
+    const result = select.await() catch |err| {
+        select.cancelDiscard();
+        return err;
+    };
+    defer select.cancelDiscard();
+    return switch (result) {
+        .receive => |receive_result| try receive_result,
+        .timeout => |timeout_result| blk: {
+            try timeout_result;
+            break :blk if (keep_alive) error.KeepAliveTimeout else error.RequestHeadTimeout;
+        },
+        .drain => |drain_result| blk: {
+            try drain_result;
+            break :blk error.ConnectionDraining;
         },
     };
 }

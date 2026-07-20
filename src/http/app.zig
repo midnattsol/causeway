@@ -122,6 +122,7 @@ fn AppConfigured(
             state: *State,
             allocator: std.mem.Allocator,
             stream: Io.net.Stream,
+            control: server.ConnectionControl,
             io: Io,
         ) anyerror!void {
             if (Locals) |RequestLocals| {
@@ -130,7 +131,7 @@ fn AppConfigured(
                     state,
                     connection_options,
                 );
-                return handler.handle(stream, io);
+                return handler.handle(stream, control, io);
             }
 
             var handler = Protocol.Handler(State, Dispatcher).init(
@@ -138,7 +139,7 @@ fn AppConfigured(
                 state,
                 connection_options,
             );
-            return handler.handle(stream, io);
+            return handler.handle(stream, control, io);
         }
     };
 }

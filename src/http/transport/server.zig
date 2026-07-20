@@ -71,13 +71,27 @@ pub const ListenerOptions = struct {
     failure_policy: ?ListenerFailurePolicy = null,
 };
 
+/// Read-only graceful-drain notification shared with one connection handler.
+pub const ConnectionControl = struct {
+    draining: *const std.atomic.Value(bool),
+    drain_event: *Io.Event,
+
+    pub fn isDraining(self: ConnectionControl) bool {
+        return self.draining.load(.acquire);
+    }
+
+    pub fn waitForDrain(self: ConnectionControl, io: Io) !void {
+        try self.drain_event.wait(io);
+    }
+};
+
 /// Type-erased boundary between transport lifecycle and connection protocol handling.
 ///
 /// Type erasure occurs once per accepted connection. The configured function may
 /// recover its typed application context and keep request dispatch fully static.
 pub const ConnectionHandler = struct {
     context: ?*anyopaque,
-    run_fn: *const fn (?*anyopaque, std.mem.Allocator, net.Stream, Io) anyerror!void,
+    run_fn: *const fn (?*anyopaque, std.mem.Allocator, net.Stream, ConnectionControl, Io) anyerror!void,
 
     /// Adapts a typed context and connection function to the server boundary.
     pub fn init(
@@ -88,9 +102,15 @@ pub const ConnectionHandler = struct {
         return .{
             .context = @ptrCast(context),
             .run_fn = struct {
-                fn call(raw_context: ?*anyopaque, allocator: std.mem.Allocator, stream: net.Stream, io: Io) anyerror!void {
+                fn call(
+                    raw_context: ?*anyopaque,
+                    allocator: std.mem.Allocator,
+                    stream: net.Stream,
+                    control: ConnectionControl,
+                    io: Io,
+                ) anyerror!void {
                     const typed_context: *Context = @ptrCast(@alignCast(raw_context.?));
-                    return handler_fn(typed_context, allocator, stream, io);
+                    return handler_fn(typed_context, allocator, stream, control, io);
                 }
             }.call,
         };
@@ -101,15 +121,27 @@ pub const ConnectionHandler = struct {
         return .{
             .context = null,
             .run_fn = struct {
-                fn close(_: ?*anyopaque, _: std.mem.Allocator, stream: net.Stream, io: Io) anyerror!void {
+                fn close(
+                    _: ?*anyopaque,
+                    _: std.mem.Allocator,
+                    stream: net.Stream,
+                    _: ConnectionControl,
+                    io: Io,
+                ) anyerror!void {
                     stream.close(io);
                 }
             }.close,
         };
     }
 
-    fn run(self: ConnectionHandler, allocator: std.mem.Allocator, stream: net.Stream, io: Io) anyerror!void {
-        return self.run_fn(self.context, allocator, stream, io);
+    fn run(
+        self: ConnectionHandler,
+        allocator: std.mem.Allocator,
+        stream: net.Stream,
+        control: ConnectionControl,
+        io: Io,
+    ) anyerror!void {
+        return self.run_fn(self.context, allocator, stream, control, io);
     }
 };
 
@@ -311,6 +343,8 @@ pub const Server = struct {
     // Admission uses atomics for the global slot count and a futex epoch to
     // wake exactly the paths waiting for released capacity.
     capacity_epoch: std.atomic.Value(u32) = .init(0),
+    draining: std.atomic.Value(bool) = .init(false),
+    drain_event: Io.Event = .unset,
 
     // The mutex serializes public control-plane submissions. A caller keeps it
     // locked while the bounded mailbox lends its stack operation to the sole
@@ -696,7 +730,10 @@ pub const Server = struct {
     }
 
     fn handleConnection(self: *Server, stream: net.Stream) anyerror!void {
-        return self.connection_handler.run(self.allocator, stream, self.io);
+        return self.connection_handler.run(self.allocator, stream, .{
+            .draining = &self.draining,
+            .drain_event = &self.drain_event,
+        }, self.io);
     }
 
     fn runConnection(self: *Server, stream: net.Stream) ConnectionOutcome {
@@ -832,6 +869,8 @@ pub const Server = struct {
     fn gracefulStopOwned(self: *Server) ?anyerror {
         self.state.store(.stopping, .release);
         const first_error = self.stopAllOwned();
+        self.draining.store(true, .release);
+        self.drain_event.set(self.io);
         const drain_error = self.drainConnectionsOwned();
         self.state.store(.stopped, .release);
         return first_error orelse drain_error;
@@ -999,7 +1038,7 @@ fn testAddress(port: u16) net.IpAddress {
 }
 
 const TestConnectionHandler = struct {
-    fn run(_: *@This(), _: std.mem.Allocator, stream: net.Stream, io: Io) void {
+    fn run(_: *@This(), _: std.mem.Allocator, stream: net.Stream, _: ConnectionControl, io: Io) void {
         stream.close(io);
     }
 };

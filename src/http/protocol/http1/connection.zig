@@ -18,6 +18,7 @@ const Exchange = @import("../../exchange.zig").Exchange;
 const exchange_adapter = @import("exchange.zig");
 const protocol_error = @import("protocol_error.zig");
 const request_body_adapter = @import("request_body.zig");
+const ConnectionControl = @import("../../transport/server.zig").ConnectionControl;
 const conditional = @import("../../semantics/conditional.zig");
 const request_head = @import("request_head.zig");
 const head_module = @import("head.zig");
@@ -167,7 +168,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         /// Serves HTTP requests on `stream` until keep-alive ends or an error occurs.
         /// The stream is closed exactly once when this function returns.
-        pub fn handle(self: *Self, stream: net.Stream, io: Io) !void {
+        pub fn handle(self: *Self, stream: net.Stream, control: ConnectionControl, io: Io) !void {
             defer stream.close(io);
             try validateOptions(self.options);
 
@@ -178,7 +179,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
             var stream_reader = stream.reader(io, read_buffer);
             var stream_writer = stream.writer(io, write_buffer);
-            try self.serve(&stream_reader.interface, &stream_writer.interface, io);
+            try self.serveControlled(&stream_reader.interface, &stream_writer.interface, control, io);
         }
 
         const RequestOutcome = enum { keep_alive, close };
@@ -187,6 +188,27 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         /// Serves an HTTP/1 connection over caller-owned streams.
         /// Unlike `handle`, this function does not close an underlying transport.
         pub fn serve(self: *Self, input: *Io.Reader, output: *Io.Writer, io: Io) !void {
+            return self.serveInternal(input, output, null, io);
+        }
+
+        /// Serves caller-owned streams while observing transport graceful drain.
+        pub fn serveControlled(
+            self: *Self,
+            input: *Io.Reader,
+            output: *Io.Writer,
+            control: ConnectionControl,
+            io: Io,
+        ) !void {
+            return self.serveInternal(input, output, control, io);
+        }
+
+        fn serveInternal(
+            self: *Self,
+            input: *Io.Reader,
+            output: *Io.Writer,
+            control: ?ConnectionControl,
+            io: Io,
+        ) !void {
             try validateOptions(self.options);
             const transfer_buffer = try self.allocator.alloc(u8, self.options.transfer_buffer_size);
             defer self.allocator.free(transfer_buffer);
@@ -202,6 +224,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     transfer_buffer,
                     arena.allocator(),
                     request_count,
+                    control,
                 );
                 if (outcome == .close) return;
                 request_count += 1;
@@ -217,6 +240,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             transfer_buffer: []u8,
             request_allocator: std.mem.Allocator,
             completed_requests: usize,
+            control: ?ConnectionControl,
         ) !RequestOutcome {
             const head_timeout = if (completed_requests == 0)
                 self.options.request_head_timeout
@@ -237,6 +261,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 self.options.automatic_date,
                 head_timeout,
                 completed_requests != 0,
+                control,
             )) {
                 .request => |request_head_value| request_head_value,
                 .close => return .close,
@@ -273,7 +298,8 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             };
 
             const connection_keep_alive = head.keep_alive and
-                !requestLimitReached(self.options.max_requests, request_count);
+                !requestLimitReached(self.options.max_requests, request_count) and
+                !(if (control) |connection_control| connection_control.isDraining() else false);
             var response = Dispatcher.dispatch(&context) catch |err| {
                 const failure = dispatchFailure(err, self.options.handler_error_policy) orelse return err;
                 const body_complete = self.finishRequestBody(head.expect_continue, request.body);
@@ -343,6 +369,10 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 .target = head.target,
                 .path = head.target.path() orelse "",
                 .query = head.target.query(),
+                .scheme = switch (head.target) {
+                    .absolute => |absolute| absolute.scheme,
+                    else => null,
+                },
                 .headers = head.headers,
                 .effective_authority = head.effective_authority,
                 .body = .init(body_state),
@@ -1123,6 +1153,35 @@ test "unsupported HTTP versions receive 505" {
     );
     defer std.testing.allocator.free(output);
     try std.testing.expect(std.mem.find(u8, output, "505 HTTP Version Not Supported") != null);
+}
+
+test "connection graceful drain wakes an idle request-head read" {
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(4));
+    const io = threaded.io();
+
+    var input_buffer: [256]u8 = undefined;
+    var blocked = SlowInput.init(io, &input_buffer, 0);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var draining: std.atomic.Value(bool) = .init(false);
+    var drain_event: Io.Event = .unset;
+    const control: ConnectionControl = .{ .draining = &draining, .drain_event = &drain_event };
+    const Trigger = struct {
+        fn run(task_io: Io, flag: *std.atomic.Value(bool), event: *Io.Event) !void {
+            try Io.sleep(task_io, .fromMilliseconds(1), .awake);
+            flag.store(true, .release);
+            event.set(task_io);
+        }
+    };
+    var trigger = Io.async(io, Trigger.run, .{ io, &draining, &drain_event });
+    var state: TestState = .{};
+    var handler = Handler(TestState, TestDispatcher).init(std.testing.allocator, &state, .{});
+    try handler.serveControlled(&blocked.reader, &output.writer, control, io);
+    try trigger.await(io);
+    try std.testing.expectEqual(@as(usize, 0), state.requests);
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
 }
 
 test "connection request-head and keep-alive phase timeouts cancel blocked reads" {

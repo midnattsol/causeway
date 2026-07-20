@@ -123,6 +123,10 @@ pub const Request = struct {
     /// Routable path, or an empty slice for authority-form and asterisk-form.
     path: []const u8,
     query: ?[]const u8 = null,
+    /// Effective URI scheme when supplied by the wire protocol.
+    scheme: ?[]const u8 = null,
+    /// Extended CONNECT protocol, such as `websocket`, when present.
+    protocol: ?[]const u8 = null,
     headers: Headers = .empty,
     /// Authority selected by the wire protocol after applying target-form rules.
     effective_authority: ?[]const u8 = null,
@@ -152,6 +156,10 @@ pub const Request = struct {
             .target = target,
             .path = target.path() orelse "",
             .query = target.query(),
+            .scheme = switch (target) {
+                .absolute => |absolute| absolute.scheme,
+                else => null,
+            },
             .headers = headers,
             .body = body,
         };
@@ -285,6 +293,8 @@ test "Request parses all HTTP request-target forms and preserves version" {
     );
     try std.testing.expectEqual(.http_1_0, absolute.version);
     try std.testing.expectEqualStrings("http", absolute.target.absolute.scheme);
+    try std.testing.expectEqualStrings("http", absolute.scheme.?);
+    try std.testing.expectEqual(null, absolute.protocol);
     try std.testing.expectEqualStrings("example.com", absolute.target.absolute.authority);
     try std.testing.expectEqualStrings("/users", absolute.path);
     try std.testing.expectEqualStrings("page=2", absolute.query.?);
