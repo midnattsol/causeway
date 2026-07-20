@@ -12,6 +12,7 @@ pub const RequestHead = struct {
     authority: ?[]const u8,
     path: ?[]const u8,
     protocol: ?[]const u8,
+    content_length: ?u64,
     headers: Headers,
 
     /// Returns the request target used by the protocol-independent Request model.
@@ -45,6 +46,7 @@ pub fn parseRequest(fields: []const Header, extended_connect_enabled: bool) !Req
 
     const method = try request_module.Method.parse(method_value orelse return error.MissingMethod);
     const regular: Headers = .{ .items = fields[regular_start..] };
+    const content_length = try parseContentLength(regular);
     if (authority) |pseudo_authority| {
         if (regular.get("host")) |host| {
             if (!std.mem.eql(u8, pseudo_authority, host)) return error.AuthorityMismatch;
@@ -72,6 +74,7 @@ pub fn parseRequest(fields: []const Header, extended_connect_enabled: bool) !Req
         .authority = authority orelse regular.get("host"),
         .path = path,
         .protocol = protocol,
+        .content_length = content_length,
         .headers = regular,
     };
 }
@@ -156,6 +159,24 @@ fn validateRegular(field: Header, kind: BlockKind) !void {
     }
 }
 
+fn parseContentLength(headers: Headers) !?u64 {
+    var result: ?u64 = null;
+    var values = headers.values("content-length");
+    while (values.next()) |value| {
+        if (value.len == 0) return error.InvalidContentLength;
+        var parsed: u64 = 0;
+        for (value) |byte| {
+            if (!std.ascii.isDigit(byte)) return error.InvalidContentLength;
+            parsed = std.math.mul(u64, parsed, 10) catch return error.InvalidContentLength;
+            parsed = std.math.add(u64, parsed, byte - '0') catch return error.InvalidContentLength;
+        }
+        if (result) |previous| {
+            if (previous != parsed) return error.ConflictingContentLength;
+        } else result = parsed;
+    }
+    return result;
+}
+
 fn setOnce(destination: *?[]const u8, value: []const u8) !void {
     if (destination.* != null) return error.DuplicatePseudoHeader;
     destination.* = value;
@@ -212,6 +233,23 @@ test "HTTP/2 rejects malformed pseudo and connection-specific fields" {
         .{ .name = ":path", .value = "/" },
         .{ .name = "connection", .value = "close" },
     }, false));
+}
+
+test "HTTP/2 content-length values must be decimal and consistent" {
+    const base = [_]Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "content-length", .value = "3" },
+        .{ .name = "content-length", .value = "3" },
+    };
+    try std.testing.expectEqual(@as(?u64, 3), (try parseRequest(&base, false)).content_length);
+    var conflicting = base;
+    conflicting[4].value = "4";
+    try std.testing.expectError(error.ConflictingContentLength, parseRequest(&conflicting, false));
+    var invalid = base;
+    invalid[3].value = "+3";
+    try std.testing.expectError(error.InvalidContentLength, parseRequest(&invalid, false));
 }
 
 test "HTTP/2 response and trailers enforce their pseudo-header sets" {
