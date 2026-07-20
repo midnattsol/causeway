@@ -1,6 +1,7 @@
 const std = @import("std");
 const frame = @import("http/protocol/http2/frame.zig");
 const frame_reader = @import("http/protocol/http2/frame_reader.zig");
+const hpack = @import("http/protocol/http2/hpack/codec.zig");
 const huffman = @import("http/protocol/http2/hpack/huffman.zig");
 const integer = @import("http/protocol/http2/hpack/integer.zig");
 
@@ -22,6 +23,7 @@ fn fuzzProtocol(_: void, smith: *std.testing.Smith) !void {
     const length = smith.slice(&bytes);
     const input = bytes[0..length];
     try fuzzHpack(input);
+    try fuzzHpackBlock(input);
     fuzzFrame(input);
 }
 
@@ -48,6 +50,36 @@ fn fuzzFrame(input: []const u8) void {
         .max_frame_size = payload_buffer.len,
     };
     _ = decoder.next() catch {};
+}
+
+fn fuzzHpackBlock(input: []const u8) !void {
+    const limits: hpack.Limits = .{
+        .dynamic_table_size = 4096,
+        .header_list_size = 16 * 1024,
+        .header_count = 100,
+        .string_size = 4096,
+        .encoded_string_size = 4096,
+    };
+    var decoder = try hpack.Decoder.init(std.testing.allocator, limits);
+    defer decoder.deinit();
+    var block = decoder.decode(std.testing.allocator, input) catch return;
+    defer block.deinit();
+
+    var encoder = try hpack.Encoder.init(std.testing.allocator, limits.dynamic_table_size);
+    defer encoder.deinit();
+    var encoded: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded.deinit();
+    try encoder.encode(&encoded.writer, block.items);
+
+    var verifier = try hpack.Decoder.init(std.testing.allocator, limits);
+    defer verifier.deinit();
+    var round_trip = try verifier.decode(std.testing.allocator, encoded.written());
+    defer round_trip.deinit();
+    try std.testing.expectEqual(block.items.len, round_trip.items.len);
+    for (block.items, round_trip.items) |expected, actual| {
+        try std.testing.expectEqualSlices(u8, expected.name, actual.name);
+        try std.testing.expectEqualSlices(u8, expected.value, actual.value);
+    }
 }
 
 fn fuzzHpack(input: []const u8) !void {
