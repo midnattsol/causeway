@@ -217,9 +217,9 @@ pub const RequestBody = struct {
         }
     }
 
-    /// Consumes and discards a pending body without allocating, allowing the
-    /// connection to remain reusable. A stream already claimed elsewhere
-    /// remains exclusive and cannot be discarded through this handle.
+    /// Consumes and discards a body without allocating, allowing the connection
+    /// to remain reusable. A stream already claimed by the completed handler may
+    /// be drained through the shared request-scoped state.
     /// Returns request trailers after the body has been fully consumed.
     /// Trailer names and values are copied into request-owned memory.
     pub fn trailers(self: RequestBody) !Headers {
@@ -238,15 +238,42 @@ pub const RequestBody = struct {
     }
 
     pub fn discard(self: RequestBody) !void {
+        const complete = try self.discardUpTo(std.math.maxInt(usize), null);
+        std.debug.assert(complete);
+    }
+
+    /// Discards at most `maximum` bytes and reports whether the body reached EOF.
+    /// A claimed stream may be drained after its handler has returned because all
+    /// `RequestBody` handles share the same request-scoped state.
+    pub fn discardUpTo(
+        self: RequestBody,
+        maximum: usize,
+        read_timeout: ?Io.Duration,
+    ) !bool {
         switch (self.state.status) {
-            .absent, .buffered, .consumed => return,
-            .streaming => return error.BodyAlreadyClaimed,
+            .absent, .buffered, .consumed => return true,
             .failed => |err| return err,
-            .pending => {},
+            .pending => |*pending| {
+                if (read_timeout != null) pending.read_timeout = read_timeout;
+                _ = try self.claimStream();
+            },
+            .streaming => |*streaming| {
+                if (read_timeout != null) streaming.pending.read_timeout = read_timeout;
+            },
         }
-        const stream = (try self.claimStream()).?;
+
+        const stream: BodyStream = .{ .state = self.state };
+        var discarded: usize = 0;
         var buffer: [4096]u8 = undefined;
-        while (try stream.read(&buffer) != 0) {}
+        while (discarded < maximum) {
+            const remaining = maximum - discarded;
+            const read = try stream.read(buffer[0..@min(buffer.len, remaining)]);
+            if (read == 0) return true;
+            discarded += read;
+        }
+
+        var probe: [1]u8 = undefined;
+        return try stream.read(&probe) == 0;
     }
 };
 
@@ -468,6 +495,18 @@ test "RequestBody buffered reads distinguish an exact limit from overflow" {
     var long_reader: Io.Reader = .fixed("abcde");
     var long_state = RequestBody.State.initReader(&long_reader, std.testing.allocator, 4);
     try std.testing.expectError(error.StreamTooLong, RequestBody.init(&long_state).readAll());
+}
+
+test "RequestBody bounds discard work and can finish a claimed stream" {
+    var reader: Io.Reader = .fixed("abcdef");
+    var state = RequestBody.State.initReader(&reader, std.testing.allocator, 16);
+    const body = RequestBody.init(&state);
+    const stream = (try body.claimStream()).?;
+    var prefix: [2]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try stream.read(&prefix));
+
+    try std.testing.expect(!try body.discardUpTo(2, null));
+    try std.testing.expect(body.status() == .streaming);
 }
 
 test "RequestBody discards a pending body without allocation" {

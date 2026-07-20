@@ -36,6 +36,13 @@ pub const HandlerErrorPolicy = enum {
     propagate,
 };
 
+/// Controls whether unread request bodies force connection closure or are
+/// drained within explicit work and time bounds.
+pub const UnreadBodyPolicy = enum {
+    close,
+    drain,
+};
+
 /// HTTP protocol resources and limits applied to each connection.
 pub const Options = struct {
     /// Maximum complete request-head size and stream read-buffer capacity.
@@ -68,6 +75,12 @@ pub const Options = struct {
     request_body_timeout: ?Io.Duration = null,
     /// Default maximum duration for emitting a response.
     response_write_timeout: ?Io.Duration = null,
+    /// Action taken when a handler returns before consuming its request body.
+    unread_body_policy: UnreadBodyPolicy = .close,
+    /// Maximum unread bytes discarded in an attempt to preserve keep-alive.
+    max_unread_body_drain_size: usize = 64 * 1024,
+    /// Idle timeout used while draining, or `request_body_timeout` when null.
+    unread_body_drain_timeout: ?Io.Duration = null,
     /// Emits an RFC 9110 `Date` field when the real-time clock is available.
     automatic_date: bool = true,
     /// Action taken when application dispatch returns an error.
@@ -90,6 +103,8 @@ pub const ConfigurationError = error{
     InvalidKeepAliveTimeout,
     InvalidRequestBodyTimeout,
     InvalidResponseWriteTimeout,
+    InvalidUnreadBodyDrainSize,
+    InvalidUnreadBodyDrainTimeout,
 };
 
 /// Returns a connection-handler type specialized for application state and a dispatcher.
@@ -242,7 +257,8 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 !requestLimitReached(self.options.max_requests, request_count);
             var response = Dispatcher.dispatch(&context) catch |err| {
                 const failure = dispatchFailure(err, self.options.handler_error_policy) orelse return err;
-                const keep_alive = connection_keep_alive and requestBodyComplete(request.body);
+                const body_complete = self.finishRequestBody(&incoming, request.body);
+                const keep_alive = connection_keep_alive and body_complete;
                 suppressUnusedExpectation(&incoming, request.body);
                 try respondGeneratedError(
                     io,
@@ -261,7 +277,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     response.write_deadline = .fromNow(io, .{ .raw = timeout, .clock = .awake });
                 }
             }
-            const body_complete = requestBodyComplete(request.body);
+            const body_complete = self.finishRequestBody(&incoming, request.body);
             suppressUnusedExpectation(&incoming, request.body);
             const outcome = response_writer.write(
                 io,
@@ -349,6 +365,19 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
             return .{ .request = request };
         }
+
+        fn finishRequestBody(
+            self: *Self,
+            incoming: *const std.http.Server.Request,
+            body: RequestBody,
+        ) bool {
+            if (requestBodyComplete(body)) return true;
+            if (self.options.unread_body_policy == .close) return false;
+            if (incoming.head.expect != null and body.status() == .pending) return false;
+
+            const timeout = self.options.unread_body_drain_timeout orelse self.options.request_body_timeout;
+            return body.discardUpTo(self.options.max_unread_body_drain_size, timeout) catch false;
+        }
     };
 }
 
@@ -407,6 +436,10 @@ fn validateOptions(options: Options) ConfigurationError!void {
     }
     if (options.response_write_timeout) |timeout| {
         if (timeout.nanoseconds <= 0) return error.InvalidResponseWriteTimeout;
+    }
+    if (options.max_unread_body_drain_size == 0) return error.InvalidUnreadBodyDrainSize;
+    if (options.unread_body_drain_timeout) |timeout| {
+        if (timeout.nanoseconds <= 0) return error.InvalidUnreadBodyDrainTimeout;
     }
 }
 
@@ -616,6 +649,9 @@ const TestDispatcher = struct {
         }
         if (std.mem.eql(u8, context.request.path, "/ignore")) {
             return .{ .status = .unauthorized, .connection = .close };
+        }
+        if (std.mem.eql(u8, context.request.path, "/ignore-keepalive")) {
+            return .{ .status = .unauthorized };
         }
         if (std.mem.eql(u8, context.request.path, "/not-modified")) {
             return .{ .status = .not_modified };
@@ -1262,6 +1298,45 @@ test "response can close a keep-alive connection before the next request" {
     try std.testing.expectEqual(@as(usize, 1), state.requests);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "HTTP/1.1 200 OK"));
     try std.testing.expect(std.mem.find(u8, output, "connection: close") != null);
+}
+
+test "bounded unread-body draining preserves keep-alive only after complete consumption" {
+    const requests = "POST /ignore-keepalive HTTP/1.1\r\nhost: example.com\r\ncontent-length: 4\r\n\r\ndata" ++
+        "GET /next HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n";
+
+    var drained_state: TestState = .{};
+    const drained = try serveTest(requests, .{
+        .unread_body_policy = .drain,
+        .max_unread_body_drain_size = 4,
+    }, &drained_state);
+    defer std.testing.allocator.free(drained);
+    try std.testing.expectEqual(@as(usize, 2), drained_state.requests);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, drained, "HTTP/1.1"));
+
+    var bounded_state: TestState = .{};
+    const bounded = try serveTest(requests, .{
+        .unread_body_policy = .drain,
+        .max_unread_body_drain_size = 3,
+    }, &bounded_state);
+    defer std.testing.allocator.free(bounded);
+    try std.testing.expectEqual(@as(usize, 1), bounded_state.requests);
+
+    var close_state: TestState = .{};
+    const closed = try serveTest(requests, .{}, &close_state);
+    defer std.testing.allocator.free(closed);
+    try std.testing.expectEqual(@as(usize, 1), close_state.requests);
+}
+
+test "unread Expect body is not activated for draining" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "POST /ignore-keepalive HTTP/1.1\r\nhost: example.com\r\ncontent-length: 4\r\nexpect: 100-continue\r\n\r\n",
+        .{ .unread_body_policy = .drain },
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.find(u8, output, "401 Unauthorized") != null);
+    try std.testing.expect(std.mem.find(u8, output, "100 Continue") == null);
 }
 
 test "connection serves multiple keep-alive requests" {

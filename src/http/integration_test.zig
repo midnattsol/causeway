@@ -404,6 +404,44 @@ test "end-to-end keep-alive serves two requests on one socket" {
     try testing.expectEqual(@as(usize, 2), state.count);
 }
 
+fn ignoreBodyHandler(state: extractors.State(KeepAliveState)) Response {
+    state.value.count += 1;
+    return .{ .status = .unauthorized };
+}
+
+const DrainRouter = routing.router.Router(.{
+    routing.route.route(.POST, "/ignore", ignoreBodyHandler),
+    routing.route.route(.GET, "/count", keepAliveHandler),
+});
+const DrainApp = app_module.AppWithOptions(KeepAliveState, DrainRouter, .{
+    .unread_body_policy = .drain,
+    .max_unread_body_drain_size = 4,
+});
+
+test "end-to-end bounded body draining preserves keep-alive" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(16));
+    const io = threaded.io();
+    var state: KeepAliveState = .{};
+    var app = DrainApp.init(testing.allocator, io, &state, server_options);
+    defer app.deinit();
+    var harness = Harness(DrainApp).init(&app);
+    try harness.start();
+    defer harness.stop() catch {};
+
+    const raw = try rawRequest(testing.allocator, io, harness.address, "POST /ignore HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\ndata" ++
+        "GET /count HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    defer testing.allocator.free(raw);
+    const first = try parseResponse(raw, 0);
+    const second = try parseResponse(raw, first.next_offset);
+    try testing.expectEqual(@as(u16, 401), first.status);
+    try testing.expectEqual(@as(u16, 200), second.status);
+    try testing.expectEqualStrings("two", second.body);
+    try harness.stop();
+    try testing.expectEqual(@as(usize, 2), state.count);
+}
+
 const LimitState = struct { handler_calls: usize = 0 };
 
 fn limitedHandler(state: extractors.State(LimitState)) Response {
