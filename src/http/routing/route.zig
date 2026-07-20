@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Response = @import("../message/response.zig").Response;
+const Method = @import("../message/request.zig").Method;
 const handler = @import("../handlers/handler.zig");
 const middleware_chain = @import("../middleware/chain.zig");
 
@@ -12,7 +13,7 @@ fn RouteType(
     comptime route_body_limit: ?usize,
 ) type {
     return struct {
-        method: std.http.Method,
+        method: Method,
         pattern: []const u8,
         handler_fn: *const Handler,
 
@@ -60,7 +61,7 @@ fn HandlerTerminal(comptime handler_fn: anytype) type {
 
 /// Creates a statically typed route without route-local middleware.
 pub fn route(
-    comptime method: std.http.Method,
+    comptime method: Method,
     comptime pattern: []const u8,
     comptime handler_fn: anytype,
 ) RouteType(@TypeOf(handler_fn), .{}, null) {
@@ -69,7 +70,7 @@ pub fn route(
 
 /// Creates a statically typed route wrapped in `middlewares`.
 pub fn routeWith(
-    comptime method: std.http.Method,
+    comptime method: Method,
     comptime pattern: []const u8,
     comptime handler_fn: anytype,
     comptime middlewares: anytype,
@@ -137,9 +138,14 @@ const Inner = struct {
 test "route stores its method pattern and handler" {
     const value = comptime route(.GET, "/users/:id", firstHandler);
 
-    try std.testing.expectEqual(std.http.Method.GET, value.method);
+    try std.testing.expect(value.method.eql(.GET));
     try std.testing.expectEqualStrings("/users/:id", value.pattern);
     try std.testing.expect(value.handler_fn == firstHandler);
+}
+
+test "route accepts extension methods" {
+    const value = comptime route(Method.extension("PURGE"), "/cache", firstHandler);
+    try std.testing.expectEqualStrings("PURGE", value.method.name);
 }
 
 test "route invokes an infallible handler" {

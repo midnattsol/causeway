@@ -1,9 +1,68 @@
 //! Causeway's HTTP request representation and borrowed request data.
 
 const std = @import("std");
-pub const Method = std.http.Method;
 const Headers = @import("headers.zig").Headers;
 const RequestBody = @import("request_body.zig").RequestBody;
+
+/// An HTTP method token, including methods unknown to Zig's standard library.
+/// The token is borrowed and remains valid for the lifetime of its request or route.
+pub const Method = struct {
+    name: []const u8,
+    standard: ?std.http.Method = null,
+
+    pub const GET: Method = fromStandard(.GET);
+    pub const HEAD: Method = fromStandard(.HEAD);
+    pub const POST: Method = fromStandard(.POST);
+    pub const PUT: Method = fromStandard(.PUT);
+    pub const DELETE: Method = fromStandard(.DELETE);
+    pub const CONNECT: Method = fromStandard(.CONNECT);
+    pub const OPTIONS: Method = fromStandard(.OPTIONS);
+    pub const TRACE: Method = fromStandard(.TRACE);
+    pub const PATCH: Method = fromStandard(.PATCH);
+
+    pub const ParseError = error{InvalidMethod};
+
+    pub fn parse(name: []const u8) ParseError!Method {
+        if (!validToken(name)) return error.InvalidMethod;
+        return if (std.meta.stringToEnum(std.http.Method, name)) |standard|
+            fromStandard(standard)
+        else
+            .{ .name = name };
+    }
+
+    /// Creates a compile-time extension method for route declarations.
+    pub fn extension(comptime name: []const u8) Method {
+        if (comptime !validToken(name)) @compileError("HTTP extension method must be a non-empty token");
+        return if (std.meta.stringToEnum(std.http.Method, name)) |standard|
+            fromStandard(standard)
+        else
+            .{ .name = name };
+    }
+
+    pub fn fromStandard(method: std.http.Method) Method {
+        return .{ .name = @tagName(method), .standard = method };
+    }
+
+    pub fn eql(self: Method, other: Method) bool {
+        return std.mem.eql(u8, self.name, other.name);
+    }
+
+    pub fn is(self: Method, standard: std.http.Method) bool {
+        return self.standard == standard;
+    }
+
+    fn validToken(name: []const u8) bool {
+        if (name.len == 0) return false;
+        for (name) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and
+                byte != '!' and byte != '#' and byte != '$' and byte != '%' and
+                byte != '&' and byte != '\'' and byte != '*' and byte != '+' and
+                byte != '-' and byte != '.' and byte != '^' and byte != '_' and
+                byte != '`' and byte != '|' and byte != '~') return false;
+        }
+        return true;
+    }
+};
 
 /// Wire protocol that carried this logical HTTP request.
 pub const Version = enum {
@@ -102,7 +161,7 @@ fn parseTarget(raw: []const u8, method: Method) InitError!Target {
     if (std.mem.findScalar(u8, raw, '#') != null) return error.InvalidTarget;
 
     if (std.mem.eql(u8, raw, "*")) {
-        if (method != .OPTIONS) return error.InvalidTargetForm;
+        if (!method.is(.OPTIONS)) return error.InvalidTargetForm;
         return .asterisk;
     }
     if (raw[0] == '/') return .{ .origin = splitPathAndQuery(raw) };
@@ -129,7 +188,7 @@ fn parseTarget(raw: []const u8, method: Method) InitError!Target {
         } };
     }
 
-    if (method != .CONNECT or std.mem.findAny(u8, raw, "/?") != null) {
+    if (!method.is(.CONNECT) or std.mem.findAny(u8, raw, "/?") != null) {
         return error.InvalidTargetForm;
     }
     return .{ .authority = raw };
@@ -152,6 +211,16 @@ fn validScheme(scheme: []const u8) bool {
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
+
+test "Method preserves standard and extension tokens" {
+    try std.testing.expect(Method.GET.is(.GET));
+    try std.testing.expect(Method.GET.eql(try Method.parse("GET")));
+
+    const purge = try Method.parse("PURGE");
+    try std.testing.expectEqualStrings("PURGE", purge.name);
+    try std.testing.expectEqual(null, purge.standard);
+    try std.testing.expectError(error.InvalidMethod, Method.parse("BAD METHOD"));
+}
 
 test "Request initializes an origin-form target without query" {
     var body_state = RequestBody.State.initAbsent();

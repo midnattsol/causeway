@@ -3,6 +3,7 @@
 const std = @import("std");
 const conditional = @import("../semantics/conditional.zig");
 const Response = @import("../message/response.zig").Response;
+const Method = @import("../message/request.zig").Method;
 
 /// Applies `If-*` request preconditions to successful GET and HEAD responses
 /// carrying `ETag` and/or `Last-Modified`.
@@ -16,7 +17,7 @@ pub const Conditional = struct {
             response.body.finalize();
             response.complete(.{ .failure = error.ResponseAbandoned });
         }
-        if ((context.request.method != .GET and context.request.method != .HEAD) or
+        if ((!context.request.method.is(.GET) and !context.request.method.is(.HEAD)) or
             response.status.class() != .success)
         {
             return response;
@@ -55,7 +56,7 @@ pub const Conditional = struct {
 
 const TestContext = struct {
     request: struct {
-        method: std.http.Method,
+        method: Method,
         headers: @import("../message/headers.zig").Headers,
     },
 };

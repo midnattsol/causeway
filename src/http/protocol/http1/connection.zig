@@ -5,7 +5,9 @@ const Header = @import("../../message/headers.zig").Header;
 const Headers = @import("../../message/headers.zig").Headers;
 const context_module = @import("../../context.zig");
 const HttpContext = context_module.Context;
-const Request = @import("../../message/request.zig").Request;
+const request_module = @import("../../message/request.zig");
+const Request = request_module.Request;
+const Method = request_module.Method;
 const RequestBody = @import("../../message/request_body.zig").RequestBody;
 const response_module = @import("../../message/response.zig");
 const Response = response_module.Response;
@@ -166,19 +168,22 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 self.options.request_head_timeout
             else
                 self.options.keep_alive_timeout orelse self.options.request_head_timeout;
-            var incoming = switch (try request_head.receive(
+            const received = switch (try request_head.receive(
                 io,
                 http_server,
                 output,
+                request_allocator,
                 head_timeout,
                 completed_requests != 0,
             )) {
                 .request => |request| request,
                 .close => return .close,
             };
+            var incoming = received.request;
             const request_count = completed_requests + 1;
             const request = switch (try self.prepareRequest(
                 &incoming,
+                received.method,
                 request_allocator,
                 transfer_buffer,
                 io,
@@ -233,6 +238,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 request_allocator,
                 transfer_buffer,
                 .{
+                    .method = request.method,
                     .keep_alive = connection_keep_alive and body_complete and response.connection == .keep_alive,
                     .request_body_complete = body_complete,
                 },
@@ -249,6 +255,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         fn prepareRequest(
             self: *Self,
             incoming: *std.http.Server.Request,
+            method: Method,
             allocator: std.mem.Allocator,
             transfer_buffer: []u8,
             io: Io,
@@ -272,7 +279,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             body_state.* = .initAbsent();
             const request = Request.initVersion(
                 raw,
-                incoming.head.method,
+                method,
                 switch (incoming.head.version) {
                     .@"HTTP/1.0" => .http_1_0,
                     .@"HTTP/1.1" => .http_1_1,
@@ -365,7 +372,7 @@ fn requestHasFramedBody(incoming: *const std.http.Server.Request) bool {
 
 fn effectiveBodyLimit(
     comptime Dispatcher: type,
-    method: std.http.Method,
+    method: Method,
     path: []const u8,
     global_maximum: usize,
 ) usize {
@@ -513,19 +520,22 @@ const SlowTestProducer = struct {
 };
 
 const TestDispatcher = struct {
-    pub fn bodyLimit(method: std.http.Method, path: []const u8) ?usize {
-        if (method == .POST and std.mem.eql(u8, path, "/limited")) return 5;
+    pub fn bodyLimit(method: Method, path: []const u8) ?usize {
+        if (method.is(.POST) and std.mem.eql(u8, path, "/limited")) return 5;
         return null;
     }
 
     fn dispatch(context: *const HttpContext(TestState)) !Response {
         context.execution.state.requests += 1;
-        if (context.request.method == .CONNECT) {
+        if (context.request.method.is(.CONNECT)) {
             const takeover = try Takeover.init(
                 context.execution.allocator,
                 TestTakeover{ .expected = "ping", .reply = "tunneled" },
             );
             return Response.tunnel(.ok, .empty, takeover);
+        }
+        if (std.mem.eql(u8, context.request.path, "/method")) {
+            return .{ .status = .ok, .body = .{ .bytes = context.request.method.name } };
         }
         if (std.mem.eql(u8, context.request.path, "/fail")) return error.HandlerFailed;
         if (std.mem.eql(u8, context.request.path, "/bad-request")) return error.InvalidQuery;
@@ -845,6 +855,19 @@ test "HTTP 1.0 responses preserve the version and close-delimit unknown streams"
     try std.testing.expect(std.mem.startsWith(u8, output, "HTTP/1.0 200 OK"));
     try std.testing.expect(std.mem.find(u8, output, "transfer-encoding") == null);
     try std.testing.expect(std.mem.endsWith(u8, output, "streamed"));
+}
+
+test "extension methods reach dispatch with their original token" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "PURGE /method HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.find(u8, output, "200 OK") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "PURGE"));
 }
 
 test "unsupported HTTP versions receive 505" {

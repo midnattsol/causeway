@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Headers = @import("../message/headers.zig").Headers;
+const Method = @import("../message/request.zig").Method;
 
 pub const Decision = enum {
     proceed,
@@ -15,7 +16,7 @@ pub const Validators = struct {
 };
 
 /// Evaluates RFC 9110 request preconditions in their required precedence.
-pub fn evaluate(headers: Headers, method: std.http.Method, validators: Validators) Decision {
+pub fn evaluate(headers: Headers, method: Method, validators: Validators) Decision {
     const has_if_match = headers.contains("if-match");
     if (has_if_match) {
         if (!matchesHeaderValues(headers, "if-match", validators.etag, .strong)) return .precondition_failed;
@@ -29,12 +30,12 @@ pub fn evaluate(headers: Headers, method: std.http.Method, validators: Validator
 
     if (headers.contains("if-none-match")) {
         if (matchesHeaderValues(headers, "if-none-match", validators.etag, .weak)) {
-            return if (method == .GET or method == .HEAD)
+            return if (method.is(.GET) or method.is(.HEAD))
                 .not_modified
             else
                 .precondition_failed;
         }
-    } else if ((method == .GET or method == .HEAD) and headers.get("if-modified-since") != null) {
+    } else if ((method.is(.GET) or method.is(.HEAD)) and headers.get("if-modified-since") != null) {
         if (validators.last_modified) |modified| {
             if (parseDate(headers.get("if-modified-since").?)) |date| {
                 if (modified <= date) return .not_modified;

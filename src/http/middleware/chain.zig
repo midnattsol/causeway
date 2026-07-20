@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Response = @import("../message/response.zig").Response;
+const Method = @import("../message/request.zig").Method;
 const middleware = @import("middleware.zig");
 
 /// Returns a dispatcher that wraps `Dispatcher` in `middlewares`.
@@ -17,7 +18,7 @@ pub fn Chain(comptime middlewares: anytype, comptime Dispatcher: type) type {
 
     return struct {
         /// Forwards pre-body route metadata without executing middleware.
-        pub fn bodyLimit(method: std.http.Method, path: []const u8) ?usize {
+        pub fn bodyLimit(method: Method, path: []const u8) ?usize {
             if (comptime @hasDecl(Dispatcher, "bodyLimit")) {
                 return Dispatcher.bodyLimit(method, path);
             }
@@ -125,8 +126,8 @@ const MustNotRun = struct {
 };
 
 const LimitedDispatcher = struct {
-    pub fn bodyLimit(method: std.http.Method, path: []const u8) ?usize {
-        if (method == .POST and std.mem.eql(u8, path, "/upload")) return 512;
+    pub fn bodyLimit(method: Method, path: []const u8) ?usize {
+        if (method.is(.POST) and std.mem.eql(u8, path, "/upload")) return 512;
         return null;
     }
 

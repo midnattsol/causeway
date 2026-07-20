@@ -9,6 +9,7 @@
 const std = @import("std");
 const cookies = @import("../semantics/cookies.zig");
 const Response = @import("../message/response.zig").Response;
+const Method = @import("../message/request.zig").Method;
 
 /// Session cookie policy defaults.
 ///
@@ -192,7 +193,7 @@ const TestBackend = struct {
 const TestContext = struct {
     locals: *TestLocals,
     request: struct {
-        method: std.http.Method = .GET,
+        method: Method = .GET,
         headers: @import("../message/headers.zig").Headers,
     },
     execution: struct { allocator: std.mem.Allocator },

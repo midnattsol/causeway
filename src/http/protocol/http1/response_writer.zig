@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Headers = @import("../../message/headers.zig").Headers;
+const Method = @import("../../message/request.zig").Method;
 const response_module = @import("../../message/response.zig");
 const Response = response_module.Response;
 const ResponseBody = response_module.ResponseBody;
@@ -10,6 +11,7 @@ const Takeover = response_module.Takeover;
 const Io = std.Io;
 
 pub const Options = struct {
+    method: Method = .GET,
     keep_alive: bool,
     request_body_complete: bool,
 };
@@ -29,7 +31,7 @@ pub fn write(
     stream_buffer: []u8,
     options: Options,
 ) !Outcome {
-    try validateFinalResponse(incoming, response.*, options.request_body_complete);
+    try validateFinalResponse(incoming, options.method, response.*, options.request_body_complete);
     const headers = try responseHeaders(response.*, allocator);
 
     if (response.takeover) |*takeover| {
@@ -37,6 +39,7 @@ pub fn write(
         try writeTakeoverHeadWithDeadline(
             io,
             incoming,
+            options.method,
             response.status,
             headers,
             takeover.kind,
@@ -66,13 +69,14 @@ pub fn write(
 
 fn validateFinalResponse(
     incoming: *const std.http.Server.Request,
+    method: Method,
     response: Response,
     request_body_complete: bool,
 ) !void {
     if (response.takeover == null and response.status.class() == .informational) {
         return error.InformationalResponseCannotBeFinal;
     }
-    if (response.takeover == null and incoming.head.method == .CONNECT and response.status.class() == .success) {
+    if (response.takeover == null and method.is(.CONNECT) and response.status.class() == .success) {
         return error.ConnectSuccessRequiresTakeover;
     }
     if (incoming.head.version == .@"HTTP/1.0" and responseHasTrailers(response)) {
@@ -144,12 +148,13 @@ fn isManagedResponseHeader(name: []const u8) bool {
 fn writeTakeoverHeadWithDeadline(
     io: Io,
     incoming: *std.http.Server.Request,
+    method: Method,
     status: std.http.Status,
     headers: []const std.http.Header,
     kind: Takeover.Kind,
     deadline: ?Io.Clock.Timestamp,
 ) !void {
-    const target = deadline orelse return writeTakeoverHead(incoming, status, headers, kind);
+    const target = deadline orelse return writeTakeoverHead(incoming, method, status, headers, kind);
     const Result = union(enum) {
         write: anyerror!void,
         timeout: anyerror!void,
@@ -157,17 +162,18 @@ fn writeTakeoverHeadWithDeadline(
     const Runner = struct {
         fn run(
             request: *std.http.Server.Request,
+            request_method: Method,
             response_status: std.http.Status,
             extra_headers: []const std.http.Header,
             takeover_kind: Takeover.Kind,
         ) anyerror!void {
-            return writeTakeoverHead(request, response_status, extra_headers, takeover_kind);
+            return writeTakeoverHead(request, request_method, response_status, extra_headers, takeover_kind);
         }
     };
 
     var results: [2]Result = undefined;
     var select = Io.Select(Result).init(io, &results);
-    select.async(.write, Runner.run, .{ incoming, status, headers, kind });
+    select.async(.write, Runner.run, .{ incoming, method, status, headers, kind });
     select.async(.timeout, waitUntil, .{ io, target });
     const result = select.await() catch |err| {
         select.cancelDiscard();
@@ -185,6 +191,7 @@ fn writeTakeoverHeadWithDeadline(
 
 fn writeTakeoverHead(
     incoming: *std.http.Server.Request,
+    method: Method,
     status: std.http.Status,
     headers: []const std.http.Header,
     kind: Takeover.Kind,
@@ -193,7 +200,7 @@ fn writeTakeoverHead(
     switch (kind) {
         .upgrade => |protocol| {
             if (incoming.head.version != .@"HTTP/1.1" or
-                incoming.head.method != .GET or
+                !method.is(.GET) or
                 status != .switching_protocols or
                 !upgradeRequested(incoming, protocol)) return error.InvalidUpgrade;
             try output.print("HTTP/1.1 101 {s}\r\nconnection: upgrade\r\nupgrade: {s}\r\n", .{
@@ -202,7 +209,7 @@ fn writeTakeoverHead(
             });
         },
         .tunnel => {
-            if (incoming.head.method != .CONNECT or status.class() != .success) {
+            if (!method.is(.CONNECT) or status.class() != .success) {
                 return error.InvalidTunnel;
             }
             try output.print("{s} {d} {s}\r\n", .{

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Headers = @import("../message/headers.zig").Headers;
+const Method = @import("../message/request.zig").Method;
 const response_module = @import("../message/response.zig");
 const Response = response_module.Response;
 const Stream = response_module.Stream;
@@ -59,8 +60,8 @@ pub fn ETag(comptime options: Options) type {
     };
 }
 
-fn methodEligible(method: std.http.Method) bool {
-    return method == .GET or method == .HEAD;
+fn methodEligible(method: Method) bool {
+    return method.is(.GET) or method.is(.HEAD);
 }
 
 fn strongTag(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
@@ -147,7 +148,7 @@ fn skipToComma(value: []const u8, cursor: *usize) void {
 const TestContext = struct {
     execution: struct { allocator: std.mem.Allocator },
     request: struct {
-        method: std.http.Method,
+        method: Method,
         headers: Headers,
     },
 };
@@ -159,7 +160,7 @@ const TestNext = struct {
     }
 };
 
-fn testContext(allocator: std.mem.Allocator, method: std.http.Method, headers: Headers) TestContext {
+fn testContext(allocator: std.mem.Allocator, method: Method, headers: Headers) TestContext {
     return .{
         .execution = .{ .allocator = allocator },
         .request = .{ .method = method, .headers = headers },

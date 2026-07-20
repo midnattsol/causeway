@@ -8,6 +8,7 @@
 const std = @import("std");
 const cookies = @import("../semantics/cookies.zig");
 const Response = @import("../message/response.zig").Response;
+const Method = @import("../message/request.zig").Method;
 
 /// CSRF policy defaults.
 ///
@@ -140,8 +141,9 @@ fn constantTimeEqual(left: []const u8, right: []const u8) bool {
     return difference == 0;
 }
 
-fn isSafe(method: std.http.Method) bool {
-    return switch (method) {
+fn isSafe(method: Method) bool {
+    const standard = method.standard orelse return false;
+    return switch (standard) {
         .GET, .HEAD, .OPTIONS, .TRACE => true,
         else => false,
     };
@@ -212,7 +214,7 @@ const Headers = @import("../message/headers.zig").Headers;
 const TestContext = struct {
     execution: struct { allocator: std.mem.Allocator },
     request: struct {
-        method: std.http.Method,
+        method: Method,
         headers: Headers,
     },
     generator_called: bool = false,
@@ -243,7 +245,7 @@ fn invalidGeneratedToken(context: anytype) []const u8 {
     return "invalid;token";
 }
 
-fn testContext(allocator: std.mem.Allocator, method: std.http.Method, headers: Headers) TestContext {
+fn testContext(allocator: std.mem.Allocator, method: Method, headers: Headers) TestContext {
     return .{
         .execution = .{ .allocator = allocator },
         .request = .{ .method = method, .headers = headers },

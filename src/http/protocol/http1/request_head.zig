@@ -1,10 +1,16 @@
 //! Timed HTTP request-head reception, parsing, and protocol-error responses.
 
 const std = @import("std");
+const Method = @import("../../message/request.zig").Method;
 const Io = std.Io;
 
-pub const Outcome = union(enum) {
+pub const Received = struct {
     request: std.http.Server.Request,
+    method: Method,
+};
+
+pub const Outcome = union(enum) {
+    request: Received,
     close,
 };
 
@@ -14,6 +20,7 @@ pub fn receive(
     io: Io,
     server: *std.http.Server,
     output: *Io.Writer,
+    allocator: std.mem.Allocator,
     timeout: ?Io.Duration,
     keep_alive: bool,
 ) !Outcome {
@@ -29,19 +36,43 @@ pub fn receive(
         },
         else => return err,
     };
-    const head = std.http.Server.Request.Head.parse(head_buffer) catch |err| {
-        const failure = parseFailure(err, head_buffer);
-        try writeProtocolError(output, failure.status, failure.body);
-        return .close;
+    var parsed_buffer = head_buffer;
+    var method: ?Method = null;
+    const head = std.http.Server.Request.Head.parse(head_buffer) catch |err| switch (err) {
+        error.UnknownHttpMethod => blk: {
+            const raw_method = requestMethod(head_buffer) orelse {
+                try writeProtocolError(output, .bad_request, "invalid method");
+                return .close;
+            };
+            method = Method.parse(raw_method) catch {
+                try writeProtocolError(output, .bad_request, "invalid method");
+                return .close;
+            };
+            parsed_buffer = try normalizeExtensionMethod(allocator, head_buffer, raw_method.len);
+            break :blk std.http.Server.Request.Head.parse(parsed_buffer) catch |normalized_err| {
+                const failure = parseFailure(normalized_err, parsed_buffer);
+                try writeProtocolError(output, failure.status, failure.body);
+                return .close;
+            };
+        },
+        else => {
+            const failure = parseFailure(err, head_buffer);
+            try writeProtocolError(output, failure.status, failure.body);
+            return .close;
+        },
     };
+    const request_method = method orelse Method.fromStandard(head.method);
     if (head.transfer_compression == .compress) {
         try writeProtocolError(output, .unsupported_media_type, "unsupported content encoding");
         return .close;
     }
     return .{ .request = .{
-        .server = server,
-        .head_buffer = head_buffer,
-        .head = head,
+        .request = .{
+            .server = server,
+            .head_buffer = parsed_buffer,
+            .head = head,
+        },
+        .method = request_method,
     } };
 }
 
@@ -86,6 +117,27 @@ fn receiveWithTimeout(
 
 fn waitForTimeout(io: Io, duration: Io.Duration) anyerror!void {
     try Io.sleep(io, duration, .awake);
+}
+
+fn requestMethod(head_buffer: []const u8) ?[]const u8 {
+    const line_end = std.mem.find(u8, head_buffer, "\r\n") orelse return null;
+    const method_end = std.mem.findScalar(u8, head_buffer[0..line_end], ' ') orelse return null;
+    if (method_end == 0) return null;
+    return head_buffer[0..method_end];
+}
+
+/// `std.http` currently models methods as a closed enum. For an extension
+/// method, parse an arena-owned copy with a known method while preserving the
+/// original token separately in Causeway's request model.
+fn normalizeExtensionMethod(
+    allocator: std.mem.Allocator,
+    head_buffer: []const u8,
+    method_len: usize,
+) ![]const u8 {
+    const normalized = try allocator.alloc(u8, head_buffer.len - method_len + 3);
+    @memcpy(normalized[0..3], "GET");
+    @memcpy(normalized[3..], head_buffer[method_len..]);
+    return normalized;
 }
 
 // -----------------------------------------------------------------------------

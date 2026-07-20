@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const Headers = @import("../message/headers.zig").Headers;
+const Method = @import("../message/request.zig").Method;
 const response_mod = @import("../message/response.zig");
 const Response = response_mod.Response;
 const ResponseBody = response_mod.ResponseBody;
@@ -237,7 +238,7 @@ fn parseQuality(value: []const u8) ?u16 {
     return quality;
 }
 
-fn eligible(comptime options: Options, method: std.http.Method, response: Response) bool {
+fn eligible(comptime options: Options, method: Method, response: Response) bool {
     switch (response.body) {
         .empty => return false,
         .bytes => |bytes| if (bytes.len < options.minimum_size) return false,
@@ -245,7 +246,7 @@ fn eligible(comptime options: Options, method: std.http.Method, response: Respon
             if (content_length < options.minimum_size) return false;
         },
     }
-    if (method == .HEAD) return false;
+    if (method.is(.HEAD)) return false;
     if (response.status.class() == .informational or
         response.status == .no_content or
         response.status == .not_modified or
@@ -354,7 +355,7 @@ const TestRequestHeaders = struct {
 const TestContext = struct {
     execution: struct { allocator: std.mem.Allocator },
     request: struct {
-        method: std.http.Method,
+        method: Method,
         headers: TestRequestHeaders,
     },
 };
@@ -367,7 +368,7 @@ const TestNext = struct {
     }
 };
 
-fn testContext(allocator: std.mem.Allocator, method: std.http.Method, accept_encoding: ?[]const u8) TestContext {
+fn testContext(allocator: std.mem.Allocator, method: Method, accept_encoding: ?[]const u8) TestContext {
     return .{
         .execution = .{ .allocator = allocator },
         .request = .{
@@ -578,7 +579,7 @@ test "unavailable zstd is not advertised or selected by the gzip default" {
 }
 
 test "empty small HEAD and bodyless statuses are excluded" {
-    const cases = [_]struct { method: std.http.Method, status: std.http.Status, body: []const u8 }{
+    const cases = [_]struct { method: Method, status: std.http.Status, body: []const u8 }{
         .{ .method = .GET, .status = .ok, .body = "" },
         .{ .method = .GET, .status = .ok, .body = "small" },
         .{ .method = .HEAD, .status = .ok, .body = compressible_body },

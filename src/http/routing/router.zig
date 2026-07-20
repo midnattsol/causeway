@@ -6,6 +6,7 @@ const Header = @import("../message/headers.zig").Header;
 const HttpContext = @import("../context.zig").Context;
 const request_module = @import("../message/request.zig");
 const Request = request_module.Request;
+const Method = request_module.Method;
 const Target = request_module.Target;
 const RequestBody = @import("../message/request_body.zig").RequestBody;
 const Params = @import("params.zig").Params;
@@ -69,7 +70,7 @@ pub fn RouterWithOptions(comptime routes: anytype, comptime options: anytype) ty
 
     return struct {
         /// Returns the matched route's body limit without executing middleware or handlers.
-        pub fn bodyLimit(method: std.http.Method, path: []const u8) ?usize {
+        pub fn bodyLimit(method: Method, path: []const u8) ?usize {
             inline for (0..maximum_specificity + 1) |offset| {
                 const specificity = maximum_specificity - offset;
                 if (bodyLimitForRoutes(routes, specificity, method, path)) |matched| {
@@ -77,7 +78,7 @@ pub fn RouterWithOptions(comptime routes: anytype, comptime options: anytype) ty
                 }
             }
 
-            if (method == .HEAD) {
+            if (method.is(.HEAD)) {
                 inline for (0..maximum_specificity + 1) |offset| {
                     const specificity = maximum_specificity - offset;
                     if (bodyLimitForRoutes(routes, specificity, .GET, path)) |matched| {
@@ -90,7 +91,7 @@ pub fn RouterWithOptions(comptime routes: anytype, comptime options: anytype) ty
 
         /// Dispatches a request context to the most specific matching route.
         pub fn dispatch(context: anytype) !Response {
-            if (context.request.method == .OPTIONS and isAsteriskTarget(context.request)) {
+            if (context.request.method.is(.OPTIONS) and isAsteriskTarget(context.request)) {
                 return .{
                     .status = .no_content,
                     .headers = .{ .items = &server_options_headers },
@@ -104,7 +105,7 @@ pub fn RouterWithOptions(comptime routes: anytype, comptime options: anytype) ty
                 }
             }
 
-            if (context.request.method == .HEAD) {
+            if (context.request.method.is(.HEAD)) {
                 inline for (0..maximum_specificity + 1) |offset| {
                     const specificity = maximum_specificity - offset;
                     if (try dispatchRoutes(routes, specificity, .GET, context)) |response| {
@@ -113,7 +114,7 @@ pub fn RouterWithOptions(comptime routes: anytype, comptime options: anytype) ty
                 }
             }
 
-            if (context.request.method == .OPTIONS) {
+            if (context.request.method.is(.OPTIONS)) {
                 inline for (0..maximum_specificity + 1) |offset| {
                     const specificity = maximum_specificity - offset;
                     if (automaticOptions(routes, specificity, context.request.path)) |response| {
@@ -184,7 +185,7 @@ fn problem(comptime routes: anytype) ?RouteProblem {
         inline for (routes, 0..) |right, right_index| {
             if (right_index <= left_index) continue;
 
-            if (comptime left.method == right.method and std.mem.eql(u8, left.pattern, right.pattern)) {
+            if (comptime left.method.eql(right.method) and std.mem.eql(u8, left.pattern, right.pattern)) {
                 return .duplicate;
             }
             if (comptime std.mem.eql(u8, left.pattern, right.pattern)) continue;
@@ -238,13 +239,13 @@ const BodyLimitMatch = struct {
 fn bodyLimitForRoutes(
     comptime routes: anytype,
     comptime specificity: usize,
-    method: std.http.Method,
+    method: Method,
     path: []const u8,
 ) ?BodyLimitMatch {
     inline for (routes) |route_value| {
         const RoutePattern = Pattern(route_value.pattern);
         if (comptime RoutePattern.static_segment_count != specificity) continue;
-        if (method == route_value.method and RoutePattern.match(path) != null) {
+        if (method.eql(route_value.method) and RoutePattern.match(path) != null) {
             return .{ .maximum = @TypeOf(route_value).max_body_size };
         }
     }
@@ -254,14 +255,14 @@ fn bodyLimitForRoutes(
 fn dispatchRoutes(
     comptime routes: anytype,
     comptime specificity: usize,
-    method: std.http.Method,
+    method: Method,
     context: anytype,
 ) !?Response {
     inline for (routes) |route_value| {
         const RoutePattern = Pattern(route_value.pattern);
         if (comptime RoutePattern.static_segment_count != specificity) continue;
 
-        if (method == route_value.method) {
+        if (method.eql(route_value.method)) {
             if (RoutePattern.match(context.request.path)) |matched| {
                 var routed_context = context.*;
                 routed_context.params = matched.params();
@@ -322,7 +323,7 @@ fn allowHeaderValue(comptime routes: anytype, comptime target_pattern: []const u
     inline for (routes) |route_value| {
         if (comptime std.mem.eql(u8, route_value.pattern, target_pattern)) {
             value = comptime appendMethod(value, route_value.method);
-            if (comptime route_value.method == .GET and !has_explicit_head) {
+            if (comptime route_value.method.is(.GET) and !has_explicit_head) {
                 value = comptime appendMethod(value, .HEAD);
             }
         }
@@ -334,10 +335,10 @@ fn allowHeaderValue(comptime routes: anytype, comptime target_pattern: []const u
 fn hasMethod(
     comptime routes: anytype,
     comptime target_pattern: []const u8,
-    comptime method: std.http.Method,
+    comptime method: Method,
 ) bool {
     inline for (routes) |route_value| {
-        if (comptime route_value.method == method and
+        if (comptime route_value.method.eql(method) and
             std.mem.eql(u8, route_value.pattern, target_pattern))
         {
             return true;
@@ -352,7 +353,7 @@ fn serverAllowHeaderValue(comptime routes: anytype) []const u8 {
         if (comptime !containsMethod(value, route_value.method)) {
             value = comptime appendMethod(value, route_value.method);
         }
-        if (comptime route_value.method == .GET and !containsMethod(value, .HEAD)) {
+        if (comptime route_value.method.is(.GET) and !containsMethod(value, .HEAD)) {
             value = comptime appendMethod(value, .HEAD);
         }
     }
@@ -360,10 +361,10 @@ fn serverAllowHeaderValue(comptime routes: anytype) []const u8 {
     return value;
 }
 
-fn containsMethod(comptime value: []const u8, comptime method: std.http.Method) bool {
+fn containsMethod(comptime value: []const u8, comptime method: Method) bool {
     var tokens = std.mem.splitSequence(u8, value, ", ");
     while (tokens.next()) |token| {
-        if (std.mem.eql(u8, token, @tagName(method))) return true;
+        if (std.mem.eql(u8, token, method.name)) return true;
     }
     return false;
 }
@@ -374,11 +375,11 @@ fn isAsteriskTarget(request: anytype) bool {
     return target == .asterisk;
 }
 
-fn appendMethod(comptime value: []const u8, comptime method: std.http.Method) []const u8 {
+fn appendMethod(comptime value: []const u8, comptime method: Method) []const u8 {
     return if (value.len == 0)
-        @tagName(method)
+        method.name
     else
-        std.fmt.comptimePrint("{s}, {s}", .{ value, @tagName(method) });
+        std.fmt.comptimePrint("{s}, {s}", .{ value, method.name });
 }
 
 fn fallbackResponse(comptime options: anytype, context: anytype) !Response {
@@ -393,7 +394,7 @@ fn fallbackResponse(comptime options: anytype, context: anytype) !Response {
 // -----------------------------------------------------------------------------
 
 const TestRequest = struct {
-    method: std.http.Method,
+    method: Method,
     target: Target = .{ .origin = .{ .path = "/", .query = null } },
     path: []const u8,
     query: ?[]const u8 = null,
@@ -471,6 +472,18 @@ test "Router dispatches static routes by method and path" {
 
     const post_context = TestContext{ .request = .{ .method = .POST, .path = "/users" } };
     try std.testing.expectEqualStrings("other", (try AppRouter.dispatch(&post_context)).body.asBytes().?);
+}
+
+test "Router dispatches extension methods" {
+    const AppRouter = Router(.{
+        route_module.route(Method.extension("PURGE"), "/cache", staticHandler),
+    });
+    const context = TestContext{ .request = .{
+        .method = Method.extension("PURGE"),
+        .path = "/cache",
+    } };
+
+    try std.testing.expectEqualStrings("static", (try AppRouter.dispatch(&context)).body.asBytes().?);
 }
 
 test "Router captures path parameters without mutating the original context" {

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Headers = @import("../message/headers.zig").Headers;
+const Method = @import("../message/request.zig").Method;
 const Response = @import("../message/response.zig").Response;
 const header_helpers = @import("header_helpers.zig");
 
@@ -10,7 +11,7 @@ const header_helpers = @import("header_helpers.zig");
 /// lists suppress their corresponding response fields.
 pub const Options = struct {
     origins: []const []const u8 = &.{"*"},
-    methods: []const std.http.Method = &.{ .GET, .HEAD, .POST },
+    methods: []const Method = &.{ .GET, .HEAD, .POST },
     headers: []const []const u8 = &.{},
     expose_headers: []const []const u8 = &.{},
     credentials: bool = false,
@@ -34,7 +35,7 @@ pub fn Cors(comptime options: Options) type {
         pub fn handle(context: anytype, next: anytype) !Response {
             const origin = context.request.headers.get("origin");
             const requested_method = context.request.headers.get("access-control-request-method");
-            const is_preflight = context.request.method == .OPTIONS and requested_method != null;
+            const is_preflight = context.request.method.is(.OPTIONS) and requested_method != null;
 
             if (is_preflight) {
                 const request_origin = origin orelse return forbidden();
@@ -134,7 +135,7 @@ pub fn Cors(comptime options: Options) type {
 
         fn methodAllowed(method: []const u8) bool {
             inline for (options.methods) |allowed| {
-                if (std.mem.eql(u8, @tagName(allowed), method)) return true;
+                if (std.mem.eql(u8, allowed.name, method)) return true;
             }
             return false;
         }
@@ -190,20 +191,20 @@ fn contains(comptime values: []const []const u8, needle: []const u8, ignore_case
     return false;
 }
 
-fn joinedMethodsLength(comptime methods: []const std.http.Method) usize {
+fn joinedMethodsLength(comptime methods: []const Method) usize {
     var length: usize = 0;
     inline for (methods, 0..) |method, index| {
         if (index != 0) length += 2;
-        length += @tagName(method).len;
+        length += method.name.len;
     }
     return length;
 }
 
-fn joinMethods(comptime methods: []const std.http.Method) [joinedMethodsLength(methods)]u8 {
+fn joinMethods(comptime methods: []const Method) [joinedMethodsLength(methods)]u8 {
     var result: [joinedMethodsLength(methods)]u8 = undefined;
     var index: usize = 0;
     inline for (methods, 0..) |method, method_index| {
-        const name = @tagName(method);
+        const name = method.name;
         if (method_index != 0) {
             result[index] = ',';
             result[index + 1] = ' ';
@@ -246,7 +247,7 @@ fn join(comptime values: []const []const u8) [joinedLength(values)]u8 {
 const TestContext = struct {
     execution: struct { allocator: std.mem.Allocator },
     request: struct {
-        method: std.http.Method,
+        method: Method,
         headers: Headers,
     },
 };
@@ -259,7 +260,7 @@ const TestNext = struct {
     }
 };
 
-fn testContext(allocator: std.mem.Allocator, method: std.http.Method, headers: Headers) TestContext {
+fn testContext(allocator: std.mem.Allocator, method: Method, headers: Headers) TestContext {
     return .{
         .execution = .{ .allocator = allocator },
         .request = .{ .method = method, .headers = headers },

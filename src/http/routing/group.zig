@@ -5,6 +5,7 @@ const Pattern = @import("pattern.zig").Pattern;
 const route_module = @import("route.zig");
 const router_module = @import("router.zig");
 const Response = @import("../message/response.zig").Response;
+const Method = @import("../message/request.zig").Method;
 
 /// Prefixes every route in `routes` and returns ordinary routes for `Router`.
 ///
@@ -123,7 +124,7 @@ fn prefixedPattern(comptime prefix: []const u8, comptime pattern: []const u8) []
 
 const TestContext = struct {
     request: struct {
-        method: std.http.Method,
+        method: Method,
         path: []const u8,
     },
     params: @import("params.zig").Params = .empty,

@@ -5,6 +5,7 @@ const conditional = @import("semantics/conditional.zig");
 const range_module = @import("semantics/range.zig");
 const Header = @import("message/headers.zig").Header;
 const Headers = @import("message/headers.zig").Headers;
+const Method = @import("message/request.zig").Method;
 const response_module = @import("message/response.zig");
 const Response = response_module.Response;
 const Stream = response_module.Stream;
@@ -122,7 +123,7 @@ fn preconditionResponse(
     path: []const u8,
     options: Options,
     headers: Headers,
-    method: std.http.Method,
+    method: Method,
     metadata: Metadata,
 ) !?Response {
     const decision = conditional.evaluate(headers, method, metadata.validators);
@@ -147,11 +148,11 @@ fn preconditionResponse(
 fn selectRange(
     allocator: std.mem.Allocator,
     headers: Headers,
-    method: std.http.Method,
+    method: Method,
     options: Options,
     metadata: Metadata,
 ) !range_module.Selection {
-    if (!options.enable_ranges or (method != .GET and method != .HEAD) or
+    if (!options.enable_ranges or (!method.is(.GET) and !method.is(.HEAD)) or
         !conditional.allowsRange(headers, metadata.validators)) return .full;
     return range_module.selectMany(
         allocator,
@@ -429,12 +430,12 @@ const TestContext = struct {
         io: Io,
     },
     request: struct {
-        method: std.http.Method,
+        method: Method,
         headers: Headers,
     },
 };
 
-fn testContext(allocator: std.mem.Allocator, method: std.http.Method, headers: Headers) TestContext {
+fn testContext(allocator: std.mem.Allocator, method: Method, headers: Headers) TestContext {
     return .{
         .execution = .{ .allocator = allocator, .io = std.testing.io },
         .request = .{ .method = method, .headers = headers },

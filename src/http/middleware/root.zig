@@ -36,11 +36,12 @@ pub const Csrf = csrf.Csrf;
 
 const Response = @import("../message/response.zig").Response;
 const Headers = @import("../message/headers.zig").Headers;
+const Method = @import("../message/request.zig").Method;
 
 const IntegrationContext = struct {
     execution: struct { allocator: std.mem.Allocator },
     request: struct {
-        method: std.http.Method,
+        method: Method,
         headers: Headers,
     },
     events: *std.ArrayList(u8),
