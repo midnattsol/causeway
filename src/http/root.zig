@@ -16,6 +16,9 @@ pub const middleware = @import("middleware/root.zig");
 pub const connection = @import("connection.zig");
 pub const headers = @import("headers.zig");
 pub const cookies = @import("cookies.zig");
+pub const conditional = @import("conditional.zig");
+pub const range = @import("range.zig");
+pub const files = @import("files.zig");
 
 test {
     std.testing.refAllDecls(@This());

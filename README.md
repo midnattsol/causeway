@@ -9,7 +9,8 @@ sockets, connection management, or an alternate HTTP engine.
 The HTTP/1.1 core is implemented: lifecycle-managed servers and hot listeners,
 typed compile-time routing, extractors and middleware, buffered and streaming
 request/response bodies, keep-alive, limits, deadlines, graceful shutdown,
-cookies, sessions, CSRF, compression, ETags, and real TCP integration tests.
+cookies, sessions, CSRF, compression, ETags, efficient file responses, byte
+ranges, conditional requests, and real TCP integration tests.
 
 REST, GraphQL, OpenAPI, and adapters remain separate higher-level phases.
 
@@ -41,4 +42,5 @@ The project uses the active ZVM master toolchain (`0.17.0-dev`).
 
 See [`IDEA.md`](IDEA.md) for architecture, ownership, and delivery plan, and
 [`docs/http-streaming.md`](docs/http-streaming.md) for request/response body
-ownership, streaming, middleware behavior, and examples.
+ownership and streaming, and [`docs/http-files.md`](docs/http-files.md) for
+file transfer, ranges, validators, and cache semantics.

@@ -84,13 +84,21 @@ pub fn Compression(comptime options: Options) type {
                 .zstd => unreachable,
             };
 
-            var mutations: [2]header_helpers.Mutation = undefined;
+            var mutations: [3]header_helpers.Mutation = undefined;
             mutations[0] = .{
                 .operation = .set,
                 .name = "content-encoding",
                 .value = encoding.name(),
             };
             var mutation_count: usize = 1;
+            if (try weakenedEtag(allocator, response.headers.get("etag"))) |etag| {
+                mutations[mutation_count] = .{
+                    .operation = .set,
+                    .name = "etag",
+                    .value = etag,
+                };
+                mutation_count += 1;
+            }
             if (!varyIncludesAcceptEncoding(response.headers)) {
                 mutations[mutation_count] = .{
                     .operation = .append,
@@ -240,7 +248,9 @@ fn eligible(comptime options: Options, method: std.http.Method, response: Respon
     if (method == .HEAD) return false;
     if (response.status.class() == .informational or
         response.status == .no_content or
-        response.status == .not_modified) return false;
+        response.status == .not_modified or
+        response.status == .partial_content) return false;
+    if (response.headers.contains("content-range")) return false;
     if (response.headers.contains("content-encoding")) return false;
 
     const content_type = response.headers.get("content-type") orelse return false;
@@ -257,6 +267,13 @@ fn contentTypeAllowed(comptime allowed_types: []const []const u8, content_type: 
 
 fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
     return value.len >= prefix.len and std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
+}
+
+fn weakenedEtag(allocator: std.mem.Allocator, etag: ?[]const u8) std.mem.Allocator.Error!?[]const u8 {
+    const value = std.mem.trim(u8, etag orelse return null, " \t");
+    if (std.mem.startsWith(u8, value, "W/")) return null;
+    if (value.len < 2 or value[0] != '"' or value[value.len - 1] != '"') return null;
+    return try std.fmt.allocPrint(allocator, "W/{s}", .{value});
 }
 
 fn varyIncludesAcceptEncoding(headers: Headers) bool {
@@ -578,6 +595,72 @@ test "empty small HEAD and bodyless statuses are excluded" {
         try std.testing.expectEqualStrings(case.body, response.body.asBytes().?);
         try std.testing.expect(response.headers.get("content-encoding") == null);
     }
+}
+
+test "Compression weakens strong ETags and preserves weak ETags" {
+    const cases = [_]struct {
+        original: []const u8,
+        expected: []const u8,
+    }{
+        .{ .original = "\"asset-v1\"", .expected = "W/\"asset-v1\"" },
+        .{ .original = "W/\"asset-v1\"", .expected = "W/\"asset-v1\"" },
+    };
+
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var context = testContext(arena.allocator(), .GET, "gzip");
+        const response = try Compression(.{}).handle(&context, TestNext{ .response = .{
+            .status = .ok,
+            .headers = .{ .items = &.{
+                .{ .name = "Content-Type", .value = "text/plain" },
+                .{ .name = "ETag", .value = case.original },
+            } },
+            .body = .{ .bytes = compressible_body },
+        } });
+
+        try std.testing.expectEqualStrings(case.expected, response.headers.get("etag").?);
+    }
+}
+
+test "Compression weakens a strong ETag on a stream" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var finalized_count: usize = 0;
+    var context = testContext(arena.allocator(), .GET, "gzip");
+    var original = try streamingResponse(
+        arena.allocator(),
+        compressible_body,
+        null,
+        &finalized_count,
+    );
+    original.headers = .{ .items = &.{
+        .{ .name = "Content-Type", .value = "text/plain" },
+        .{ .name = "ETag", .value = "\"stream-v1\"" },
+    } };
+
+    var response = try Compression(.{}).handle(&context, TestNext{ .response = original });
+    try std.testing.expectEqualStrings("W/\"stream-v1\"", response.headers.get("etag").?);
+    response.body.stream.finalize();
+    try std.testing.expectEqual(@as(usize, 1), finalized_count);
+}
+
+test "partial content is never recompressed after range selection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var context = testContext(arena.allocator(), .GET, "gzip");
+    const response = try Compression(.{}).handle(&context, TestNext{ .response = .{
+        .status = .partial_content,
+        .headers = .{ .items = &.{
+            .{ .name = "Content-Type", .value = "text/plain" },
+            .{ .name = "Content-Range", .value = "bytes 0-9/100" },
+            .{ .name = "ETag", .value = "\"asset-v1\"" },
+        } },
+        .body = .{ .bytes = compressible_body },
+    } });
+    try std.testing.expect(response.headers.get("content-encoding") == null);
+    try std.testing.expectEqualStrings("\"asset-v1\"", response.headers.get("etag").?);
+    try std.testing.expectEqualStrings(compressible_body, response.body.asBytes().?);
 }
 
 test "missing or disallowed content type and existing content encoding are excluded" {

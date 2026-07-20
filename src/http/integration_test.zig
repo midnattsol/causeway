@@ -7,6 +7,7 @@ const routing = causeway.http.routing;
 const extractors = causeway.http.extractors;
 const middleware = causeway.http.middleware;
 const Stream = causeway.http.response.Stream;
+const files = causeway.http.files;
 
 const Io = std.Io;
 const net = Io.net;
@@ -992,4 +993,152 @@ test "graceful shutdown times out and cancels an active long stream without live
     try testing.expect(state.canceled.load(.acquire));
     try testing.expectEqual(@as(usize, 1), state.producer_calls.load(.acquire));
     try testing.expectEqual(@as(usize, 1), state.finalize_calls.load(.acquire));
+}
+
+const FileState = struct { dir: Io.Dir };
+const FileContext = causeway.http.context.Context(FileState);
+
+fn fileHandler(context: *const FileContext) !Response {
+    return files.response(context, context.execution.state.dir, "asset.txt", .{
+        .etag = "\"asset-v1\"",
+    });
+}
+
+const FileRouter = routing.router.Router(.{
+    routing.route.route(.GET, "/asset", fileHandler),
+});
+const FileStack = middleware.Chain(.{
+    middleware.Compression(.{ .minimum_size = 1 }),
+}, FileRouter);
+const FileApp = app_module.AppWithOptions(FileState, FileStack, .{});
+
+test "end-to-end file responses support sendfile ranges validators and HEAD" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(16));
+    const io = threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "asset.txt", .data = "0123456789" });
+
+    var state = FileState{ .dir = tmp.dir };
+    var app = FileApp.init(testing.allocator, io, &state, server_options);
+    defer app.deinit();
+    var harness = Harness(FileApp).init(&app);
+    try harness.start();
+    defer harness.stop() catch {};
+
+    const full_raw = try rawRequest(
+        testing.allocator,
+        io,
+        harness.address,
+        "GET /asset HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
+    );
+    defer testing.allocator.free(full_raw);
+    const full = try parseResponse(full_raw, 0);
+    try testing.expectEqual(@as(u16, 200), full.status);
+    try testing.expectEqualStrings("0123456789", full.body);
+    try testing.expectEqualStrings("10", full.header("content-length").?);
+    try testing.expectEqualStrings("text/plain; charset=utf-8", full.header("content-type").?);
+    try testing.expectEqualStrings("bytes", full.header("accept-ranges").?);
+    try testing.expectEqualStrings("\"asset-v1\"", full.header("etag").?);
+    try testing.expect(full.header("last-modified") != null);
+
+    const compressed_raw = try rawRequest(
+        testing.allocator,
+        io,
+        harness.address,
+        "GET /asset HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+    );
+    defer testing.allocator.free(compressed_raw);
+    const compressed = try parseResponse(compressed_raw, 0);
+    try testing.expectEqual(@as(u16, 200), compressed.status);
+    try testing.expectEqualStrings("gzip", compressed.header("content-encoding").?);
+    try testing.expectEqualStrings("W/\"asset-v1\"", compressed.header("etag").?);
+    const decompressed = try decompressGzip(testing.allocator, compressed.body);
+    defer testing.allocator.free(decompressed);
+    try testing.expectEqualStrings("0123456789", decompressed);
+
+    const compressed_cached_raw = try rawRequest(
+        testing.allocator,
+        io,
+        harness.address,
+        "GET /asset HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\nIf-None-Match: W/\"asset-v1\"\r\nConnection: close\r\n\r\n",
+    );
+    defer testing.allocator.free(compressed_cached_raw);
+    const compressed_cached = try parseResponse(compressed_cached_raw, 0);
+    try testing.expectEqual(@as(u16, 304), compressed_cached.status);
+    try testing.expectEqual(@as(usize, 0), compressed_cached.body.len);
+
+    const partial_raw = try rawRequest(
+        testing.allocator,
+        io,
+        harness.address,
+        "GET /asset HTTP/1.1\r\nHost: localhost\r\nRange: bytes=3-6\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+    );
+    defer testing.allocator.free(partial_raw);
+    const partial = try parseResponse(partial_raw, 0);
+    try testing.expectEqual(@as(u16, 206), partial.status);
+    try testing.expectEqualStrings("3456", partial.body);
+    try testing.expectEqualStrings("bytes 3-6/10", partial.header("content-range").?);
+    try testing.expectEqualStrings("4", partial.header("content-length").?);
+    try testing.expect(partial.header("content-encoding") == null);
+    try testing.expectEqualStrings("\"asset-v1\"", partial.header("etag").?);
+
+    const unsatisfied_raw = try rawRequest(
+        testing.allocator,
+        io,
+        harness.address,
+        "GET /asset HTTP/1.1\r\nHost: localhost\r\nRange: bytes=99-\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
+    );
+    defer testing.allocator.free(unsatisfied_raw);
+    const unsatisfied = try parseResponse(unsatisfied_raw, 0);
+    try testing.expectEqual(@as(u16, 416), unsatisfied.status);
+    try testing.expectEqualStrings("bytes */10", unsatisfied.header("content-range").?);
+
+    const cached_raw = try rawRequest(
+        testing.allocator,
+        io,
+        harness.address,
+        "GET /asset HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: \"asset-v1\"\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
+    );
+    defer testing.allocator.free(cached_raw);
+    const cached = try parseResponse(cached_raw, 0);
+    try testing.expectEqual(@as(u16, 304), cached.status);
+    try testing.expectEqual(@as(usize, 0), cached.body.len);
+
+    const failed_raw = try rawRequest(
+        testing.allocator,
+        io,
+        harness.address,
+        "GET /asset HTTP/1.1\r\nHost: localhost\r\nIf-Match: \"other\"\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
+    );
+    defer testing.allocator.free(failed_raw);
+    const failed = try parseResponse(failed_raw, 0);
+    try testing.expectEqual(@as(u16, 412), failed.status);
+
+    const if_range_raw = try rawRequest(
+        testing.allocator,
+        io,
+        harness.address,
+        "GET /asset HTTP/1.1\r\nHost: localhost\r\nRange: bytes=3-6\r\nIf-Range: \"other\"\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
+    );
+    defer testing.allocator.free(if_range_raw);
+    const if_range = try parseResponse(if_range_raw, 0);
+    try testing.expectEqual(@as(u16, 200), if_range.status);
+    try testing.expectEqualStrings("0123456789", if_range.body);
+
+    const head_raw = try rawRequest(
+        testing.allocator,
+        io,
+        harness.address,
+        "HEAD /asset HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
+    );
+    defer testing.allocator.free(head_raw);
+    const head_end = std.mem.find(u8, head_raw, "\r\n\r\n") orelse return error.IncompleteResponseHead;
+    try testing.expect(std.mem.find(u8, head_raw, "HTTP/1.1 200 OK") != null);
+    try testing.expect(std.mem.find(u8, head_raw, "content-length: 10") != null);
+    try testing.expectEqual(head_end + 4, head_raw.len);
+
+    try harness.stop();
 }

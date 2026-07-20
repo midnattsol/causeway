@@ -56,6 +56,18 @@ test "public HTTP API exposes request and response bodies" {
     try std.testing.expect(true);
 }
 
+test "public HTTP API exposes files ranges and conditional requests" {
+    _ = causeway.http.files.response;
+    _ = causeway.http.files.FileBody;
+    _ = causeway.http.files.OpenFileBody;
+    _ = causeway.http.files.Options;
+    _ = causeway.http.range.ByteRange;
+    _ = causeway.http.range.select;
+    _ = causeway.http.conditional.evaluate;
+    _ = causeway.http.conditional.allowsRange;
+    try std.testing.expect(true);
+}
+
 test "public HTTP API exposes typed extractors" {
     _ = causeway.http.extractors.Path;
     _ = causeway.http.extractors.Query;
