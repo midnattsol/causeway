@@ -150,11 +150,32 @@ pub const Encoder = struct {
     }
 
     pub fn encode(self: *Encoder, writer: *Io.Writer, fields: []const Header) !void {
+        try self.beginBlock(writer);
+        for (fields) |field| try self.encodeField(writer, field);
+    }
+
+    /// Encodes application headers after ASCII-lowercasing their names into
+    /// caller-owned scratch storage. The dynamic table stores its own copy.
+    pub fn encodeLowercase(
+        self: *Encoder,
+        writer: *Io.Writer,
+        fields: []const Header,
+        name_scratch: []u8,
+    ) !void {
+        try self.beginBlock(writer);
+        for (fields) |field| {
+            if (field.name.len > name_scratch.len) return error.HeaderNameTooLong;
+            const name = name_scratch[0..field.name.len];
+            for (field.name, name) |byte, *destination| destination.* = std.ascii.toLower(byte);
+            try self.encodeField(writer, .{ .name = name, .value = field.value });
+        }
+    }
+
+    fn beginBlock(self: *Encoder, writer: *Io.Writer) !void {
         if (self.pending_capacity) |capacity| {
             try integer.encode(writer, capacity, 5, 0x20);
             self.pending_capacity = null;
         }
-        for (fields) |field| try self.encodeField(writer, field);
     }
 
     fn encodeField(self: *Encoder, writer: *Io.Writer, field: Header) !void {
