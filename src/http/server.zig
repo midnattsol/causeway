@@ -4,7 +4,6 @@
 //! response handling remain the responsibility of `connection.zig`.
 
 const std = @import("std");
-const connection = @import("connection.zig");
 const Io = std.Io;
 const net = Io.net;
 
@@ -69,6 +68,48 @@ pub const ListenerOptions = struct {
     listen: net.IpAddress.ListenOptions = .{},
     /// Per-listener failure policy, or `null` to inherit `ServerOptions.listener_failure_policy`.
     failure_policy: ?ListenerFailurePolicy = null,
+};
+
+/// Type-erased boundary between transport lifecycle and connection protocol handling.
+///
+/// Type erasure occurs once per accepted connection. The configured function may
+/// recover its typed application context and keep request dispatch fully static.
+pub const ConnectionHandler = struct {
+    context: ?*anyopaque,
+    run_fn: *const fn (?*anyopaque, std.mem.Allocator, net.Stream, Io) anyerror!void,
+
+    /// Adapts a typed context and connection function to the server boundary.
+    pub fn init(
+        comptime Context: type,
+        context: *Context,
+        comptime handler_fn: anytype,
+    ) ConnectionHandler {
+        return .{
+            .context = @ptrCast(context),
+            .run_fn = struct {
+                fn call(raw_context: ?*anyopaque, allocator: std.mem.Allocator, stream: net.Stream, io: Io) anyerror!void {
+                    const typed_context: *Context = @ptrCast(@alignCast(raw_context.?));
+                    return handler_fn(typed_context, allocator, stream, io);
+                }
+            }.call,
+        };
+    }
+
+    /// Returns a handler that closes every accepted connection immediately.
+    pub fn closing() ConnectionHandler {
+        return .{
+            .context = null,
+            .run_fn = struct {
+                fn close(_: ?*anyopaque, _: std.mem.Allocator, stream: net.Stream, io: Io) anyerror!void {
+                    stream.close(io);
+                }
+            }.close,
+        };
+    }
+
+    fn run(self: ConnectionHandler, allocator: std.mem.Allocator, stream: net.Stream, io: Io) anyerror!void {
+        return self.run_fn(self.context, allocator, stream, io);
+    }
 };
 
 /// Configuration shared by the server and its listeners.
@@ -252,6 +293,7 @@ pub const Server = struct {
     next_listener_id: u64 = 1,
     allocator: std.mem.Allocator,
     io: Io,
+    connection_handler: ConnectionHandler,
     options: ServerOptions = .{},
     listeners: std.ArrayList(*Listener) = .empty,
     state: std.atomic.Value(ServerState) = .init(.configured),
@@ -281,8 +323,18 @@ pub const Server = struct {
 
     /// Initializes an idle server without opening sockets or starting tasks.
     /// Option validation is deferred until `serve`.
-    pub fn init(allocator: std.mem.Allocator, io: Io, options: ServerOptions) Server {
-        return .{ .allocator = allocator, .io = io, .options = options };
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: Io,
+        connection_handler: ConnectionHandler,
+        options: ServerOptions,
+    ) Server {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .connection_handler = connection_handler,
+            .options = options,
+        };
     }
 
     /// Releases listener and control-plane storage.
@@ -638,16 +690,16 @@ pub const Server = struct {
         };
     }
 
-    fn handleConnection(stream: net.Stream, io: Io) anyerror!void {
-        try connection.handle(stream, io);
+    fn handleConnection(self: *Server, stream: net.Stream) anyerror!void {
+        return self.connection_handler.run(self.allocator, stream, self.io);
     }
 
     fn runConnection(self: *Server, stream: net.Stream) ConnectionOutcome {
         const timeout = self.options.connection_timeout orelse {
-            handleConnection(stream, self.io) catch |err| return classifyConnectionError(err);
+            self.handleConnection(stream) catch |err| return classifyConnectionError(err);
             return .completed;
         };
-        return self.runTaskWithTimeout(handleConnection, .{ stream, self.io }, timeout);
+        return self.runTaskWithTimeout(handleConnection, .{ self, stream }, timeout);
     }
 
     fn connectionWorker(self: *Server, listener: *Listener, stream: net.Stream) void {
@@ -939,8 +991,24 @@ fn testAddress(port: u16) net.IpAddress {
     return .{ .ip4 = net.Ip4Address.loopback(port) };
 }
 
+const TestConnectionHandler = struct {
+    fn run(_: *@This(), _: std.mem.Allocator, stream: net.Stream, io: Io) void {
+        stream.close(io);
+    }
+};
+
+var test_connection_handler: TestConnectionHandler = .{};
+
+fn testConnectionHandler() ConnectionHandler {
+    return .init(TestConnectionHandler, &test_connection_handler, TestConnectionHandler.run);
+}
+
 fn testServer() Server {
-    return .{ .allocator = std.testing.allocator, .io = undefined };
+    return .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .connection_handler = testConnectionHandler(),
+    };
 }
 
 fn waitRunning(server: *Server) void {
@@ -988,7 +1056,7 @@ test "serve opens listeners without listen and supports hot stop restart" {
     defer threaded.deinit();
     threaded.setAsyncLimit(.limited(4));
     const io = threaded.io();
-    var server = Server.init(std.testing.allocator, io, .{});
+    var server = Server.init(std.testing.allocator, io, testConnectionHandler(), .{});
     defer server.deinit();
     const id = try server.addListener(.{ .address = testAddress(0) });
     const thread = try spawnServe(&server);
@@ -1024,7 +1092,7 @@ test "stopped listener is skipped by serve" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    var server = Server.init(std.testing.allocator, io, .{});
+    var server = Server.init(std.testing.allocator, io, testConnectionHandler(), .{});
     defer server.deinit();
     const id = try server.addListener(.{ .address = testAddress(0) });
     try server.stopListener(id);
@@ -1043,7 +1111,7 @@ test "startup stop_listener policy isolates bind failure" {
     var occupied = try net.IpAddress.listen(&occupied_address, io, .{});
     defer occupied.deinit(io);
 
-    var server = Server.init(std.testing.allocator, io, .{});
+    var server = Server.init(std.testing.allocator, io, testConnectionHandler(), .{});
     defer server.deinit();
     const failed = try server.addListener(.{ .address = occupied.socket.address, .failure_policy = .stop_listener });
     _ = try server.addListener(.{ .address = testAddress(0) });
@@ -1065,7 +1133,7 @@ test "startup shutdown_server policy returns bind error and cleans up" {
     var occupied_address = testAddress(0);
     var occupied = try net.IpAddress.listen(&occupied_address, io, .{});
     defer occupied.deinit(io);
-    var server = Server.init(std.testing.allocator, io, .{});
+    var server = Server.init(std.testing.allocator, io, testConnectionHandler(), .{});
     defer server.deinit();
     _ = try server.addListener(.{ .address = occupied.socket.address });
     try std.testing.expectError(error.AddressInUse, server.serve());
@@ -1077,7 +1145,7 @@ test "server and listener status expose running details" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    var server = Server.init(std.testing.allocator, io, .{ .max_connections = 3 });
+    var server = Server.init(std.testing.allocator, io, testConnectionHandler(), .{ .max_connections = 3 });
     defer server.deinit();
     const id = try server.addListener(.{ .address = testAddress(0) });
     const thread = try spawnServe(&server);
@@ -1106,7 +1174,7 @@ test "server and listener status expose running details" {
 test "connection slots are atomic and bounded" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
-    var server = Server.init(std.testing.allocator, threaded.io(), .{ .max_connections = 2 });
+    var server = Server.init(std.testing.allocator, threaded.io(), testConnectionHandler(), .{ .max_connections = 2 });
     defer server.deinit();
     try std.testing.expect(server.acquireConnectionSlot());
     try std.testing.expect(server.acquireConnectionSlot());
@@ -1119,7 +1187,7 @@ test "connection slots are atomic and bounded" {
 test "connection outcomes release slots without affecting listener lifecycle" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
-    var server = Server.init(std.testing.allocator, threaded.io(), .{ .max_connections = 1 });
+    var server = Server.init(std.testing.allocator, threaded.io(), testConnectionHandler(), .{ .max_connections = 1 });
     defer server.deinit();
     const id = try server.addListener(.{ .address = testAddress(0) });
     const listener = server.findListener(id).?;
@@ -1151,7 +1219,7 @@ test "connection timeout cancels outstanding task" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     threaded.setAsyncLimit(.limited(2));
-    var server = Server.init(std.testing.allocator, threaded.io(), .{});
+    var server = Server.init(std.testing.allocator, threaded.io(), testConnectionHandler(), .{});
     defer server.deinit();
 
     const SlowTask = struct {
@@ -1169,7 +1237,7 @@ test "connection saturation rejects once and waits cancelably for capacity" {
     threaded.setAsyncLimit(.limited(4));
     const io = threaded.io();
 
-    var server = Server.init(std.testing.allocator, io, .{ .max_connections = 1 });
+    var server = Server.init(std.testing.allocator, io, testConnectionHandler(), .{ .max_connections = 1 });
     defer server.deinit();
     try std.testing.expect(server.acquireConnectionSlot());
     const id = try server.addListener(.{ .address = testAddress(0) });
@@ -1207,7 +1275,7 @@ test "restart policy automatically restarts failed listener" {
     defer threaded.deinit();
     threaded.setAsyncLimit(.limited(4));
     const io = threaded.io();
-    var server = Server.init(std.testing.allocator, io, .{});
+    var server = Server.init(std.testing.allocator, io, testConnectionHandler(), .{});
     defer server.deinit();
     const id = try server.addListener(.{ .address = testAddress(0), .failure_policy = .{ .restart = .{ .initial_delay = .zero, .max_delay = .zero } } });
     const thread = try spawnServe(&server);
@@ -1229,7 +1297,7 @@ test "restart exhaustion falls back to stop listener" {
     var occupied_address = testAddress(0);
     var occupied = try net.IpAddress.listen(&occupied_address, io, .{});
     defer occupied.deinit(io);
-    var server = Server.init(std.testing.allocator, io, .{});
+    var server = Server.init(std.testing.allocator, io, testConnectionHandler(), .{});
     defer server.deinit();
     const id = try server.addListener(.{ .address = testAddress(0), .failure_policy = .{ .restart = .{ .max_attempts = 2, .initial_delay = .zero, .max_delay = .zero, .fallback = .stop_listener } } });
     const thread = try spawnServe(&server);
@@ -1248,7 +1316,7 @@ test "shutdown cancels pending restart timer" {
     defer threaded.deinit();
     threaded.setAsyncLimit(.limited(4));
     const io = threaded.io();
-    var server = Server.init(std.testing.allocator, io, .{});
+    var server = Server.init(std.testing.allocator, io, testConnectionHandler(), .{});
     defer server.deinit();
     const id = try server.addListener(.{ .address = testAddress(0), .failure_policy = .{ .restart = .{ .initial_delay = .fromSeconds(60), .max_delay = .fromSeconds(60) } } });
     const thread = try spawnServe(&server);
@@ -1264,7 +1332,7 @@ test "shutdown cancels pending restart timer" {
 test "server is one-shot after shutdown" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
-    var server = Server.init(std.testing.allocator, threaded.io(), .{});
+    var server = Server.init(std.testing.allocator, threaded.io(), testConnectionHandler(), .{});
     defer server.deinit();
 
     const thread = try spawnServe(&server);
@@ -1278,7 +1346,7 @@ test "server is one-shot after shutdown" {
 test "concurrent shutdown calls complete cleanly" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
-    var server = Server.init(std.testing.allocator, threaded.io(), .{});
+    var server = Server.init(std.testing.allocator, threaded.io(), testConnectionHandler(), .{});
     defer server.deinit();
 
     const serve_thread = try spawnServe(&server);
@@ -1301,7 +1369,7 @@ test "shutdown timeout cancels remaining connection tasks" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    var server = Server.init(std.testing.allocator, io, .{ .shutdown_timeout = .fromMilliseconds(1) });
+    var server = Server.init(std.testing.allocator, io, testConnectionHandler(), .{ .shutdown_timeout = .fromMilliseconds(1) });
     defer server.deinit();
 
     const Context = struct {
@@ -1330,7 +1398,7 @@ test "shutdown drains connection group before stopping" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    var server = Server.init(std.testing.allocator, io, .{});
+    var server = Server.init(std.testing.allocator, io, testConnectionHandler(), .{});
     defer server.deinit();
     const Context = struct {
         event: Io.Event = .unset,
@@ -1378,13 +1446,13 @@ test "serve rejects negative timeout configuration" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
 
-    var connection_server = Server.init(std.testing.allocator, threaded.io(), .{
+    var connection_server = Server.init(std.testing.allocator, threaded.io(), testConnectionHandler(), .{
         .connection_timeout = .fromNanoseconds(-1),
     });
     defer connection_server.deinit();
     try std.testing.expectError(error.InvalidConnectionTimeout, connection_server.serve());
 
-    var shutdown_server = Server.init(std.testing.allocator, threaded.io(), .{
+    var shutdown_server = Server.init(std.testing.allocator, threaded.io(), testConnectionHandler(), .{
         .shutdown_timeout = .fromNanoseconds(-1),
     });
     defer shutdown_server.deinit();
@@ -1394,7 +1462,7 @@ test "serve rejects negative timeout configuration" {
 test "serve rejects zero control queue capacity" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
-    var server = Server.init(std.testing.allocator, threaded.io(), .{ .control_queue_capacity = 0 });
+    var server = Server.init(std.testing.allocator, threaded.io(), testConnectionHandler(), .{ .control_queue_capacity = 0 });
     defer server.deinit();
     try std.testing.expectError(error.InvalidControlQueueCapacity, server.serve());
 }
