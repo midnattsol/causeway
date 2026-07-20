@@ -3,6 +3,7 @@
 const std = @import("std");
 const Headers = @import("../../message/headers.zig").Headers;
 const Method = @import("../../message/request.zig").Method;
+const date = @import("date.zig");
 const response_module = @import("../../message/response.zig");
 const Response = response_module.Response;
 const ResponseBody = response_module.ResponseBody;
@@ -12,6 +13,7 @@ const Io = std.Io;
 
 pub const Options = struct {
     method: Method = .GET,
+    automatic_date: bool = true,
     keep_alive: bool,
     request_body_complete: bool,
 };
@@ -32,7 +34,12 @@ pub fn write(
     options: Options,
 ) !Outcome {
     try validateFinalResponse(incoming, options.method, response.*, options.request_body_complete);
-    const headers = try responseHeaders(response.*, allocator);
+    var date_buffer: [29]u8 = undefined;
+    const generated_date = if (options.automatic_date and !response.headers.contains("date"))
+        date.value(io, &date_buffer)
+    else
+        null;
+    const headers = try responseHeaders(response.*, allocator, generated_date);
 
     if (response.takeover) |*takeover| {
         defer takeover.finalize();
@@ -101,7 +108,11 @@ fn http10CloseDelimited(version: std.http.Version, body: ResponseBody) bool {
     };
 }
 
-fn responseHeaders(response: Response, allocator: std.mem.Allocator) ![]const std.http.Header {
+fn responseHeaders(
+    response: Response,
+    allocator: std.mem.Allocator,
+    generated_date: ?[]const u8,
+) ![]const std.http.Header {
     const trailer_names, const stream_content_length = switch (response.body) {
         .stream => |stream| .{ stream.trailer_names, stream.content_length },
         else => .{ &.{}, null },
@@ -112,15 +123,20 @@ fn responseHeaders(response: Response, allocator: std.mem.Allocator) ![]const st
 
     const result = try allocator.alloc(
         std.http.Header,
-        response.headers.items.len + @intFromBool(trailer_names.len != 0),
+        response.headers.items.len + @intFromBool(generated_date != null) + @intFromBool(trailer_names.len != 0),
     );
     for (response.headers.items, result[0..response.headers.items.len]) |header, *target| {
         if (!validResponseHeader(header.name, header.value)) return error.InvalidResponseHeader;
         if (isManagedResponseHeader(header.name)) return error.ManagedResponseHeader;
         target.* = .{ .name = header.name, .value = header.value };
     }
+    var next = response.headers.items.len;
+    if (generated_date) |value| {
+        result[next] = .{ .name = "date", .value = value };
+        next += 1;
+    }
     if (trailer_names.len != 0) {
-        result[result.len - 1] = .{
+        result[next] = .{
             .name = "trailer",
             .value = try joinTrailerNames(allocator, trailer_names),
         };

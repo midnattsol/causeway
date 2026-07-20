@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Method = @import("../../message/request.zig").Method;
+const date = @import("date.zig");
 const Io = std.Io;
 
 pub const Received = struct {
@@ -21,17 +22,18 @@ pub fn receive(
     server: *std.http.Server,
     output: *Io.Writer,
     allocator: std.mem.Allocator,
+    automatic_date: bool,
     timeout: ?Io.Duration,
     keep_alive: bool,
 ) !Outcome {
     const head_buffer = receiveWithTimeout(io, &server.reader, timeout, keep_alive) catch |err| switch (err) {
         error.HttpConnectionClosing => return .close,
         error.HttpHeadersOversize => {
-            try writeProtocolError(output, .request_header_fields_too_large, "request headers too large");
+            try writeProtocolError(io, output, automatic_date, .request_header_fields_too_large, "request headers too large");
             return .close;
         },
         error.HttpRequestTruncated => {
-            try writeProtocolError(output, .bad_request, "bad request");
+            try writeProtocolError(io, output, automatic_date, .bad_request, "bad request");
             return .close;
         },
         else => return err,
@@ -41,29 +43,29 @@ pub fn receive(
     const head = std.http.Server.Request.Head.parse(head_buffer) catch |err| switch (err) {
         error.UnknownHttpMethod => blk: {
             const raw_method = requestMethod(head_buffer) orelse {
-                try writeProtocolError(output, .bad_request, "invalid method");
+                try writeProtocolError(io, output, automatic_date, .bad_request, "invalid method");
                 return .close;
             };
             method = Method.parse(raw_method) catch {
-                try writeProtocolError(output, .bad_request, "invalid method");
+                try writeProtocolError(io, output, automatic_date, .bad_request, "invalid method");
                 return .close;
             };
             parsed_buffer = try normalizeExtensionMethod(allocator, head_buffer, raw_method.len);
             break :blk std.http.Server.Request.Head.parse(parsed_buffer) catch |normalized_err| {
                 const failure = parseFailure(normalized_err, parsed_buffer);
-                try writeProtocolError(output, failure.status, failure.body);
+                try writeProtocolError(io, output, automatic_date, failure.status, failure.body);
                 return .close;
             };
         },
         else => {
             const failure = parseFailure(err, head_buffer);
-            try writeProtocolError(output, failure.status, failure.body);
+            try writeProtocolError(io, output, automatic_date, failure.status, failure.body);
             return .close;
         },
     };
     const request_method = method orelse Method.fromStandard(head.method);
     if (head.transfer_compression == .compress) {
-        try writeProtocolError(output, .unsupported_media_type, "unsupported content encoding");
+        try writeProtocolError(io, output, automatic_date, .unsupported_media_type, "unsupported content encoding");
         return .close;
     }
     return .{ .request = .{
@@ -189,10 +191,24 @@ fn containsHeaderName(head_buffer: []const u8, name: []const u8) bool {
     return false;
 }
 
-fn writeProtocolError(output: *Io.Writer, status: std.http.Status, body: []const u8) !void {
+fn writeProtocolError(
+    io: Io,
+    output: *Io.Writer,
+    automatic_date: bool,
+    status: std.http.Status,
+    body: []const u8,
+) !void {
     try output.print(
-        "HTTP/1.1 {d} {s}\r\nconnection: close\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {d}\r\n\r\n{s}",
-        .{ @intFromEnum(status), status.phrase() orelse "", body.len, body },
+        "HTTP/1.1 {d} {s}\r\nconnection: close\r\n",
+        .{ @intFromEnum(status), status.phrase() orelse "" },
+    );
+    var date_buffer: [29]u8 = undefined;
+    if (automatic_date) {
+        if (date.value(io, &date_buffer)) |value| try output.print("date: {s}\r\n", .{value});
+    }
+    try output.print(
+        "content-type: text/plain; charset=utf-8\r\ncontent-length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
     );
     try output.flush();
 }

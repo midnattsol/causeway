@@ -206,8 +206,8 @@ fn timestamp(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) Da
     return days * 86_400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second;
 }
 
-/// Formats Unix seconds as IMF-fixdate into request-owned memory.
-pub fn formatDate(allocator: std.mem.Allocator, unix_seconds: i64) (DateError || std.mem.Allocator.Error)![]const u8 {
+/// Formats Unix seconds as the 29-byte IMF-fixdate wire representation.
+pub fn formatDateInto(buffer: *[29]u8, unix_seconds: i64) DateError![]const u8 {
     if (unix_seconds < 0 or unix_seconds > maximum_http_date_seconds) return error.InvalidHttpDate;
     const seconds: u64 = @intCast(unix_seconds);
     const epoch = std.time.epoch.EpochSeconds{ .secs = seconds };
@@ -217,8 +217,8 @@ pub fn formatDate(allocator: std.mem.Allocator, unix_seconds: i64) (DateError ||
     const day_seconds = epoch.getDaySeconds();
     const weekday: usize = @intCast((epoch_day.day + 4) % 7);
 
-    return std.fmt.allocPrint(
-        allocator,
+    return std.fmt.bufPrint(
+        buffer,
         "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT",
         .{
             weekdays[weekday],
@@ -229,7 +229,13 @@ pub fn formatDate(allocator: std.mem.Allocator, unix_seconds: i64) (DateError ||
             day_seconds.getMinutesIntoHour(),
             day_seconds.getSecondsIntoMinute(),
         },
-    );
+    ) catch unreachable;
+}
+
+/// Formats Unix seconds as IMF-fixdate into request-owned memory.
+pub fn formatDate(allocator: std.mem.Allocator, unix_seconds: i64) (DateError || std.mem.Allocator.Error)![]const u8 {
+    var buffer: [29]u8 = undefined;
+    return allocator.dupe(u8, try formatDateInto(&buffer, unix_seconds));
 }
 
 fn parseDecimal(comptime T: type, bytes: []const u8) !T {

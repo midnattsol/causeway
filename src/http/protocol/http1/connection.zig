@@ -16,7 +16,9 @@ const Takeover = response_module.Takeover;
 const extractor_errors = @import("../../extractors/errors.zig");
 const Exchange = @import("../../exchange.zig").Exchange;
 const exchange_adapter = @import("exchange.zig");
+const date = @import("date.zig");
 const request_body_adapter = @import("request_body.zig");
+const conditional = @import("../../semantics/conditional.zig");
 const request_head = @import("request_head.zig");
 const response_writer = @import("response_writer.zig");
 const Io = std.Io;
@@ -54,6 +56,8 @@ pub const Options = struct {
     request_body_timeout: ?Io.Duration = null,
     /// Default maximum duration for emitting a response.
     response_write_timeout: ?Io.Duration = null,
+    /// Emits an RFC 9110 `Date` field when the real-time clock is available.
+    automatic_date: bool = true,
     /// Action taken when application dispatch returns an error.
     handler_error_policy: HandlerErrorPolicy = .internal_server_error,
 };
@@ -173,6 +177,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 http_server,
                 output,
                 request_allocator,
+                self.options.automatic_date,
                 head_timeout,
                 completed_requests != 0,
             )) {
@@ -215,11 +220,14 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 const failure = dispatchFailure(err, self.options.handler_error_policy) orelse return err;
                 const keep_alive = connection_keep_alive and requestBodyComplete(request.body);
                 suppressUnusedExpectation(&incoming, request.body);
-                try incoming.respond(failure.body, .{
-                    .version = incoming.head.version,
-                    .status = failure.status,
-                    .keep_alive = keep_alive,
-                });
+                try respondGeneratedError(
+                    io,
+                    &incoming,
+                    self.options.automatic_date,
+                    failure.body,
+                    failure.status,
+                    keep_alive,
+                );
                 return if (keep_alive) .keep_alive else .close;
             };
 
@@ -239,6 +247,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 transfer_buffer,
                 .{
                     .method = request.method,
+                    .automatic_date = self.options.automatic_date,
                     .keep_alive = connection_keep_alive and body_complete and response.connection == .keep_alive,
                     .request_body_complete = body_complete,
                 },
@@ -262,11 +271,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         ) !PreparedRequest {
             if (!expectationSupported(incoming.head.expect)) {
                 incoming.head.expect = null;
-                try incoming.respond("expectation failed", .{
-                    .version = incoming.head.version,
-                    .status = .expectation_failed,
-                    .keep_alive = false,
-                });
+                try respondGeneratedError(io, incoming, self.options.automatic_date, "expectation failed", .expectation_failed, false);
                 return .close;
             }
             if (incoming.head.expect) |expect| {
@@ -288,11 +293,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 .init(body_state),
             ) catch {
                 incoming.head.expect = null;
-                try incoming.respond("bad request", .{
-                    .version = incoming.head.version,
-                    .status = .bad_request,
-                    .keep_alive = false,
-                });
+                try respondGeneratedError(io, incoming, self.options.automatic_date, "bad request", .bad_request, false);
                 return .close;
             };
             const body_limit = if (requestHasFramedBody(incoming))
@@ -303,11 +304,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 bodyExceedsKnownLimit(incoming.head.content_length, body_limit))
             {
                 incoming.head.expect = null;
-                try incoming.respond("request body too large", .{
-                    .version = incoming.head.version,
-                    .status = .payload_too_large,
-                    .keep_alive = false,
-                });
+                try respondGeneratedError(io, incoming, self.options.automatic_date, "request body too large", .payload_too_large, false);
                 return .close;
             }
             if (requestHasFramedBody(incoming)) {
@@ -329,6 +326,28 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 // -----------------------------------------------------------------------------
 // Connection policy helpers
 // -----------------------------------------------------------------------------
+
+fn respondGeneratedError(
+    io: Io,
+    incoming: *std.http.Server.Request,
+    automatic_date: bool,
+    body: []const u8,
+    status: std.http.Status,
+    keep_alive: bool,
+) !void {
+    var date_buffer: [29]u8 = undefined;
+    var date_header: [1]std.http.Header = undefined;
+    const extra_headers: []const std.http.Header = if (automatic_date) blk: {
+        date_header[0] = date.header(io, &date_buffer) orelse break :blk &.{};
+        break :blk &date_header;
+    } else &.{};
+    try incoming.respond(body, .{
+        .version = incoming.head.version,
+        .status = status,
+        .keep_alive = keep_alive,
+        .extra_headers = extra_headers,
+    });
+}
 
 fn validateOptions(options: Options) ConfigurationError!void {
     if (options.max_header_size == 0) return error.InvalidHeaderSize;
@@ -536,6 +555,12 @@ const TestDispatcher = struct {
         }
         if (std.mem.eql(u8, context.request.path, "/method")) {
             return .{ .status = .ok, .body = .{ .bytes = context.request.method.name } };
+        }
+        if (std.mem.eql(u8, context.request.path, "/dated")) {
+            return .{ .status = .ok, .headers = .{ .items = &.{.{
+                .name = "date",
+                .value = "Sun, 06 Nov 1994 08:49:37 GMT",
+            }} } };
         }
         if (std.mem.eql(u8, context.request.path, "/fail")) return error.HandlerFailed;
         if (std.mem.eql(u8, context.request.path, "/bad-request")) return error.InvalidQuery;
@@ -855,6 +880,38 @@ test "HTTP 1.0 responses preserve the version and close-delimit unknown streams"
     try std.testing.expect(std.mem.startsWith(u8, output, "HTTP/1.0 200 OK"));
     try std.testing.expect(std.mem.find(u8, output, "transfer-encoding") == null);
     try std.testing.expect(std.mem.endsWith(u8, output, "streamed"));
+}
+
+test "responses generate Date without overriding an explicit field" {
+    var state: TestState = .{};
+    const generated = try serveTest(
+        "GET / HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(generated);
+    const date_start = (std.mem.find(u8, generated, "date: ") orelse return error.MissingDate) + 6;
+    _ = try conditional.parseDate(generated[date_start .. date_start + 29]);
+
+    const explicit = try serveTest(
+        "GET /dated HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(explicit);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, explicit, "date: "));
+    try std.testing.expect(std.mem.find(u8, explicit, "date: Sun, 06 Nov 1994 08:49:37 GMT") != null);
+}
+
+test "automatic Date generation can be disabled" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "GET / HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{ .automatic_date = false },
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.find(u8, output, "date: ") == null);
 }
 
 test "extension methods reach dispatch with their original token" {
