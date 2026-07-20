@@ -12,8 +12,13 @@ const Headers = @import("headers.zig").Headers;
 /// Protocol adapter for lazy body activation and optional trailers.
 pub const Source = struct {
     context: *anyopaque,
-    activate_fn: *const fn (*anyopaque, std.mem.Allocator) anyerror!*Io.Reader,
-    trailers_fn: ?*const fn (*anyopaque, std.mem.Allocator) anyerror!Headers = null,
+    vtable: *const VTable,
+
+    const VTable = struct {
+        activate: *const fn (*anyopaque, std.mem.Allocator) anyerror!*Io.Reader,
+        trailers: ?*const fn (*anyopaque, std.mem.Allocator) anyerror!Headers = null,
+        failure: ?*const fn (*anyopaque) ?anyerror = null,
+    };
 
     pub fn borrowed(adapter: anytype) Source {
         const Pointer = @TypeOf(adapter);
@@ -38,32 +43,47 @@ pub const Source = struct {
                 const typed: *Adapter = @ptrCast(@alignCast(raw));
                 return typed.trailers(allocator);
             }
+
+            fn failure(raw: *anyopaque) ?anyerror {
+                const typed: *Adapter = @ptrCast(@alignCast(raw));
+                return typed.failure();
+            }
         };
         return .{
             .context = adapter,
-            .activate_fn = Bridge.activate,
-            .trailers_fn = if (@hasDecl(Adapter, "trailers")) Bridge.trailers else null,
+            .vtable = &.{
+                .activate = Bridge.activate,
+                .trailers = if (@hasDecl(Adapter, "trailers")) Bridge.trailers else null,
+                .failure = if (@hasDecl(Adapter, "failure")) Bridge.failure else null,
+            },
         };
     }
 
     pub fn fromReader(reader: *Io.Reader) Source {
         return .{
             .context = reader,
-            .activate_fn = struct {
-                fn activate(raw: *anyopaque, _: std.mem.Allocator) anyerror!*Io.Reader {
-                    return @ptrCast(@alignCast(raw));
-                }
-            }.activate,
+            .vtable = &.{
+                .activate = struct {
+                    fn activate(raw: *anyopaque, _: std.mem.Allocator) anyerror!*Io.Reader {
+                        return @ptrCast(@alignCast(raw));
+                    }
+                }.activate,
+            },
         };
     }
 
     fn activate(self: Source, allocator: std.mem.Allocator) !*Io.Reader {
-        return self.activate_fn(self.context, allocator);
+        return self.vtable.activate(self.context, allocator);
     }
 
     fn trailers(self: Source, allocator: std.mem.Allocator) !Headers {
-        const trailers_fn = self.trailers_fn orelse return .empty;
+        const trailers_fn = self.vtable.trailers orelse return .empty;
         return trailers_fn(self.context, allocator);
+    }
+
+    fn failure(self: Source) ?anyerror {
+        const failure_fn = self.vtable.failure orelse return null;
+        return failure_fn(self.context);
     }
 };
 
@@ -397,7 +417,9 @@ fn activate(pending: RequestBody.Pending) !*Io.Reader {
 
 fn readRemaining(reader: *Io.Reader, pending: RequestBody.Pending) ![]u8 {
     if (pending.read_timeout == null) {
-        return reader.allocRemaining(pending.allocator, readAllLimit(pending.maximum));
+        return reader.allocRemaining(pending.allocator, readAllLimit(pending.maximum)) catch |err| {
+            return sourceError(pending.source, err);
+        };
     }
 
     var bytes: std.ArrayList(u8) = .empty;
@@ -416,8 +438,12 @@ fn readRemaining(reader: *Io.Reader, pending: RequestBody.Pending) ![]u8 {
 }
 
 fn readSource(reader: *Io.Reader, buffer: []u8, pending: RequestBody.Pending) !usize {
-    const duration = pending.read_timeout orelse return reader.readSliceShort(buffer);
-    const io = pending.io orelse return reader.readSliceShort(buffer);
+    const duration = pending.read_timeout orelse return reader.readSliceShort(buffer) catch |err| {
+        return sourceError(pending.source, err);
+    };
+    const io = pending.io orelse return reader.readSliceShort(buffer) catch |err| {
+        return sourceError(pending.source, err);
+    };
     const Result = union(enum) {
         read: anyerror!usize,
         timeout: anyerror!void,
@@ -437,12 +463,17 @@ fn readSource(reader: *Io.Reader, buffer: []u8, pending: RequestBody.Pending) !u
     };
     defer select.cancelDiscard();
     return switch (result) {
-        .read => |read_result| try read_result,
+        .read => |read_result| read_result catch |err| return sourceError(pending.source, err),
         .timeout => |timeout_result| blk: {
             try timeout_result;
             break :blk error.RequestBodyTimeout;
         },
     };
+}
+
+fn sourceError(source: Source, err: anyerror) anyerror {
+    if (err == error.ReadFailed) return source.failure() orelse err;
+    return err;
 }
 
 fn waitForBodyTimeout(io: Io, duration: Io.Duration) anyerror!void {

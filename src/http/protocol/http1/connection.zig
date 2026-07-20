@@ -20,6 +20,7 @@ const date = @import("date.zig");
 const request_body_adapter = @import("request_body.zig");
 const conditional = @import("../../semantics/conditional.zig");
 const request_head = @import("request_head.zig");
+const head_module = @import("head.zig");
 const response_writer = @import("response_writer.zig");
 const Io = std.Io;
 const net = Io.net;
@@ -57,6 +58,12 @@ pub const Options = struct {
     max_header_value_size: usize = 8 * 1024,
     /// Maximum decoded request-body size. Route limits may reduce it further.
     max_body_size: usize = 1024 * 1024,
+    /// Maximum transfer-framed bytes consumed before content decoding.
+    max_encoded_body_size: usize = 8 * 1024 * 1024,
+    /// Maximum chunks accepted in one chunked request body.
+    max_chunk_count: usize = 100_000,
+    /// Maximum bytes in one chunk-extension line.
+    max_chunk_extension_size: usize = 1024,
     /// Maximum number of request trailer fields.
     max_trailer_count: usize = 32,
     /// Maximum total request-trailer wire size.
@@ -94,6 +101,9 @@ pub const ConfigurationError = error{
     InvalidHeaderNameSize,
     InvalidHeaderValueSize,
     InvalidBodySize,
+    InvalidEncodedBodySize,
+    InvalidChunkCount,
+    InvalidChunkExtensionSize,
     InvalidTrailerCount,
     InvalidTrailerSize,
     InvalidTransferBufferSize,
@@ -227,7 +237,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             const request_count = completed_requests + 1;
             const request = switch (try self.prepareRequest(
                 &incoming,
-                received.head.method,
+                received.head,
                 request_allocator,
                 transfer_buffer,
                 io,
@@ -304,7 +314,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         fn prepareRequest(
             self: *Self,
             incoming: *std.http.Server.Request,
-            method: Method,
+            logical_head: head_module.Head,
             allocator: std.mem.Allocator,
             transfer_buffer: []u8,
             io: Io,
@@ -324,7 +334,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             body_state.* = .initAbsent();
             var request = Request.initVersion(
                 raw,
-                method,
+                logical_head.method,
                 switch (incoming.head.version) {
                     .@"HTTP/1.0" => .http_1_0,
                     .@"HTTP/1.1" => .http_1_1,
@@ -345,8 +355,9 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 effectiveBodyLimit(Dispatcher, request.method, request.path, self.options.max_body_size)
             else
                 self.options.max_body_size;
-            if (incoming.head.transfer_compression == .identity and
-                bodyExceedsKnownLimit(incoming.head.content_length, body_limit))
+            if (bodyExceedsKnownLimit(incoming.head.content_length, self.options.max_encoded_body_size) or
+                (incoming.head.transfer_compression == .identity and
+                    bodyExceedsKnownLimit(incoming.head.content_length, body_limit)))
             {
                 incoming.head.expect = null;
                 try respondGeneratedError(io, incoming, self.options.automatic_date, "request body too large", .payload_too_large, false);
@@ -357,6 +368,10 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 adapter.* = .{
                     .incoming = incoming,
                     .transfer_buffer = transfer_buffer,
+                    .framing = logical_head.framing,
+                    .max_encoded_body_size = self.options.max_encoded_body_size,
+                    .max_chunk_count = self.options.max_chunk_count,
+                    .max_chunk_extension_size = self.options.max_chunk_extension_size,
                     .max_trailer_count = self.options.max_trailer_count,
                     .max_trailer_size = self.options.max_trailer_size,
                 };
@@ -425,6 +440,9 @@ fn validateOptions(options: Options) ConfigurationError!void {
         return error.InvalidHeaderValueSize;
     }
     if (options.max_body_size == 0) return error.InvalidBodySize;
+    if (options.max_encoded_body_size == 0) return error.InvalidEncodedBodySize;
+    if (options.max_chunk_count == 0) return error.InvalidChunkCount;
+    if (options.max_chunk_extension_size == 0) return error.InvalidChunkExtensionSize;
     if (options.max_trailer_count == 0) return error.InvalidTrailerCount;
     if (options.max_trailer_size == 0) return error.InvalidTrailerSize;
     if (options.transfer_buffer_size == 0) return error.InvalidTransferBufferSize;
@@ -513,7 +531,10 @@ const DispatchFailure = struct {
 };
 
 fn dispatchFailure(err: anyerror, policy: HandlerErrorPolicy) ?DispatchFailure {
-    if (err == error.StreamTooLong) {
+    if (err == error.StreamTooLong or
+        err == error.EncodedBodyTooLarge or
+        err == error.TooManyChunks)
+    {
         return .{ .status = .payload_too_large, .body = "request body too large" };
     }
     if (err == error.HttpExpectationFailed) {
@@ -527,6 +548,14 @@ fn dispatchFailure(err: anyerror, policy: HandlerErrorPolicy) ?DispatchFailure {
     }
     if (err == error.InvalidTrailer or err == error.ForbiddenTrailer) {
         return .{ .status = .bad_request, .body = "invalid request trailers" };
+    }
+    if (err == error.InvalidChunkSize or
+        err == error.InvalidChunkExtension or
+        err == error.InvalidChunkTerminator or
+        err == error.TruncatedChunk or
+        err == error.TruncatedBody)
+    {
+        return .{ .status = .bad_request, .body = "invalid request body framing" };
     }
     if (extractor_errors.status(err)) |status| {
         return .{ .status = status, .body = "bad request" };

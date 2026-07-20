@@ -1,6 +1,7 @@
 const std = @import("std");
 const validation = @import("http/protocol/http1/validation.zig");
 const head = @import("http/protocol/http1/head.zig");
+const chunked = @import("http/protocol/http1/chunked.zig");
 const request = @import("http/message/request.zig");
 const RequestBody = @import("http/message/request_body.zig").RequestBody;
 
@@ -66,6 +67,14 @@ test "fuzz chunk-size parsing" {
 fn fuzzChunk(_: void, smith: *std.testing.Smith) !void {
     var buffer: [4096]u8 = undefined;
     const length = smith.slice(&buffer);
-    var parser: std.http.ChunkParser = .init;
-    _ = parser.feed(buffer[0..length]);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    _ = chunked.decode(arena.allocator(), buffer[0..length], .{
+        .encoded_size = buffer.len,
+        .decoded_size = buffer.len,
+        .chunk_count = 128,
+        .chunk_extension_size = 1024,
+        .trailer_size = 2048,
+        .trailer_count = 64,
+    }) catch {};
 }

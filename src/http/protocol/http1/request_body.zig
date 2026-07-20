@@ -3,50 +3,86 @@
 const std = @import("std");
 const headers_module = @import("../../message/headers.zig");
 const request_body = @import("../../message/request_body.zig");
-const Header = headers_module.Header;
+const body_reader = @import("body_reader.zig");
+const head_module = @import("head.zig");
+
 const Headers = headers_module.Headers;
 const Io = std.Io;
 
 pub const Adapter = struct {
     incoming: *std.http.Server.Request,
     transfer_buffer: []u8,
+    framing: head_module.Framing,
+    max_encoded_body_size: usize,
+    max_chunk_count: usize,
+    max_chunk_extension_size: usize,
     max_trailer_count: usize,
     max_trailer_size: usize,
+    fixed: ?*body_reader.Fixed = null,
+    chunked: ?*body_reader.Chunked = null,
 
     pub fn activate(self: *Adapter, allocator: std.mem.Allocator) !*Io.Reader {
         try self.incoming.writeExpectContinue();
+        const transfer_reader = switch (self.framing) {
+            .none => return error.MissingBodyFraming,
+            .content_length => |length| blk: {
+                const fixed = try allocator.create(body_reader.Fixed);
+                self.fixed = fixed;
+                break :blk fixed.init(
+                    self.incoming.server.reader.in,
+                    &self.incoming.server.reader,
+                    length,
+                    self.max_encoded_body_size,
+                    self.transfer_buffer,
+                );
+            },
+            .chunked => blk: {
+                const chunked = try allocator.create(body_reader.Chunked);
+                const line_buffer = try allocator.alloc(
+                    u8,
+                    @max(self.max_chunk_extension_size + 32, self.max_trailer_size),
+                );
+                self.chunked = chunked;
+                break :blk chunked.init(
+                    self.incoming.server.reader.in,
+                    &self.incoming.server.reader,
+                    allocator,
+                    .{
+                        .encoded_size = self.max_encoded_body_size,
+                        .chunk_count = self.max_chunk_count,
+                        .chunk_extension_size = self.max_chunk_extension_size,
+                        .trailer_size = self.max_trailer_size,
+                        .trailer_count = self.max_trailer_count,
+                    },
+                    self.transfer_buffer,
+                    line_buffer,
+                );
+            },
+        };
         const decompress = try allocator.create(std.http.Decompress);
         const capacity = self.incoming.head.transfer_compression.minBufferCapacity();
         const decompress_buffer = try allocator.alloc(u8, capacity);
-        return self.incoming.server.reader.bodyReaderDecompressing(
-            self.transfer_buffer,
-            self.incoming.head.transfer_encoding,
-            self.incoming.head.content_length,
-            self.incoming.head.transfer_compression,
+        return std.http.Decompress.init(
             decompress,
+            transfer_reader,
             decompress_buffer,
+            self.incoming.head.transfer_compression,
         );
     }
 
+    pub fn failure(self: *Adapter) ?anyerror {
+        if (self.fixed) |fixed| return fixed.failure;
+        if (self.chunked) |chunked| return chunked.failure;
+        return null;
+    }
+
     pub fn trailers(self: *Adapter, allocator: std.mem.Allocator) !Headers {
-        const raw = self.incoming.server.reader.trailers;
-        if (raw.len > self.max_trailer_size) return error.TrailersTooLarge;
-        var lines = std.mem.splitSequence(u8, raw, "\r\n");
-        var items: std.ArrayList(Header) = .empty;
-        while (lines.next()) |line| {
-            if (line.len == 0) break;
-            if (items.items.len == self.max_trailer_count) return error.TooManyTrailers;
-            const colon = std.mem.findScalar(u8, line, ':') orelse return error.InvalidTrailer;
-            const name = line[0..colon];
-            const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-            if (!validToken(name) or !validFieldValue(value)) return error.InvalidTrailer;
-            if (forbiddenTrailer(name)) return error.ForbiddenTrailer;
-            try items.append(allocator, .{
-                .name = try allocator.dupe(u8, name),
-                .value = try allocator.dupe(u8, value),
-            });
+        _ = allocator;
+        const result = if (self.chunked) |chunked| chunked.trailers() else Headers.empty;
+        for (result.items) |header| {
+            if (forbiddenTrailer(header.name)) return error.ForbiddenTrailer;
         }
-        return .{ .items = items.items };
+        return result;
     }
 };
 
@@ -64,25 +100,6 @@ pub fn initState(
         io,
         read_timeout,
     );
-}
-
-fn validToken(value: []const u8) bool {
-    if (value.len == 0) return false;
-    for (value) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and
-            byte != '!' and byte != '#' and byte != '$' and byte != '%' and
-            byte != '&' and byte != '\'' and byte != '*' and byte != '+' and
-            byte != '-' and byte != '.' and byte != '^' and byte != '_' and
-            byte != '`' and byte != '|' and byte != '~') return false;
-    }
-    return true;
-}
-
-fn validFieldValue(value: []const u8) bool {
-    for (value) |byte| {
-        if ((byte < 0x20 and byte != '\t') or byte == 0x7f) return false;
-    }
-    return true;
 }
 
 fn forbiddenTrailer(name: []const u8) bool {

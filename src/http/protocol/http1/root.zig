@@ -6,6 +6,8 @@ pub const connection = @import("connection.zig");
 pub const syntax = @import("syntax.zig");
 pub const authority = @import("authority.zig");
 pub const head = @import("head.zig");
+pub const chunked = @import("chunked.zig");
+pub const body_reader = @import("body_reader.zig");
 
 /// Configuration consumed by the HTTP/1 connection driver.
 pub const Options = connection.Options;
