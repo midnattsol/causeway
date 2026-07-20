@@ -3,6 +3,7 @@
 const std = @import("std");
 const Method = @import("../../message/request.zig").Method;
 const date = @import("date.zig");
+const validation = @import("validation.zig");
 const Io = std.Io;
 
 pub const Received = struct {
@@ -38,9 +39,19 @@ pub fn receive(
         },
         else => return err,
     };
+    const validated = validation.validate(head_buffer) catch |err| {
+        const status: std.http.Status = if (err == error.UnsupportedHttpVersion)
+            .http_version_not_supported
+        else
+            .bad_request;
+        const body = if (err == error.UnsupportedHttpVersion) "HTTP version not supported" else "bad request";
+        try writeProtocolError(io, output, automatic_date, status, body);
+        return .close;
+    };
+
     var parsed_buffer = head_buffer;
     var method: ?Method = null;
-    const head = std.http.Server.Request.Head.parse(head_buffer) catch |err| switch (err) {
+    var head = std.http.Server.Request.Head.parse(head_buffer) catch |err| switch (err) {
         error.UnknownHttpMethod => blk: {
             const raw_method = requestMethod(head_buffer) orelse {
                 try writeProtocolError(io, output, automatic_date, .bad_request, "invalid method");
@@ -63,6 +74,11 @@ pub fn receive(
             return .close;
         },
     };
+    if (validated.connection_close) {
+        head.keep_alive = false;
+    } else if (head.version == .@"HTTP/1.0" and validated.connection_keep_alive) {
+        head.keep_alive = true;
+    }
     const request_method = method orelse Method.fromStandard(head.method);
     if (head.transfer_compression == .compress) {
         try writeProtocolError(io, output, automatic_date, .unsupported_media_type, "unsupported content encoding");

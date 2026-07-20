@@ -18,5 +18,6 @@ pub const HandlerWithLocals = connection.HandlerWithLocals;
 // -----------------------------------------------------------------------------
 
 test {
+    _ = @import("compliance_test.zig");
     std.testing.refAllDecls(@This());
 }
