@@ -32,20 +32,21 @@ zig build unit-test
 zig build integration-test
 zig build smoke-test
 zig build http1-fuzz
+zig build --fuzz=100K http1-fuzz
 zig build --fuzz http1-fuzz
 zig build test
 ```
 
-`zig build http1-fuzz` runs the finite fuzz smoke pass. The coverage-guided
-`--fuzz` mode is wired correctly, but Zig `0.17.0-dev.1413+addc3c3b8` currently
-aborts inside Maker after discovery; this is a toolchain issue rather than a
-Causeway input crash.
+`zig build http1-fuzz` runs the finite corpus smoke pass. Coverage-guided fuzzing
+uses LLVM only for the fuzz artifact because the default backend in Zig
+`0.17.0-dev.1413+addc3c3b8` does not emit the required coverage points. Use an
+iteration limit for CI and omit it for an interactive, continuous campaign.
 
 The project uses the active ZVM master toolchain (`0.17.0-dev`).
 
 ## Layers
 
-- `core`: allocators, context, and cross-cutting errors.
+- `core`: protocol-independent execution context and application state.
 - `http`: messages, semantics, wire protocols, transport, routing, handlers, extractors, and middleware.
 - `rest`: JSON responses, API errors, validation, and REST conventions.
 - `graphql`: GraphQL over Causeway HTTP; planned, not in the MVP.

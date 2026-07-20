@@ -35,6 +35,9 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        // Zig's built-in fuzzer requires LLVM coverage instrumentation on the
+        // current master toolchain; normal builds keep their default backend.
+        .use_llvm = true,
     });
     const run_http1_fuzz_tests = b.addRunArtifact(http1_fuzz_tests);
 
