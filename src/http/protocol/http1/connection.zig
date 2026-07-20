@@ -541,6 +541,9 @@ fn dispatchFailure(err: anyerror, policy: HandlerErrorPolicy) ?DispatchFailure {
     if (err == error.InvalidTrailer or err == error.ForbiddenTrailer) {
         return .{ .status = .bad_request, .body = "invalid request trailers" };
     }
+    if (err == error.InvalidContentEncodingBody) {
+        return .{ .status = .bad_request, .body = "invalid content-encoded request body" };
+    }
     if (err == error.InvalidChunkSize or
         err == error.InvalidChunkExtension or
         err == error.InvalidChunkTerminator or
@@ -947,6 +950,19 @@ test "connection decodes gzip request content before enforcing the body limit" {
 
     try std.testing.expect(std.mem.find(u8, output, "200 OK") != null);
     try std.testing.expect(std.mem.endsWith(u8, output, "hello"));
+}
+
+test "connection classifies corrupt compressed request bodies as bad requests" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "POST /echo HTTP/1.1\r\nhost: example.com\r\ncontent-encoding: gzip\r\ncontent-length: 8\r\nconnection: close\r\n\r\nnot-gzip",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.find(u8, output, "400 Bad Request") != null);
+    try std.testing.expect(std.mem.find(u8, output, "500 Internal Server Error") == null);
 }
 
 test "connection streams responses and finalizes their producers" {

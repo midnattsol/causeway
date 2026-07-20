@@ -25,6 +25,7 @@ pub const Adapter = struct {
     max_trailer_size: usize,
     fixed: ?*body_reader.Fixed = null,
     chunked: ?*body_reader.Chunked = null,
+    decompress: ?*std.http.Decompress = null,
 
     pub fn activate(self: *Adapter, allocator: std.mem.Allocator) !*Io.Reader {
         if (self.expect_continue) {
@@ -72,6 +73,7 @@ pub const Adapter = struct {
             },
         };
         const decompress = try allocator.create(std.http.Decompress);
+        self.decompress = decompress;
         const capacity = self.content_encoding.minBufferCapacity();
         const decompress_buffer = try allocator.alloc(u8, capacity);
         return std.http.Decompress.init(
@@ -83,8 +85,17 @@ pub const Adapter = struct {
     }
 
     pub fn failure(self: *Adapter) ?anyerror {
-        if (self.fixed) |fixed| return fixed.failure;
-        if (self.chunked) |chunked| return chunked.failure;
+        if (self.fixed) |fixed| {
+            if (fixed.failure) |err| return err;
+        }
+        if (self.chunked) |chunked| {
+            if (chunked.failure) |err| return err;
+        }
+        if (self.decompress) |decompress| switch (decompress.*) {
+            .flate => |flate| if (flate.err != null) return error.InvalidContentEncodingBody,
+            .zstd => |zstd| if (zstd.err != null) return error.InvalidContentEncodingBody,
+            .none => {},
+        };
         return null;
     }
 
