@@ -20,27 +20,36 @@ const Response = @import("../response.zig").Response;
 ///     group("/admin", admin_routes),
 /// });
 /// ```
-pub fn group(comptime prefix: []const u8, comptime routes: anytype) GroupedRoutes(routes) {
+pub fn group(comptime prefix: []const u8, comptime routes: anytype) GroupedRoutes(routes, .{}) {
+    return groupWith(prefix, routes, .{});
+}
+
+/// Prefixes routes and wraps each one in shared outer middleware.
+pub fn groupWith(
+    comptime prefix: []const u8,
+    comptime routes: anytype,
+    comptime middlewares: anytype,
+) GroupedRoutes(routes, middlewares) {
     validatePrefix(prefix);
 
-    var grouped: GroupedRoutes(routes) = undefined;
+    var grouped: GroupedRoutes(routes, middlewares) = undefined;
     inline for (routes, 0..) |route_value, index| {
         const combined = prefixedPattern(prefix, route_value.pattern);
         _ = Pattern(combined);
 
-        var prefixed_route = route_value;
+        var prefixed_route = route_module.withMiddleware(route_value, middlewares);
         prefixed_route.pattern = combined;
         grouped[index] = prefixed_route;
     }
     return grouped;
 }
 
-fn GroupedRoutes(comptime routes: anytype) type {
+fn GroupedRoutes(comptime routes: anytype, comptime middlewares: anytype) type {
     const info = tupleInfo(routes, "group routes must be a tuple");
 
     var route_types: [info.field_types.len]type = undefined;
     inline for (routes, 0..) |route_value, index| {
-        route_types[index] = @TypeOf(route_value);
+        route_types[index] = @TypeOf(route_module.withMiddleware(route_value, middlewares));
     }
     return @Tuple(&route_types);
 }
@@ -114,6 +123,7 @@ const TestContext = struct {
         path: []const u8,
     },
     params: @import("params.zig").Params = .empty,
+    events: ?*std.ArrayList(u8) = null,
 };
 
 fn usersHandler(_: *const TestContext) Response {
@@ -127,6 +137,29 @@ fn healthHandler(_: *const TestContext) Response {
 fn tenantHandler(context: *const TestContext) Response {
     return .{ .status = .ok, .body = context.params.get("tenant_id").? };
 }
+
+fn groupedHandler(context: *const TestContext) !Response {
+    try context.events.?.append(std.testing.allocator, 3);
+    return .{ .status = .ok, .body = context.params.get("id").? };
+}
+
+const GroupMiddleware = struct {
+    pub fn handle(context: anytype, next: anytype) !Response {
+        try context.events.?.append(std.testing.allocator, 1);
+        const response = try next.run(context);
+        try context.events.?.append(std.testing.allocator, 5);
+        return response;
+    }
+};
+
+const RouteMiddleware = struct {
+    pub fn handle(context: anytype, next: anytype) !Response {
+        try context.events.?.append(std.testing.allocator, 2);
+        const response = try next.run(context);
+        try context.events.?.append(std.testing.allocator, 4);
+        return response;
+    }
+};
 
 test "group prefixes ordinary routes" {
     const routes = comptime group("/api", .{
@@ -181,4 +214,21 @@ test "groups can be nested" {
     }));
 
     try std.testing.expectEqualStrings("/v1/api/users", routes[0].pattern);
+}
+
+test "group middleware wraps route middleware after params are injected" {
+    const routes = comptime groupWith("/api", .{
+        route_module.routeWith(.GET, "/users/:id", groupedHandler, .{RouteMiddleware}),
+    }, .{GroupMiddleware});
+    const AppRouter = router_module.Router(routes);
+    var events: std.ArrayList(u8) = .empty;
+    defer events.deinit(std.testing.allocator);
+    const context = TestContext{
+        .request = .{ .method = .GET, .path = "/api/users/42" },
+        .events = &events,
+    };
+
+    try std.testing.expectEqualStrings("42", (try AppRouter.dispatch(&context)).body);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5 }, events.items);
+    try std.testing.expect(context.params.isEmpty());
 }

@@ -50,6 +50,17 @@ pub fn RouterWithOptions(comptime routes: anytype, comptime options: anytype) ty
         .not_found;
 
     return struct {
+        /// Returns the matched route's body limit without executing middleware or handlers.
+        pub fn bodyLimit(method: std.http.Method, path: []const u8) ?usize {
+            inline for (0..maximum_specificity + 1) |offset| {
+                const specificity = maximum_specificity - offset;
+                if (bodyLimitForRoutes(routes, specificity, method, path)) |matched| {
+                    return matched.maximum;
+                }
+            }
+            return null;
+        }
+
         /// Dispatches a request context to the most specific matching route.
         pub fn dispatch(context: anytype) !Response {
             inline for (0..maximum_specificity + 1) |offset| {
@@ -159,6 +170,26 @@ fn maxStaticSegments(comptime routes: anytype) usize {
         maximum = @max(maximum, RoutePattern.static_segment_count);
     }
     return maximum;
+}
+
+const BodyLimitMatch = struct {
+    maximum: ?usize,
+};
+
+fn bodyLimitForRoutes(
+    comptime routes: anytype,
+    comptime specificity: usize,
+    method: std.http.Method,
+    path: []const u8,
+) ?BodyLimitMatch {
+    inline for (routes) |route_value| {
+        const RoutePattern = Pattern(route_value.pattern);
+        if (comptime RoutePattern.static_segment_count != specificity) continue;
+        if (method == route_value.method and RoutePattern.match(path) != null) {
+            return .{ .maximum = @TypeOf(route_value).max_body_size };
+        }
+    }
+    return null;
 }
 
 fn dispatchRoutes(
@@ -416,6 +447,17 @@ test "route validation detects duplicates ambiguity and valid specificity" {
     try std.testing.expectEqual(null, problem(valid));
 }
 
+test "Router exposes matched route body limits before dispatch" {
+    const AppRouter = Router(.{
+        route_module.withBodyLimit(route_module.route(.POST, "/uploads/:id", otherHandler), 1024),
+        route_module.route(.POST, "/uploads/unlimited", otherHandler),
+    });
+
+    try std.testing.expectEqual(@as(?usize, 1024), AppRouter.bodyLimit(.POST, "/uploads/42"));
+    try std.testing.expectEqual(@as(?usize, null), AppRouter.bodyLimit(.POST, "/uploads/unlimited"));
+    try std.testing.expectEqual(@as(?usize, null), AppRouter.bodyLimit(.GET, "/uploads/42"));
+}
+
 test "empty Router always uses its fallback" {
     const EmptyRouter = Router(.{});
     const context = TestContext{ .request = .{ .method = .GET, .path = "/" } };
@@ -496,4 +538,51 @@ test "Router invokes handlers with typed extractors" {
     try std.testing.expectEqual(@as(u32, 42), state.extracted_id);
     try std.testing.expect(state.details);
     try std.testing.expect(context.params.isEmpty());
+}
+
+const RequestLocals = struct {
+    request_id: []const u8 = "",
+};
+const RequestLocalContext = @import("../context.zig").ContextWithLocals(RealState, RequestLocals);
+
+fn generatedRequestId(_: anytype) []const u8 {
+    return "generated";
+}
+
+fn requestIdHandler(
+    request_id: @import("../extractors/local.zig").Local([]const u8, "request_id"),
+) Response {
+    return .{ .status = .ok, .body = request_id.value.* };
+}
+
+test "global middleware shares typed locals with routed handler extractors" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var state = RealState{};
+    var locals = RequestLocals{};
+    const context = RequestLocalContext{
+        .execution = .{
+            .state = &state,
+            .allocator = arena.allocator(),
+            .io = threaded.io(),
+        },
+        .request = try Request.init("/request-id", .GET, .{ .items = &.{
+            .{ .name = "X-Request-Id", .value = "incoming-42" },
+        } }, null),
+        .locals = &locals,
+    };
+    const AppRouter = Router(.{
+        route_module.route(.GET, "/request-id", requestIdHandler),
+    });
+    const Dispatcher = @import("../middleware/chain.zig").Chain(.{
+        @import("../middleware/request_id.zig").RequestId(.{ .generate = generatedRequestId }),
+    }, AppRouter);
+
+    const response = try Dispatcher.dispatch(&context);
+    try std.testing.expectEqualStrings("incoming-42", response.body);
+    try std.testing.expectEqualStrings("incoming-42", locals.request_id);
+    try std.testing.expectEqualStrings("incoming-42", response.headers.get("x-request-id").?);
 }

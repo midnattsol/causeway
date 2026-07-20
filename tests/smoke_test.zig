@@ -12,6 +12,41 @@ test "public module exposes architectural layers" {
     try std.testing.expect(true);
 }
 
+test "public HTTP API exposes cookies" {
+    _ = causeway.http.cookies.Cookies;
+    _ = causeway.http.cookies.SetCookie;
+    _ = causeway.http.cookies.appendToResponse;
+    try std.testing.expect(true);
+}
+
+test "public HTTP API exposes typed app routing configuration" {
+    _ = causeway.http.app.AppWithLocals;
+    _ = causeway.http.app.AppWithLocalsAndOptions;
+    _ = causeway.http.context.ContextWithLocals;
+    _ = causeway.http.routing.route.routeWith;
+    _ = causeway.http.routing.route.withBodyLimit;
+    _ = causeway.http.routing.group.groupWith;
+    try std.testing.expect(true);
+}
+
+test "public HTTP API exposes middleware" {
+    _ = causeway.http.middleware.Chain;
+    _ = causeway.http.middleware.SecurityHeaders;
+    _ = causeway.http.middleware.Cors;
+    _ = causeway.http.middleware.ErrorMapping;
+    _ = causeway.http.middleware.BearerAuth;
+    _ = causeway.http.middleware.Logging;
+    _ = causeway.http.middleware.RequestId;
+    _ = causeway.http.middleware.Timeout;
+    _ = causeway.http.middleware.Compression;
+    _ = causeway.http.middleware.RateLimit;
+    _ = causeway.http.middleware.RateLimitDecision;
+    _ = causeway.http.middleware.ETag;
+    _ = causeway.http.middleware.Session;
+    _ = causeway.http.middleware.Csrf;
+    try std.testing.expect(true);
+}
+
 test "public HTTP API exposes typed extractors" {
     _ = causeway.http.extractors.Path;
     _ = causeway.http.extractors.Query;
@@ -19,6 +54,7 @@ test "public HTTP API exposes typed extractors" {
     _ = causeway.http.extractors.Body;
     _ = causeway.http.extractors.OptionalBody;
     _ = causeway.http.extractors.State;
+    _ = causeway.http.extractors.Local;
     _ = causeway.http.extractors.Error;
     try std.testing.expect(true);
 }

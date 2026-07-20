@@ -22,6 +22,21 @@ pub fn Context(comptime State: type) type {
     };
 }
 
+/// Returns an HTTP context carrying mutable, request-scoped typed locals.
+///
+/// The locals object is owned by the connection's current request and borrowed
+/// through this context. Middleware may mutate it; routed context copies retain
+/// the same pointer, so later middleware, extractors, and handlers observe the
+/// same values.
+pub fn ContextWithLocals(comptime State: type, comptime Locals: type) type {
+    return struct {
+        execution: CoreContext(State),
+        request: Request,
+        params: Params = .empty,
+        locals: *Locals,
+    };
+}
+
 test "HTTP Context carries execution state and request data" {
     const AppState = struct {
         requests: usize = 0,
@@ -46,6 +61,29 @@ test "HTTP Context carries execution state and request data" {
     try std.testing.expectEqualStrings("/users", context.request.path);
     try std.testing.expectEqualStrings("active=true", context.request.query.?);
     try std.testing.expect(context.params.isEmpty());
+}
+
+test "HTTP ContextWithLocals shares mutable request-scoped data across copies" {
+    const AppState = struct {};
+    const Locals = struct { request_id: []const u8 = "" };
+
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var state = AppState{};
+    var locals = Locals{};
+    const context = ContextWithLocals(AppState, Locals){
+        .execution = .{
+            .state = &state,
+            .allocator = std.testing.allocator,
+            .io = threaded.io(),
+        },
+        .request = try Request.init("/", .GET, .empty, null),
+        .locals = &locals,
+    };
+
+    var copied = context;
+    copied.locals.request_id = "req-1";
+    try std.testing.expectEqualStrings("req-1", context.locals.request_id);
 }
 
 test "HTTP Context exposes routed path parameters" {

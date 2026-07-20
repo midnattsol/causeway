@@ -4,6 +4,12 @@ const std = @import("std");
 const Headers = @import("headers.zig").Headers;
 const Status = @import("status.zig").Status;
 
+/// Controls whether the HTTP connection may be reused after this response.
+pub const Connection = enum {
+    keep_alive,
+    close,
+};
+
 /// An immutable HTTP response that borrows its headers and body.
 ///
 /// The caller must keep the header storage and body alive while the response
@@ -12,6 +18,8 @@ pub const Response = struct {
     status: Status,
     headers: Headers = .empty,
     body: []const u8 = "",
+    /// Requests connection closure after this response is written.
+    connection: Connection = .keep_alive,
 
     pub fn init(status: Status, headers: Headers, body: []const u8) Response {
         return .{
@@ -69,11 +77,13 @@ test "Response initializes status headers and body" {
     try std.testing.expectEqual(Status.ok, response.status);
     try std.testing.expectEqualStrings(ContentType.text, response.headers.get("Content-Type").?);
     try std.testing.expectEqualStrings("Hello", response.body);
+    try std.testing.expectEqual(Connection.keep_alive, response.connection);
 }
 
 test "Response supports empty headers and body" {
-    const response = Response{ .status = .no_content };
+    const response = Response{ .status = .no_content, .connection = .close };
 
     try std.testing.expect(response.headers.isEmpty());
     try std.testing.expectEqualStrings("", response.body);
+    try std.testing.expectEqual(Connection.close, response.connection);
 }

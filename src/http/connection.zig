@@ -3,7 +3,8 @@
 const std = @import("std");
 const Header = @import("headers.zig").Header;
 const Headers = @import("headers.zig").Headers;
-const HttpContext = @import("context.zig").Context;
+const context_module = @import("context.zig");
+const HttpContext = context_module.Context;
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
 const extractor_errors = @import("extractors/errors.zig");
@@ -48,13 +49,29 @@ pub const ConfigurationError = error{
 /// The handler owns no state: it borrows `state`, while each call to `handle`
 /// owns and closes its accepted stream.
 pub fn Handler(comptime State: type, comptime Dispatcher: type) type {
+    return HandlerType(State, null, Dispatcher);
+}
+
+/// Returns a connection handler whose contexts include typed request locals.
+pub fn HandlerWithLocals(
+    comptime State: type,
+    comptime Locals: type,
+    comptime Dispatcher: type,
+) type {
+    return HandlerType(State, Locals, Dispatcher);
+}
+
+fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher: type) type {
     return struct {
         allocator: std.mem.Allocator,
         state: *State,
         options: Options = .{},
 
         const Self = @This();
-        const Context = HttpContext(State);
+        const Context = if (Locals) |RequestLocals|
+            context_module.ContextWithLocals(State, RequestLocals)
+        else
+            HttpContext(State);
 
         pub fn init(allocator: std.mem.Allocator, state: *State, options: Options) Self {
             return .{
@@ -113,7 +130,24 @@ pub fn Handler(comptime State: type, comptime Dispatcher: type) type {
                 const raw = try request_allocator.dupe(u8, incoming.head.target);
                 const headers = try copyHeaders(&incoming, request_allocator);
 
-                if (bodyExceedsKnownLimit(incoming.head.content_length, self.options.max_body_size)) {
+                var request = Request.init(raw, incoming.head.method, headers, null) catch {
+                    try incoming.respond("bad request", .{
+                        .status = .bad_request,
+                        .keep_alive = false,
+                    });
+                    return;
+                };
+                const body_limit = if (requestHasFramedBody(&incoming))
+                    effectiveBodyLimit(
+                        Dispatcher,
+                        request.method,
+                        request.path,
+                        self.options.max_body_size,
+                    )
+                else
+                    self.options.max_body_size;
+
+                if (bodyExceedsKnownLimit(incoming.head.content_length, body_limit)) {
                     incoming.head.expect = null;
                     try incoming.respond("request body too large", .{
                         .status = .payload_too_large,
@@ -122,7 +156,7 @@ pub fn Handler(comptime State: type, comptime Dispatcher: type) type {
                     return;
                 }
 
-                const body = readBody(&incoming, request_allocator, transfer_buffer, self.options.max_body_size) catch |err| switch (err) {
+                const body = readBody(&incoming, request_allocator, transfer_buffer, body_limit) catch |err| switch (err) {
                     error.StreamTooLong => {
                         try incoming.respond("request body too large", .{
                             .status = .payload_too_large,
@@ -133,14 +167,17 @@ pub fn Handler(comptime State: type, comptime Dispatcher: type) type {
                     else => return err,
                 };
 
-                const request = Request.init(raw, incoming.head.method, headers, body) catch {
-                    try incoming.respond("bad request", .{
-                        .status = .bad_request,
-                        .keep_alive = false,
-                    });
-                    return;
-                };
-                const context = Context{
+                request.body = body;
+                var locals: if (Locals) |RequestLocals| RequestLocals else void = if (Locals != null) .{} else {};
+                const context = if (Locals) |_| Context{
+                    .execution = .{
+                        .state = self.state,
+                        .allocator = request_allocator,
+                        .io = io,
+                    },
+                    .request = request,
+                    .locals = &locals,
+                } else Context{
                     .execution = .{
                         .state = self.state,
                         .allocator = request_allocator,
@@ -170,12 +207,13 @@ pub fn Handler(comptime State: type, comptime Dispatcher: type) type {
                 };
 
                 const response_headers = try responseHeaders(response, request_allocator);
+                const response_keep_alive = keep_alive and response.connection == .keep_alive;
                 try incoming.respond(response.body, .{
                     .status = response.status,
-                    .keep_alive = keep_alive,
+                    .keep_alive = response_keep_alive,
                     .extra_headers = response_headers,
                 });
-                if (!keep_alive) return;
+                if (!response_keep_alive) return;
                 _ = arena.reset(.retain_capacity);
             }
         }
@@ -226,6 +264,25 @@ fn readBody(
     return body;
 }
 
+fn requestHasFramedBody(incoming: *const std.http.Server.Request) bool {
+    return incoming.head.method.requestHasBody() and
+        (incoming.head.content_length != null or incoming.head.transfer_encoding == .chunked);
+}
+
+fn effectiveBodyLimit(
+    comptime Dispatcher: type,
+    method: std.http.Method,
+    path: []const u8,
+    global_maximum: usize,
+) usize {
+    if (comptime @hasDecl(Dispatcher, "bodyLimit")) {
+        if (Dispatcher.bodyLimit(method, path)) |route_maximum| {
+            return @min(global_maximum, route_maximum);
+        }
+    }
+    return global_maximum;
+}
+
 fn bodyExceedsKnownLimit(content_length: ?u64, maximum: usize) bool {
     const length = content_length orelse return false;
     return length > maximum;
@@ -263,10 +320,18 @@ const TestState = struct {
 };
 
 const TestDispatcher = struct {
+    pub fn bodyLimit(method: std.http.Method, path: []const u8) ?usize {
+        if (method == .POST and std.mem.eql(u8, path, "/limited")) return 5;
+        return null;
+    }
+
     fn dispatch(context: *const HttpContext(TestState)) error{ HandlerFailed, InvalidQuery }!Response {
         context.execution.state.requests += 1;
         if (std.mem.eql(u8, context.request.path, "/fail")) return error.HandlerFailed;
         if (std.mem.eql(u8, context.request.path, "/bad-request")) return error.InvalidQuery;
+        if (std.mem.eql(u8, context.request.path, "/close")) {
+            return .{ .status = .ok, .body = "close", .connection = .close };
+        }
         return .{
             .status = .ok,
             .headers = .{ .items = &.{.{ .name = "x-causeway", .value = "test" }} },
@@ -286,6 +351,32 @@ fn serveTest(input_bytes: []const u8, options: Options, state: *TestState) ![]u8
     var handler = Handler(TestState, TestDispatcher).init(std.testing.allocator, state, options);
     try handler.serve(&input, &output.writer, threaded.io());
     return output.toOwnedSlice();
+}
+
+test "HandlerWithLocals creates fresh default-initialized locals for a request" {
+    const Locals = struct { request_id: []const u8 = "" };
+    const LocalDispatcher = struct {
+        pub fn dispatch(context: anytype) error{}!Response {
+            std.debug.assert(context.locals.request_id.len == 0);
+            context.locals.request_id = "request-local";
+            return .{ .status = .ok, .body = context.locals.request_id };
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var input = Io.Reader.fixed("GET / HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n");
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: TestState = .{};
+    var handler = HandlerWithLocals(TestState, Locals, LocalDispatcher).init(
+        std.testing.allocator,
+        &state,
+        .{},
+    );
+
+    try handler.serve(&input, &output.writer, threaded.io());
+    try std.testing.expect(std.mem.endsWith(u8, output.written(), "request-local"));
 }
 
 test "connection dispatches a request and writes its response" {
@@ -316,6 +407,20 @@ test "connection reads a bounded request body" {
     try std.testing.expect(std.mem.endsWith(u8, output, "hello"));
 }
 
+test "connection applies a stricter route body limit before dispatch" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "POST /limited HTTP/1.1\r\nhost: example.com\r\ncontent-length: 6\r\nexpect: 100-continue\r\n\r\nhello!",
+        .{ .max_body_size = 100 },
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqual(@as(usize, 0), state.requests);
+    try std.testing.expect(std.mem.find(u8, output, "413 Payload Too Large") != null);
+    try std.testing.expect(std.mem.find(u8, output, "100 Continue") == null);
+}
+
 test "connection rejects a known oversized body before dispatch" {
     var state: TestState = .{};
     const output = try serveTest(
@@ -327,6 +432,21 @@ test "connection rejects a known oversized body before dispatch" {
 
     try std.testing.expectEqual(@as(usize, 0), state.requests);
     try std.testing.expect(std.mem.find(u8, output, "413 Payload Too Large") != null);
+}
+
+test "response can close a keep-alive connection before the next request" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "GET /close HTTP/1.1\r\nhost: example.com\r\n\r\n" ++
+            "GET /never HTTP/1.1\r\nhost: example.com\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqual(@as(usize, 1), state.requests);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "HTTP/1.1 200 OK"));
+    try std.testing.expect(std.mem.find(u8, output, "connection: close") != null);
 }
 
 test "connection serves multiple keep-alive requests" {
