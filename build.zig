@@ -28,6 +28,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const http1_fuzz_tests = b.addTest(.{
+        .name = "HTTP1 fuzz tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/http1_fuzz_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_http1_fuzz_tests = b.addRunArtifact(http1_fuzz_tests);
+
     const integration_tests = b.addTest(.{
         .name = "integration tests",
         .root_module = b.createModule(.{
@@ -44,6 +54,9 @@ pub fn build(b: *std.Build) void {
 
     const unit_test_step = b.step("unit-test", "Run unit tests");
     unit_test_step.dependOn(&run_unit_tests.step);
+
+    const http1_fuzz_step = b.step("http1-fuzz", "Fuzz HTTP/1 parsers and validation");
+    http1_fuzz_step.dependOn(&run_http1_fuzz_tests.step);
 
     const integration_test_step = b.step("integration-test", "Run HTTP integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);

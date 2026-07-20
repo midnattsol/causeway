@@ -29,6 +29,8 @@ zig fmt .
 zig build unit-test
 zig build integration-test
 zig build smoke-test
+zig build http1-fuzz
+zig build --fuzz http1-fuzz
 zig build test
 ```
 
