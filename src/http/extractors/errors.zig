@@ -20,6 +20,9 @@ pub const Error = error{
     InvalidMultipart,
     TooManyMultipartParts,
     TooManyMultipartHeaders,
+    InvalidWebSocketHandshake,
+    UnsupportedWebSocketVersion,
+    InvalidWebSocketSubprotocol,
 };
 
 /// Returns the HTTP status for a request-extraction error, or `null` when the
@@ -39,7 +42,10 @@ pub fn status(err: anyerror) ?std.http.Status {
         error.DuplicateFormField,
         error.InvalidForm,
         error.InvalidMultipart,
+        error.InvalidWebSocketHandshake,
+        error.InvalidWebSocketSubprotocol,
         => .bad_request,
+        error.UnsupportedWebSocketVersion => .upgrade_required,
         error.TooManyMultipartParts,
         error.TooManyMultipartHeaders,
         => .payload_too_large,

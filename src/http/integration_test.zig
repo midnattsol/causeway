@@ -8,6 +8,7 @@ const extractors = causeway.http.extractors;
 const middleware = causeway.http.middleware;
 const Stream = causeway.http.response.Stream;
 const files = causeway.http.files;
+const websocket = causeway.http.websocket;
 
 const Io = std.Io;
 const net = Io.net;
@@ -654,6 +655,52 @@ test "end-to-end session and CSRF cookies round-trip through sequential requests
     try testing.expectEqual(@as(usize, 1), state.loads);
     try testing.expectEqual(@as(usize, 2), state.saves);
     try testing.expectEqual(@as(usize, 2), state.stored.?.count);
+}
+
+// -----------------------------------------------------------------------------
+// WebSocket takeover
+// -----------------------------------------------------------------------------
+
+const WebSocketState = struct {};
+const WebSocketContext = causeway.http.context.Context(WebSocketState);
+
+fn webSocketHandler(context: *const WebSocketContext) !Response {
+    const Echo = struct {
+        pub fn run(_: *@This(), connection: *websocket.Connection) !void {
+            const message = (try connection.readMessage()) orelse return;
+            try connection.sendText(message.data);
+            try connection.close(1000, "done");
+        }
+    };
+    return websocket.upgrade(context, Echo{}, .{});
+}
+
+const WebSocketRouter = routing.router.Router(.{
+    routing.route.route(.GET, "/socket", webSocketHandler),
+});
+const WebSocketApp = app_module.AppWithOptions(WebSocketState, WebSocketRouter, .{});
+
+test "end-to-end WebSocket handshake and masked message exchange" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(16));
+    const io = threaded.io();
+    var state: WebSocketState = .{};
+    var app = WebSocketApp.init(testing.allocator, io, &state, server_options);
+    defer app.deinit();
+    var harness = Harness(WebSocketApp).init(&app);
+    try harness.start();
+    defer harness.stop() catch {};
+
+    const raw = try rawRequest(testing.allocator, io, harness.address, "GET /socket HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" ++
+        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n" ++
+        "\x81\x82\x01\x02\x03\x04\x69\x6b");
+    defer testing.allocator.free(raw);
+    const handshake = try parseResponse(raw, 0);
+    try testing.expectEqual(@as(u16, 101), handshake.status);
+    try testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", handshake.header("sec-websocket-accept").?);
+    try testing.expectEqualSlices(u8, &.{ 0x81, 0x02, 'h', 'i', 0x88, 0x06, 0x03, 0xe8, 'd', 'o', 'n', 'e' }, raw[handshake.next_offset..]);
+    try harness.stop();
 }
 
 // -----------------------------------------------------------------------------

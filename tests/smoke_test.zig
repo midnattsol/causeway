@@ -73,6 +73,13 @@ test "public HTTP API exposes request and response bodies" {
     try std.testing.expect(true);
 }
 
+test "public HTTP API exposes WebSocket upgrade and framing" {
+    _ = causeway.http.websocket.upgrade;
+    _ = causeway.http.websocket.Connection;
+    _ = causeway.http.websocket.Message;
+    try std.testing.expect(true);
+}
+
 test "public HTTP API exposes streaming event responses" {
     _ = causeway.http.sse.Event;
     _ = causeway.http.sse.response;
