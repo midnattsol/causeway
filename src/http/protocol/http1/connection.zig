@@ -184,7 +184,9 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         const RequestOutcome = enum { keep_alive, close };
         const PreparedRequest = union(enum) { request: Request, close };
 
-        fn serve(self: *Self, input: *Io.Reader, output: *Io.Writer, io: Io) !void {
+        /// Serves an HTTP/1 connection over caller-owned streams.
+        /// Unlike `handle`, this function does not close an underlying transport.
+        pub fn serve(self: *Self, input: *Io.Reader, output: *Io.Writer, io: Io) !void {
             try validateOptions(self.options);
             const transfer_buffer = try self.allocator.alloc(u8, self.options.transfer_buffer_size);
             defer self.allocator.free(transfer_buffer);
