@@ -17,6 +17,9 @@ pub const Error = error{
     DuplicateFormField,
     InvalidForm,
     UnsupportedMediaType,
+    InvalidMultipart,
+    TooManyMultipartParts,
+    TooManyMultipartHeaders,
 };
 
 /// Returns the HTTP status for a request-extraction error, or `null` when the
@@ -35,7 +38,11 @@ pub fn status(err: anyerror) ?std.http.Status {
         error.MissingFormField,
         error.DuplicateFormField,
         error.InvalidForm,
+        error.InvalidMultipart,
         => .bad_request,
+        error.TooManyMultipartParts,
+        error.TooManyMultipartHeaders,
+        => .payload_too_large,
         error.UnsupportedMediaType => .unsupported_media_type,
         else => null,
     };

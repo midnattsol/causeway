@@ -96,6 +96,8 @@ test "public HTTP API exposes typed extractors" {
     _ = causeway.http.extractors.OptionalBody;
     _ = causeway.http.extractors.BodyStream;
     _ = causeway.http.extractors.Form;
+    _ = causeway.http.extractors.Multipart;
+    _ = causeway.http.extractors.MultipartPart;
     _ = causeway.http.extractors.State;
     _ = causeway.http.extractors.Local;
     _ = causeway.http.extractors.Error;
