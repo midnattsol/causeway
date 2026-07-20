@@ -8,6 +8,10 @@ pub const authority = @import("authority.zig");
 pub const head = @import("head.zig");
 pub const chunked = @import("chunked.zig");
 pub const body_reader = @import("body_reader.zig");
+pub const body_writer = @import("body_writer.zig");
+pub const trailers = @import("trailers.zig");
+pub const response_plan = @import("response_plan.zig");
+pub const response_head = @import("response_head.zig");
 
 /// Configuration consumed by the HTTP/1 connection driver.
 pub const Options = connection.Options;

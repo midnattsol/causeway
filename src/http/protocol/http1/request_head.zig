@@ -2,8 +2,8 @@
 
 const std = @import("std");
 const Method = @import("../../message/request.zig").Method;
-const date = @import("date.zig");
 const head_module = @import("head.zig");
+const protocol_error = @import("protocol_error.zig");
 const validation = @import("validation.zig");
 const Io = std.Io;
 
@@ -219,17 +219,13 @@ fn writeProtocolError(
     status: std.http.Status,
     body: []const u8,
 ) !void {
-    try output.print(
-        "HTTP/1.1 {d} {s}\r\nconnection: close\r\n",
-        .{ @intFromEnum(status), status.phrase() orelse "" },
+    return protocol_error.write(
+        io,
+        output,
+        automatic_date,
+        .@"HTTP/1.1",
+        status,
+        body,
+        false,
     );
-    var date_buffer: [29]u8 = undefined;
-    if (automatic_date) {
-        if (date.value(io, &date_buffer)) |value| try output.print("date: {s}\r\n", .{value});
-    }
-    try output.print(
-        "content-type: text/plain; charset=utf-8\r\ncontent-length: {d}\r\n\r\n{s}",
-        .{ body.len, body },
-    );
-    try output.flush();
 }

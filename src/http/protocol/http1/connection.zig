@@ -16,7 +16,7 @@ const Takeover = response_module.Takeover;
 const extractor_errors = @import("../../extractors/errors.zig");
 const Exchange = @import("../../exchange.zig").Exchange;
 const exchange_adapter = @import("exchange.zig");
-const date = @import("date.zig");
+const protocol_error = @import("protocol_error.zig");
 const request_body_adapter = @import("request_body.zig");
 const conditional = @import("../../semantics/conditional.zig");
 const request_head = @import("request_head.zig");
@@ -413,18 +413,16 @@ fn respondGeneratedError(
     status: std.http.Status,
     keep_alive: bool,
 ) !void {
-    var date_buffer: [29]u8 = undefined;
-    var date_header: [1]std.http.Header = undefined;
-    const extra_headers: []const std.http.Header = if (automatic_date) blk: {
-        date_header[0] = date.header(io, &date_buffer) orelse break :blk &.{};
-        break :blk &date_header;
-    } else &.{};
-    try incoming.respond(body, .{
-        .version = incoming.head.version,
-        .status = status,
-        .keep_alive = keep_alive,
-        .extra_headers = extra_headers,
-    });
+    try protocol_error.write(
+        io,
+        incoming.server.out,
+        automatic_date,
+        incoming.head.version,
+        status,
+        body,
+        keep_alive,
+    );
+    incoming.server.reader.state = if (keep_alive) .ready else .closing;
 }
 
 fn validateOptions(options: Options) ConfigurationError!void {

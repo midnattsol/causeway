@@ -4,6 +4,7 @@ const std = @import("std");
 const Header = @import("../../message/headers.zig").Header;
 const Headers = @import("../../message/headers.zig").Headers;
 const syntax = @import("syntax.zig");
+const trailer_policy = @import("trailers.zig");
 
 pub const Limits = struct {
     encoded_size: usize,
@@ -57,6 +58,7 @@ pub fn decode(allocator: std.mem.Allocator, encoded: []const u8, limits: Limits)
         const name = line[0..colon];
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
         if (!syntax.isToken(name) or !syntax.isFieldValue(value)) return error.InvalidTrailer;
+        if (trailer_policy.isForbidden(name)) return error.ForbiddenTrailer;
         try trailers.append(allocator, .{ .name = name, .value = value });
     }
     return .{ .body = body.items, .trailers = .{ .items = trailers.items }, .consumed = cursor };

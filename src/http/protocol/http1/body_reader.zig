@@ -4,6 +4,7 @@ const std = @import("std");
 const Header = @import("../../message/headers.zig").Header;
 const Headers = @import("../../message/headers.zig").Headers;
 const syntax = @import("syntax.zig");
+const trailer_policy = @import("trailers.zig");
 const Io = std.Io;
 
 pub const Limits = struct {
@@ -157,6 +158,7 @@ pub const Chunked = struct {
             const name = line[0..colon];
             const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
             if (!syntax.isToken(name) or !syntax.isFieldValue(value)) return error.InvalidTrailer;
+            if (trailer_policy.isForbidden(name)) return error.ForbiddenTrailer;
             try self.trailers_list.append(self.allocator, .{
                 .name = try self.allocator.dupe(u8, name),
                 .value = try self.allocator.dupe(u8, value),

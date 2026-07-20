@@ -5,6 +5,7 @@ const headers_module = @import("../../message/headers.zig");
 const request_body = @import("../../message/request_body.zig");
 const body_reader = @import("body_reader.zig");
 const head_module = @import("head.zig");
+const trailer_policy = @import("trailers.zig");
 
 const Headers = headers_module.Headers;
 const Io = std.Io;
@@ -80,7 +81,7 @@ pub const Adapter = struct {
         _ = allocator;
         const result = if (self.chunked) |chunked| chunked.trailers() else Headers.empty;
         for (result.items) |header| {
-            if (forbiddenTrailer(header.name)) return error.ForbiddenTrailer;
+            if (trailer_policy.isForbidden(header.name)) return error.ForbiddenTrailer;
         }
         return result;
     }
@@ -100,13 +101,6 @@ pub fn initState(
         io,
         read_timeout,
     );
-}
-
-fn forbiddenTrailer(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "content-length") or
-        std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
-        std.ascii.eqlIgnoreCase(name, "host") or
-        std.ascii.eqlIgnoreCase(name, "trailer");
 }
 
 // -----------------------------------------------------------------------------
