@@ -38,6 +38,40 @@ pub const Encoder = struct {
         try self.write(.settings, frame.Flag.ack, 0, &.{});
     }
 
+    /// Writes one complete compressed header block as an atomic HEADERS /
+    /// CONTINUATION sequence. The caller must not interleave other frames.
+    pub fn writeHeaderBlock(
+        self: *Encoder,
+        stream_id: u32,
+        block: []const u8,
+        end_stream: bool,
+    ) !void {
+        if (stream_id == 0) return error.ProtocolError;
+        const maximum: usize = @intCast(self.peer_max_frame_size);
+        const first_length = @min(block.len, maximum);
+        var flags: u8 = if (end_stream) frame.Flag.end_stream else 0;
+        if (first_length == block.len) flags |= frame.Flag.end_headers;
+        try self.write(.headers, flags, stream_id, block[0..first_length]);
+
+        var offset = first_length;
+        while (offset < block.len) {
+            const length = @min(block.len - offset, maximum);
+            const final = offset + length == block.len;
+            try self.write(
+                .continuation,
+                if (final) frame.Flag.end_headers else 0,
+                stream_id,
+                block[offset..][0..length],
+            );
+            offset += length;
+        }
+    }
+
+    pub fn writeData(self: *Encoder, stream_id: u32, data: []const u8, end_stream: bool) !void {
+        if (stream_id == 0) return error.ProtocolError;
+        try self.write(.data, if (end_stream) frame.Flag.end_stream else 0, stream_id, data);
+    }
+
     pub fn writePing(self: *Encoder, data: *const [8]u8, ack: bool) !void {
         try self.write(.ping, if (ack) frame.Flag.ack else 0, 0, data);
     }
@@ -90,6 +124,20 @@ test "encoder writes exact frame headers and payloads" {
     try std.testing.expectEqualSlices(
         u8,
         "\x00\x00\x03\x00\x01\x00\x00\x00\x01abc",
+        output.written(),
+    );
+}
+
+test "encoder fragments header blocks into contiguous continuations" {
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var encoder: Encoder = .{ .output = &output.writer, .peer_max_frame_size = 3 };
+    try encoder.writeHeaderBlock(1, "abcdefg", true);
+    try std.testing.expectEqualSlices(
+        u8,
+        "\x00\x00\x03\x01\x01\x00\x00\x00\x01abc" ++
+            "\x00\x00\x03\x09\x00\x00\x00\x00\x01def" ++
+            "\x00\x00\x01\x09\x04\x00\x00\x00\x01g",
         output.written(),
     );
 }
