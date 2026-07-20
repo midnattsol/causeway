@@ -1,5 +1,6 @@
 const std = @import("std");
 const validation = @import("http/protocol/http1/validation.zig");
+const head = @import("http/protocol/http1/head.zig");
 const request = @import("http/message/request.zig");
 const RequestBody = @import("http/message/request_body.zig").RequestBody;
 
@@ -37,6 +38,14 @@ fn fuzzHead(_: void, smith: *std.testing.Smith) !void {
     var buffer: [16 * 1024]u8 = undefined;
     const length = smith.slice(&buffer);
     _ = validation.validate(buffer[0..length]) catch {};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    _ = head.parse(buffer[0..length], arena.allocator(), .{
+        .request_line_size = 8 * 1024,
+        .header_count = 100,
+        .header_name_size = 256,
+        .header_value_size = 8 * 1024,
+    }) catch {};
 }
 
 test "fuzz request-target parsing" {

@@ -3,12 +3,13 @@
 const std = @import("std");
 const Method = @import("../../message/request.zig").Method;
 const date = @import("date.zig");
+const head_module = @import("head.zig");
 const validation = @import("validation.zig");
 const Io = std.Io;
 
 pub const Received = struct {
     request: std.http.Server.Request,
-    method: Method,
+    head: head_module.Head,
 };
 
 pub const Outcome = union(enum) {
@@ -40,12 +41,14 @@ pub fn receive(
         },
         else => return err,
     };
-    const validated = validation.validateWithLimits(head_buffer, limits) catch |err| {
+    const logical_head = head_module.parse(head_buffer, allocator, limits) catch |err| {
         const status: std.http.Status = switch (err) {
             error.UnsupportedHttpVersion => .http_version_not_supported,
             error.RequestLineTooLong => .uri_too_long,
             error.TooManyHeaders, error.HeaderNameTooLong, error.HeaderValueTooLong => .request_header_fields_too_large,
-            error.InvalidRequestHead => .bad_request,
+            error.UnsupportedExpectation => .expectation_failed,
+            error.UnsupportedTransferCoding => .not_implemented,
+            else => .bad_request,
         };
         const body = switch (status) {
             .http_version_not_supported => "HTTP version not supported",
@@ -58,14 +61,13 @@ pub fn receive(
     };
 
     var parsed_buffer = head_buffer;
-    var method: ?Method = null;
     var head = std.http.Server.Request.Head.parse(head_buffer) catch |err| switch (err) {
         error.UnknownHttpMethod => blk: {
             const raw_method = requestMethod(head_buffer) orelse {
                 try writeProtocolError(io, output, automatic_date, .bad_request, "invalid method");
                 return .close;
             };
-            method = Method.parse(raw_method) catch {
+            _ = Method.parse(raw_method) catch {
                 try writeProtocolError(io, output, automatic_date, .bad_request, "invalid method");
                 return .close;
             };
@@ -82,12 +84,7 @@ pub fn receive(
             return .close;
         },
     };
-    if (validated.connection_close) {
-        head.keep_alive = false;
-    } else if (head.version == .@"HTTP/1.0" and validated.connection_keep_alive) {
-        head.keep_alive = true;
-    }
-    const request_method = method orelse Method.fromStandard(head.method);
+    head.keep_alive = logical_head.keep_alive;
     if (head.transfer_compression == .compress) {
         try writeProtocolError(io, output, automatic_date, .unsupported_media_type, "unsupported content encoding");
         return .close;
@@ -98,7 +95,7 @@ pub fn receive(
             .head_buffer = parsed_buffer,
             .head = head,
         },
-        .method = request_method,
+        .head = logical_head,
     } };
 }
 

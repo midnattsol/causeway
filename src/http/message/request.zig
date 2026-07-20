@@ -124,6 +124,8 @@ pub const Request = struct {
     path: []const u8,
     query: ?[]const u8 = null,
     headers: Headers = .empty,
+    /// Authority selected by the wire protocol after applying target-form rules.
+    effective_authority: ?[]const u8 = null,
     body: RequestBody,
 
     pub fn init(
@@ -156,7 +158,7 @@ pub const Request = struct {
     }
 };
 
-fn parseTarget(raw: []const u8, method: Method) InitError!Target {
+pub fn parseTarget(raw: []const u8, method: Method) InitError!Target {
     if (raw.len == 0) return error.EmptyTarget;
     if (std.mem.findScalar(u8, raw, '#') != null) return error.InvalidTarget;
 

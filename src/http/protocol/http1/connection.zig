@@ -227,7 +227,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             const request_count = completed_requests + 1;
             const request = switch (try self.prepareRequest(
                 &incoming,
-                received.method,
+                received.head.method,
                 request_allocator,
                 transfer_buffer,
                 io,
@@ -322,7 +322,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             const headers = try copyHeaders(incoming, allocator);
             const body_state = try allocator.create(RequestBody.State);
             body_state.* = .initAbsent();
-            const request = Request.initVersion(
+            var request = Request.initVersion(
                 raw,
                 method,
                 switch (incoming.head.version) {
@@ -335,6 +335,11 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 incoming.head.expect = null;
                 try respondGeneratedError(io, incoming, self.options.automatic_date, "bad request", .bad_request, false);
                 return .close;
+            };
+            request.effective_authority = switch (request.target) {
+                .absolute => |absolute| absolute.authority,
+                .authority => |value| value,
+                .origin, .asterisk => headers.get("host"),
             };
             const body_limit = if (requestHasFramedBody(incoming))
                 effectiveBodyLimit(Dispatcher, request.method, request.path, self.options.max_body_size)
