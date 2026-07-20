@@ -80,7 +80,7 @@ const IntegrationMapper = struct {
 const IntegrationTerminal = struct {
     pub fn dispatch(context: anytype) !Response {
         if (context.fail) return error.TerminalFailure;
-        return .{ .status = .ok, .body = "ok" };
+        return .{ .status = .ok, .body = .{ .bytes = "ok" } };
     }
 };
 

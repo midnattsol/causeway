@@ -26,14 +26,14 @@ const FailingNext = struct {
 };
 const SuccessfulNext = struct {
     fn run(_: @This(), _: *TestContext) !Response {
-        return .{ .status = .accepted, .body = "ok" };
+        return .{ .status = .accepted, .body = .{ .bytes = "ok" } };
     }
 };
 const TestMapper = struct {
     pub fn map(err: anyerror, context: anytype) ?Response {
         if (err != error.NotFound) return null;
         context.mapped = true;
-        return .{ .status = .not_found, .body = "missing" };
+        return .{ .status = .not_found, .body = .{ .bytes = "missing" } };
     }
 };
 
@@ -42,7 +42,7 @@ test "ErrorMapping returns mapped downstream errors" {
     const response = try ErrorMapping(TestMapper).handle(&context, FailingNext{ .err = error.NotFound });
     try std.testing.expect(context.mapped);
     try std.testing.expectEqual(std.http.Status.not_found, response.status);
-    try std.testing.expectEqualStrings("missing", response.body);
+    try std.testing.expectEqualStrings("missing", response.body.asBytes().?);
 }
 
 test "ErrorMapping repropagates unmapped errors" {
@@ -57,5 +57,5 @@ test "ErrorMapping leaves successful responses unchanged" {
     var context = TestContext{};
     const response = try ErrorMapping(TestMapper).handle(&context, SuccessfulNext{});
     try std.testing.expectEqual(std.http.Status.accepted, response.status);
-    try std.testing.expectEqualStrings("ok", response.body);
+    try std.testing.expectEqualStrings("ok", response.body.asBytes().?);
 }

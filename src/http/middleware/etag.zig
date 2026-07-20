@@ -2,7 +2,9 @@
 
 const std = @import("std");
 const Headers = @import("../headers.zig").Headers;
-const Response = @import("../response.zig").Response;
+const response_module = @import("../response.zig");
+const Response = response_module.Response;
+const Stream = response_module.Stream;
 const header_helpers = @import("header_helpers.zig");
 
 /// Compile-time ETag generation policy.
@@ -20,6 +22,10 @@ pub fn ETag(comptime options: Options) type {
     return struct {
         pub fn handle(context: anytype, next: anytype) !Response {
             var response = try next.run(context);
+            errdefer {
+                response.body.finalize();
+                response.complete(.{ .failure = error.ResponseAbandoned });
+            }
             if (!methodEligible(context.request.method) or
                 response.status.class() != .success or
                 response.status == .no_content)
@@ -29,8 +35,12 @@ pub fn ETag(comptime options: Options) type {
 
             var tag = response.headers.get("etag");
             if (tag == null) {
-                if (response.body.len == 0 or response.body.len < options.minimum_size) return response;
-                tag = try strongTag(context.execution.allocator, response.body);
+                const bytes = switch (response.body) {
+                    .empty, .stream => return response,
+                    .bytes => |bytes| bytes,
+                };
+                if (bytes.len == 0 or bytes.len < options.minimum_size) return response;
+                tag = try strongTag(context.execution.allocator, bytes);
                 response.headers = try header_helpers.set(
                     context.execution.allocator,
                     response.headers,
@@ -40,8 +50,9 @@ pub fn ETag(comptime options: Options) type {
             }
 
             if (matchesIfNoneMatch(context.request.headers, tag.?)) {
+                response.body.finalize();
                 response.status = .not_modified;
-                response.body = "";
+                response.body = .empty;
             }
             return response;
         }
@@ -158,11 +169,11 @@ test "ETag generates a stable strong tag and preserves response metadata" {
     const response = try ETag(.{}).handle(&context, TestNext{ .response = .{
         .status = .ok,
         .headers = .{ .items = &.{.{ .name = "content-type", .value = "text/plain" }} },
-        .body = "hello",
+        .body = .{ .bytes = "hello" },
     } });
 
     try std.testing.expectEqualStrings(try strongTag(arena.allocator(), "hello"), response.headers.get("etag").?);
-    try std.testing.expectEqualStrings("hello", response.body);
+    try std.testing.expectEqualStrings("hello", response.body.asBytes().?);
     try std.testing.expectEqualStrings("text/plain", response.headers.get("content-type").?);
 }
 
@@ -182,11 +193,11 @@ test "ETag applies weak If-None-Match comparison and wildcard" {
         const response = try ETag(.{}).handle(&context, TestNext{ .response = .{
             .status = .ok,
             .headers = .{ .items = &.{.{ .name = "ETag", .value = "\"existing\"" }} },
-            .body = "body",
+            .body = .{ .bytes = "body" },
         } });
 
         try std.testing.expectEqual(.not_modified, response.status);
-        try std.testing.expectEqualStrings("", response.body);
+        try std.testing.expectEqualStrings("", response.body.asBytes().?);
         try std.testing.expectEqualStrings("\"existing\"", response.headers.get("etag").?);
     }
 }
@@ -198,7 +209,7 @@ test "ETag outside Compression hashes the final encoded representation" {
             return .{
                 .status = .ok,
                 .headers = .{ .items = &.{.{ .name = "content-type", .value = "text/plain" }} },
-                .body = &body_storage,
+                .body = .{ .bytes = &body_storage },
             };
         }
     };
@@ -216,7 +227,7 @@ test "ETag outside Compression hashes the final encoded representation" {
     const first = try Dispatcher.dispatch(&first_context);
     const tag = first.headers.get("etag").?;
     try std.testing.expectEqualStrings("gzip", first.headers.get("content-encoding").?);
-    try std.testing.expectEqualStrings(try strongTag(arena.allocator(), first.body), tag);
+    try std.testing.expectEqualStrings(try strongTag(arena.allocator(), first.body.asBytes().?), tag);
 
     var second_context = testContext(arena.allocator(), .GET, .{ .items = &.{
         .{ .name = "Accept-Encoding", .value = "gzip" },
@@ -224,28 +235,125 @@ test "ETag outside Compression hashes the final encoded representation" {
     } });
     const second = try Dispatcher.dispatch(&second_context);
     try std.testing.expectEqual(.not_modified, second.status);
-    try std.testing.expectEqualStrings("", second.body);
+    try std.testing.expectEqualStrings("", second.body.asBytes().?);
+}
+
+test "ETag passes streams through without generating a tag" {
+    const Producer = struct {
+        produced_count: *usize,
+        finalized_count: *usize,
+
+        pub fn produce(self: *@This(), writer: *std.Io.Writer) !void {
+            self.produced_count.* += 1;
+            try writer.writeAll("streamed");
+        }
+
+        pub fn finalize(self: *@This()) void {
+            self.finalized_count.* += 1;
+        }
+    };
+
+    var produced_count: usize = 0;
+    var finalized_count: usize = 0;
+    var producer = Producer{
+        .produced_count = &produced_count,
+        .finalized_count = &finalized_count,
+    };
+    var context = testContext(std.testing.allocator, .GET, .{ .items = &.{.{
+        .name = "If-None-Match",
+        .value = "*",
+    }} });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var response = try ETag(.{}).handle(&context, TestNext{ .response = .{
+        .status = .ok,
+        .body = .{ .stream = try Stream.borrowed(arena.allocator(), &producer, .{}) },
+    } });
+
+    try std.testing.expect(response.headers.get("etag") == null);
+    try std.testing.expect(response.body == .stream);
+    try std.testing.expectEqual(@as(usize, 0), produced_count);
+    try std.testing.expectEqual(@as(usize, 0), finalized_count);
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try response.body.stream.produce(&output.writer);
+    response.body.stream.finalize();
+
+    try std.testing.expectEqualStrings("streamed", output.written());
+    try std.testing.expectEqual(@as(usize, 1), produced_count);
+    try std.testing.expectEqual(@as(usize, 1), finalized_count);
+}
+
+test "ETag explicit stream tag match returns empty and finalizes without producing" {
+    const Producer = struct {
+        produced_count: *usize,
+        finalized_count: *usize,
+
+        pub fn produce(self: *@This(), _: *std.Io.Writer) !void {
+            self.produced_count.* += 1;
+        }
+
+        pub fn finalize(self: *@This()) void {
+            self.finalized_count.* += 1;
+        }
+    };
+
+    var produced_count: usize = 0;
+    var finalized_count: usize = 0;
+    var producer = Producer{
+        .produced_count = &produced_count,
+        .finalized_count = &finalized_count,
+    };
+    var context = testContext(std.testing.allocator, .GET, .{ .items = &.{.{
+        .name = "If-None-Match",
+        .value = "W/\"explicit\"",
+    }} });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const response = try ETag(.{}).handle(&context, TestNext{ .response = .{
+        .status = .ok,
+        .headers = .{ .items = &.{.{ .name = "ETag", .value = "\"explicit\"" }} },
+        .body = .{ .stream = try Stream.borrowed(arena.allocator(), &producer, .{}) },
+    } });
+
+    try std.testing.expectEqual(.not_modified, response.status);
+    try std.testing.expect(response.body == .empty);
+    try std.testing.expectEqualStrings("\"explicit\"", response.headers.get("etag").?);
+    try std.testing.expectEqual(@as(usize, 0), produced_count);
+    try std.testing.expectEqual(@as(usize, 1), finalized_count);
 }
 
 test "ETag ignores nonmatching unsafe and ineligible responses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
+    var empty_context = testContext(arena.allocator(), .GET, .empty);
+    const empty = try ETag(.{}).handle(
+        &empty_context,
+        TestNext{ .response = .{ .status = .ok } },
+    );
+    try std.testing.expect(empty.headers.get("etag") == null);
+    try std.testing.expect(empty.body == .empty);
+
     var post_context = testContext(arena.allocator(), .POST, .empty);
-    const post = try ETag(.{}).handle(&post_context, TestNext{ .response = .{ .status = .ok, .body = "body" } });
+    const post = try ETag(.{}).handle(&post_context, TestNext{ .response = .{
+        .status = .ok,
+        .body = .{ .bytes = "body" },
+    } });
     try std.testing.expect(post.headers.get("etag") == null);
 
     var small_context = testContext(arena.allocator(), .GET, .empty);
     const small = try ETag(.{ .minimum_size = 5 }).handle(
         &small_context,
-        TestNext{ .response = .{ .status = .ok, .body = "tiny" } },
+        TestNext{ .response = .{ .status = .ok, .body = .{ .bytes = "tiny" } } },
     );
     try std.testing.expect(small.headers.get("etag") == null);
 
     var error_context = testContext(arena.allocator(), .GET, .empty);
     const failure = try ETag(.{}).handle(
         &error_context,
-        TestNext{ .response = .{ .status = .internal_server_error, .body = "failure" } },
+        TestNext{ .response = .{ .status = .internal_server_error, .body = .{ .bytes = "failure" } } },
     );
     try std.testing.expect(failure.headers.get("etag") == null);
 }

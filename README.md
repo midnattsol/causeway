@@ -6,8 +6,12 @@ sockets, connection management, or an alternate HTTP engine.
 
 ## Status
 
-Early scaffolding. The first implementation target is a minimal typed
-`GET /health` route returning JSON.
+The HTTP/1.1 core is implemented: lifecycle-managed servers and hot listeners,
+typed compile-time routing, extractors and middleware, buffered and streaming
+request/response bodies, keep-alive, limits, deadlines, graceful shutdown,
+cookies, sessions, CSRF, compression, ETags, and real TCP integration tests.
+
+REST, GraphQL, OpenAPI, and adapters remain separate higher-level phases.
 
 ## Toolchain
 
@@ -18,8 +22,13 @@ that toolchain before implementing `http/server.zig`.
 
 ```sh
 zig fmt .
+zig build unit-test
+zig build integration-test
+zig build smoke-test
 zig build test
 ```
+
+The project uses the active ZVM master toolchain (`0.17.0-dev`).
 
 ## Layers
 
@@ -30,4 +39,6 @@ zig build test
 - `openapi`: route metadata and OpenAPI generation; planned after the MVP.
 - `adapters`: optional integrations such as OIDC and observability.
 
-See [`IDEA.md`](IDEA.md) for architecture, ownership, and delivery plan.
+See [`IDEA.md`](IDEA.md) for architecture, ownership, and delivery plan, and
+[`docs/http-streaming.md`](docs/http-streaming.md) for request/response body
+ownership, streaming, middleware behavior, and examples.

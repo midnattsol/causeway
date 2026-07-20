@@ -89,6 +89,10 @@ pub fn Csrf(comptime options: anytype) type {
                 if (!isValidToken(token)) return error.InvalidGeneratedCsrfToken;
 
                 var response = try next.run(context);
+                errdefer {
+                    response.body.finalize();
+                    response.complete(.{ .failure = error.ResponseAbandoned });
+                }
                 try cookies.appendToResponse(context.execution.allocator, &response, cookies.SetCookie{
                     .name = cookie_name,
                     .value = token,
@@ -255,13 +259,13 @@ test "Csrf safe request preserves an existing valid cookie without setting one" 
 
     const response = try Csrf(.{ .generate = generatedToken }).handle(&context, TestNext{
         .calls = &calls,
-        .response = .{ .status = .accepted, .headers = original_headers, .body = "body", .connection = .close },
+        .response = .{ .status = .accepted, .headers = original_headers, .body = .{ .bytes = "body" }, .connection = .close },
     });
 
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expect(!context.generator_called);
     try std.testing.expectEqual(std.http.Status.accepted, response.status);
-    try std.testing.expectEqualStrings("body", response.body);
+    try std.testing.expectEqualStrings("body", response.body.asBytes().?);
     try std.testing.expectEqualStrings("preserved", response.headers.get("x-downstream").?);
     try std.testing.expect(response.headers.get("set-cookie") == null);
     try std.testing.expectEqual(@import("../response.zig").Connection.close, response.connection);
@@ -302,13 +306,13 @@ test "Csrf unsafe request accepts matching valid cookie and header" {
 
     const response = try Csrf(.{ .generate = generatedToken }).handle(
         &context,
-        TestNext{ .calls = &calls, .response = .{ .status = .created, .body = "created" } },
+        TestNext{ .calls = &calls, .response = .{ .status = .created, .body = .{ .bytes = "created" } } },
     );
 
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expect(!context.generator_called);
     try std.testing.expectEqual(std.http.Status.created, response.status);
-    try std.testing.expectEqualStrings("created", response.body);
+    try std.testing.expectEqualStrings("created", response.body.asBytes().?);
 }
 
 test "Csrf unsafe request rejects missing and mismatched tokens without next" {

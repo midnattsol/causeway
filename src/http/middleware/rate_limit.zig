@@ -53,7 +53,7 @@ pub fn RateLimit(comptime Policy: type) type {
             var response = if (decision.allowed)
                 try next.run(context)
             else
-                Response{ .status = .too_many_requests, .body = "too many requests" };
+                Response{ .status = .too_many_requests, .body = .{ .bytes = "too many requests" } };
             response.headers = try addHeaders(
                 context.execution.allocator,
                 response.headers,

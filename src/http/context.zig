@@ -3,6 +3,7 @@
 const std = @import("std");
 const CoreContext = @import("../core/context.zig").Context;
 const Request = @import("request.zig").Request;
+const RequestBody = @import("request_body.zig").RequestBody;
 const Params = @import("routing/params.zig").Params;
 
 /// Returns the HTTP handler-context type for an application's `State`.
@@ -46,7 +47,8 @@ test "HTTP Context carries execution state and request data" {
     defer threaded.deinit();
 
     var state = AppState{};
-    const request = try Request.init("/users?active=true", .GET, .empty, null);
+    var body_state = RequestBody.State.initAbsent();
+    const request = try Request.init("/users?active=true", .GET, .empty, RequestBody.init(&body_state));
     const context = Context(AppState){
         .execution = .{
             .state = &state,
@@ -71,13 +73,14 @@ test "HTTP ContextWithLocals shares mutable request-scoped data across copies" {
     defer threaded.deinit();
     var state = AppState{};
     var locals = Locals{};
+    var body_state = RequestBody.State.initAbsent();
     const context = ContextWithLocals(AppState, Locals){
         .execution = .{
             .state = &state,
             .allocator = std.testing.allocator,
             .io = threaded.io(),
         },
-        .request = try Request.init("/", .GET, .empty, null),
+        .request = try Request.init("/", .GET, .empty, RequestBody.init(&body_state)),
         .locals = &locals,
     };
 
@@ -93,13 +96,14 @@ test "HTTP Context exposes routed path parameters" {
     defer threaded.deinit();
 
     var state = AppState{};
+    var body_state = RequestBody.State.initAbsent();
     const context = Context(AppState){
         .execution = .{
             .state = &state,
             .allocator = std.testing.allocator,
             .io = threaded.io(),
         },
-        .request = try Request.init("/users/42", .GET, .empty, null),
+        .request = try Request.init("/users/42", .GET, .empty, RequestBody.init(&body_state)),
         .params = .{ .items = &.{
             .{ .name = "id", .value = "42" },
         } },

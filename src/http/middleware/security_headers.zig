@@ -17,6 +17,10 @@ pub fn SecurityHeaders(comptime options: Options) type {
     return struct {
         pub fn handle(context: anytype, next: anytype) !Response {
             var response = try next.run(context);
+            errdefer {
+                response.body.finalize();
+                response.complete(.{ .failure = error.ResponseAbandoned });
+            }
             var mutations: [3]header_helpers.Mutation = undefined;
             var count: usize = 0;
 

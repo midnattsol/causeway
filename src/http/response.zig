@@ -1,4 +1,4 @@
-//! Borrowed HTTP response representation.
+//! Borrowed and streaming HTTP response representation.
 
 const std = @import("std");
 const Headers = @import("headers.zig").Headers;
@@ -10,23 +10,267 @@ pub const Connection = enum {
     close,
 };
 
-/// An immutable HTTP response that borrows its headers and body.
+/// A type-erased response producer.
 ///
-/// The caller must keep the header storage and body alive while the response
-/// is being written. `Response` does not allocate and does not need `deinit`.
+/// A producer is a struct with either `produce` (preferred) or `write` whose
+/// effective signature is `fn (*Producer, *std.Io.Writer) !void`. It may also
+/// define `finalize` with effective signature `fn (*Producer) void`.
+///
+/// `produce` invokes the selected producer method at most once. `finalize`
+/// invokes the optional finalizer at most once, including when production
+/// failed. A connection should therefore arrange `defer stream.finalize()`
+/// before calling `stream.produce(writer)` exactly once.
+pub const Stream = struct {
+    context: *anyopaque,
+    produce_fn: *const fn (context: *anyopaque, writer: *std.Io.Writer) anyerror!void,
+    finalize_fn: ?*const fn (context: *anyopaque) void = null,
+    lifecycle: *Lifecycle,
+    content_length: ?u64 = null,
+
+    pub const Lifecycle = struct {
+        produced: bool = false,
+        finalized: bool = false,
+    };
+
+    pub const Options = struct {
+        content_length: ?u64 = null,
+    };
+
+    /// Copies `producer` into `allocator`, normally the request arena.
+    /// Arena ownership remains with the caller; `finalize` is for producer
+    /// resources and does not free the copied storage.
+    pub fn init(allocator: std.mem.Allocator, producer: anytype, options: Options) std.mem.Allocator.Error!Stream {
+        const Producer = @TypeOf(producer);
+        requireProducer(Producer);
+
+        const Box = struct {
+            lifecycle: Lifecycle = .{},
+            producer: Producer,
+        };
+        const box = try allocator.create(Box);
+        box.* = .{ .producer = producer };
+        return fromPointer(Producer, &box.producer, &box.lifecycle, options);
+    }
+
+    /// Borrows a mutable producer and allocates only its shared lifecycle in
+    /// `allocator`, normally the request arena. The producer itself must outlive
+    /// production and finalization.
+    pub fn borrowed(
+        allocator: std.mem.Allocator,
+        producer: anytype,
+        options: Options,
+    ) std.mem.Allocator.Error!Stream {
+        const Pointer = @TypeOf(producer);
+        const pointer = switch (@typeInfo(Pointer)) {
+            .pointer => |info| info,
+            else => @compileError("borrowed producer must be a mutable single-item pointer"),
+        };
+        if (pointer.size != .one or pointer.attrs.@"const")
+            @compileError("borrowed producer must be a mutable single-item pointer");
+
+        requireProducer(pointer.child);
+        const lifecycle = try allocator.create(Lifecycle);
+        lifecycle.* = .{};
+        return fromPointer(pointer.child, producer, lifecycle, options);
+    }
+
+    /// Adapts a compile-time-known producer function. Only the shared
+    /// lifecycle is allocated in `allocator`; the producer has no state.
+    /// The function signature is `fn (*std.Io.Writer) !void`.
+    pub fn stateless(
+        allocator: std.mem.Allocator,
+        comptime producer: anytype,
+        options: Options,
+    ) std.mem.Allocator.Error!Stream {
+        const Adapter = struct {
+            pub fn produce(_: *@This(), writer: *std.Io.Writer) anyerror!void {
+                return producer(writer);
+            }
+        };
+        return init(allocator, Adapter{}, options);
+    }
+
+    pub fn produce(self: *Stream, writer: *std.Io.Writer) anyerror!void {
+        if (self.lifecycle.produced) return error.StreamAlreadyProduced;
+        self.lifecycle.produced = true;
+        return self.produce_fn(self.context, writer);
+    }
+
+    pub fn finalize(self: *Stream) void {
+        if (self.lifecycle.finalized) return;
+        self.lifecycle.finalized = true;
+        if (self.finalize_fn) |finalize_fn| finalize_fn(self.context);
+    }
+
+    fn fromPointer(
+        comptime Producer: type,
+        producer: *Producer,
+        lifecycle: *Lifecycle,
+        options: Options,
+    ) Stream {
+        const Adapter = struct {
+            fn produce(context: *anyopaque, writer: *std.Io.Writer) anyerror!void {
+                const typed: *Producer = @ptrCast(@alignCast(context));
+                if (comptime @hasDecl(Producer, "produce"))
+                    return typed.produce(writer)
+                else
+                    return typed.write(writer);
+            }
+
+            fn finalize(context: *anyopaque) void {
+                const typed: *Producer = @ptrCast(@alignCast(context));
+                typed.finalize();
+            }
+        };
+
+        return .{
+            .context = producer,
+            .produce_fn = Adapter.produce,
+            .finalize_fn = if (@hasDecl(Producer, "finalize")) Adapter.finalize else null,
+            .lifecycle = lifecycle,
+            .content_length = options.content_length,
+        };
+    }
+
+    fn requireProducer(comptime Producer: type) void {
+        switch (@typeInfo(Producer)) {
+            .@"struct", .@"union", .@"enum", .@"opaque" => {},
+            else => @compileError("producer must be a container with a produce or write declaration"),
+        }
+        if (!@hasDecl(Producer, "produce") and !@hasDecl(Producer, "write"))
+            @compileError("producer must declare produce or write");
+    }
+};
+
+/// A response body with allocation-free fast paths for empty and byte bodies.
+pub const ResponseBody = union(enum) {
+    empty,
+    bytes: []const u8,
+    stream: Stream,
+
+    pub fn fromBytes(bytes: []const u8) ResponseBody {
+        return if (bytes.len == 0) .empty else .{ .bytes = bytes };
+    }
+
+    pub fn fromStream(stream: Stream) ResponseBody {
+        return .{ .stream = stream };
+    }
+
+    /// Returns a direct byte slice for non-streaming bodies.
+    pub fn asBytes(self: ResponseBody) ?[]const u8 {
+        return switch (self) {
+            .empty => "",
+            .bytes => |bytes| bytes,
+            .stream => null,
+        };
+    }
+
+    pub fn contentLength(self: ResponseBody) ?u64 {
+        return switch (self) {
+            .empty => 0,
+            .bytes => |bytes| @intCast(bytes.len),
+            .stream => |stream| stream.content_length,
+        };
+    }
+
+    /// Finalizes an owned stream body without producing it. Empty and byte
+    /// bodies require no action. Calling this repeatedly is safe.
+    pub fn finalize(self: *ResponseBody) void {
+        switch (self.*) {
+            .stream => |*stream| stream.finalize(),
+            else => {},
+        }
+    }
+};
+
+/// Outcome observed after the connection attempts to write a response.
+pub const CompletionResult = union(enum) {
+    success,
+    failure: anyerror,
+};
+
+/// A request-arena-allocated, type-erased response completion observer.
+/// Multiple observers form a linked chain without enlarging `Response` beyond
+/// one nullable pointer.
+pub const Completion = struct {
+    context: *anyopaque,
+    notify_fn: *const fn (*anyopaque, CompletionResult) void,
+    previous: ?*Completion,
+    notified: bool = false,
+
+    /// Copies `observer` into one request-arena allocation. `Observer` must
+    /// declare `complete(*Observer, CompletionResult) void`.
+    pub fn create(
+        allocator: std.mem.Allocator,
+        observer: anytype,
+        previous: ?*Completion,
+    ) std.mem.Allocator.Error!*Completion {
+        const Observer = @TypeOf(observer);
+        if (!@hasDecl(Observer, "complete")) {
+            @compileError("completion observer must declare complete");
+        }
+        const Box = struct {
+            completion: Completion,
+            observer: Observer,
+        };
+        const Adapter = struct {
+            fn notify(context: *anyopaque, result: CompletionResult) void {
+                const typed: *Observer = @ptrCast(@alignCast(context));
+                typed.complete(result);
+            }
+        };
+
+        const box = try allocator.create(Box);
+        box.* = .{
+            .completion = .{
+                .context = &box.observer,
+                .notify_fn = Adapter.notify,
+                .previous = previous,
+            },
+            .observer = observer,
+        };
+        return &box.completion;
+    }
+
+    pub fn notify(self: *Completion, result: CompletionResult) void {
+        if (self.notified) return;
+        self.notified = true;
+        if (self.previous) |previous| previous.notify(result);
+        self.notify_fn(self.context, result);
+    }
+};
+
+/// An HTTP response with a uniform body type for fixed and streaming output.
 pub const Response = struct {
     status: Status,
     headers: Headers = .empty,
-    body: []const u8 = "",
+    body: ResponseBody = .empty,
     /// Requests connection closure after this response is written.
     connection: Connection = .keep_alive,
+    /// Internal observer chain notified by the connection after body emission.
+    completion: ?*Completion = null,
+    /// Optional absolute deadline covering header and body emission.
+    write_deadline: ?std.Io.Clock.Timestamp = null,
 
+    /// Compatibility constructor for fixed byte responses.
     pub fn init(status: Status, headers: Headers, body: []const u8) Response {
         return .{
             .status = status,
             .headers = headers,
-            .body = body,
+            .body = .fromBytes(body),
         };
+    }
+
+    pub fn streaming(status: Status, headers: Headers, stream: Stream) Response {
+        return .{
+            .status = status,
+            .headers = headers,
+            .body = .fromStream(stream),
+        };
+    }
+
+    pub fn complete(self: *Response, result: CompletionResult) void {
+        if (self.completion) |completion| completion.notify(result);
     }
 };
 
@@ -68,7 +312,7 @@ pub const ContentType = struct {
     pub const graphql = "application/graphql-response+json";
 };
 
-test "Response initializes status headers and body" {
+test "Response initializes status headers and byte body" {
     const headers = Headers{ .items = &.{
         .{ .name = "content-type", .value = ContentType.text },
     } };
@@ -76,14 +320,106 @@ test "Response initializes status headers and body" {
 
     try std.testing.expectEqual(Status.ok, response.status);
     try std.testing.expectEqualStrings(ContentType.text, response.headers.get("Content-Type").?);
-    try std.testing.expectEqualStrings("Hello", response.body);
+    try std.testing.expectEqualStrings("Hello", response.body.asBytes().?);
+    try std.testing.expectEqual(@as(?u64, 5), response.body.contentLength());
     try std.testing.expectEqual(Connection.keep_alive, response.connection);
 }
 
-test "Response supports empty headers and body" {
+test "Response supports empty headers and body fast path" {
     const response = Response{ .status = .no_content, .connection = .close };
 
     try std.testing.expect(response.headers.isEmpty());
-    try std.testing.expectEqualStrings("", response.body);
+    try std.testing.expectEqualStrings("", response.body.asBytes().?);
+    try std.testing.expectEqual(@as(?u64, 0), response.body.contentLength());
     try std.testing.expectEqual(Connection.close, response.connection);
+}
+
+test "allocated stream produces and finalizes at most once" {
+    const Producer = struct {
+        value: []const u8,
+        produced_count: *usize,
+        finalized_count: *usize,
+
+        pub fn produce(self: *@This(), writer: *std.Io.Writer) !void {
+            self.produced_count.* += 1;
+            try writer.writeAll(self.value);
+        }
+
+        pub fn finalize(self: *@This()) void {
+            self.finalized_count.* += 1;
+        }
+    };
+
+    var produced_count: usize = 0;
+    var finalized_count: usize = 0;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var stream = try Stream.init(arena.allocator(), Producer{
+        .value = "streamed",
+        .produced_count = &produced_count,
+        .finalized_count = &finalized_count,
+    }, .{ .content_length = 8 });
+    var copy = stream;
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try stream.produce(&output.writer);
+    try std.testing.expectError(error.StreamAlreadyProduced, copy.produce(&output.writer));
+    stream.finalize();
+    copy.finalize();
+
+    try std.testing.expectEqualStrings("streamed", output.written());
+    try std.testing.expectEqual(@as(usize, 1), produced_count);
+    try std.testing.expectEqual(@as(usize, 1), finalized_count);
+    try std.testing.expectEqual(@as(?u64, 8), stream.content_length);
+}
+
+test "borrowed stream accepts write producer without copying" {
+    const Producer = struct {
+        calls: usize = 0,
+
+        pub fn write(self: *@This(), writer: *std.Io.Writer) !void {
+            self.calls += 1;
+            try writer.writeAll("borrowed");
+        }
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var producer: Producer = .{};
+    var stream = try Stream.borrowed(arena.allocator(), &producer, .{});
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try stream.produce(&output.writer);
+
+    try std.testing.expectEqualStrings("borrowed", output.written());
+    try std.testing.expectEqual(@as(usize, 1), producer.calls);
+    try std.testing.expectEqual(@as(?u64, null), stream.content_length);
+}
+
+test "stateless stream stores only shared lifecycle state" {
+    const Producer = struct {
+        fn produce(writer: *std.Io.Writer) !void {
+            try writer.writeAll("stateless");
+        }
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var response = Response.streaming(
+        .ok,
+        .empty,
+        try Stream.stateless(arena.allocator(), Producer.produce, .{}),
+    );
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try response.body.stream.produce(&output.writer);
+    response.body.stream.finalize();
+
+    try std.testing.expectEqualStrings("stateless", output.written());
+    try std.testing.expect(response.body.asBytes() == null);
+    try std.testing.expectEqual(@as(?u64, null), response.body.contentLength());
 }

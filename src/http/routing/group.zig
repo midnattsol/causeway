@@ -127,20 +127,20 @@ const TestContext = struct {
 };
 
 fn usersHandler(_: *const TestContext) Response {
-    return .{ .status = .ok, .body = "users" };
+    return .{ .status = .ok, .body = .{ .bytes = "users" } };
 }
 
 fn healthHandler(_: *const TestContext) Response {
-    return .{ .status = .ok, .body = "health" };
+    return .{ .status = .ok, .body = .{ .bytes = "health" } };
 }
 
 fn tenantHandler(context: *const TestContext) Response {
-    return .{ .status = .ok, .body = context.params.get("tenant_id").? };
+    return .{ .status = .ok, .body = .{ .bytes = context.params.get("tenant_id").? } };
 }
 
 fn groupedHandler(context: *const TestContext) !Response {
     try context.events.?.append(std.testing.allocator, 3);
-    return .{ .status = .ok, .body = context.params.get("id").? };
+    return .{ .status = .ok, .body = .{ .bytes = context.params.get("id").? } };
 }
 
 const GroupMiddleware = struct {
@@ -192,10 +192,10 @@ test "groups combine and remain consumable by Router" {
     const AppRouter = router_module.Router(routes);
 
     const users_context = TestContext{ .request = .{ .method = .GET, .path = "/api/users" } };
-    try std.testing.expectEqualStrings("users", (try AppRouter.dispatch(&users_context)).body);
+    try std.testing.expectEqualStrings("users", (try AppRouter.dispatch(&users_context)).body.asBytes().?);
 
     const health_context = TestContext{ .request = .{ .method = .GET, .path = "/system/health" } };
-    try std.testing.expectEqualStrings("health", (try AppRouter.dispatch(&health_context)).body);
+    try std.testing.expectEqualStrings("health", (try AppRouter.dispatch(&health_context)).body.asBytes().?);
 }
 
 test "group supports dynamic prefix parameters" {
@@ -205,7 +205,7 @@ test "group supports dynamic prefix parameters" {
     const AppRouter = router_module.Router(routes);
     const context = TestContext{ .request = .{ .method = .GET, .path = "/tenants/acme/users" } };
 
-    try std.testing.expectEqualStrings("acme", (try AppRouter.dispatch(&context)).body);
+    try std.testing.expectEqualStrings("acme", (try AppRouter.dispatch(&context)).body.asBytes().?);
 }
 
 test "groups can be nested" {
@@ -228,7 +228,7 @@ test "group middleware wraps route middleware after params are injected" {
         .events = &events,
     };
 
-    try std.testing.expectEqualStrings("42", (try AppRouter.dispatch(&context)).body);
+    try std.testing.expectEqualStrings("42", (try AppRouter.dispatch(&context)).body.asBytes().?);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5 }, events.items);
     try std.testing.expect(context.params.isEmpty());
 }

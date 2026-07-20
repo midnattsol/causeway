@@ -57,7 +57,7 @@ const TestNext = struct {
     called: *bool,
     fn run(self: @This(), _: *TestContext) !Response {
         self.called.* = true;
-        return .{ .status = .ok, .body = "private" };
+        return .{ .status = .ok, .body = .{ .bytes = "private" } };
     }
 };
 

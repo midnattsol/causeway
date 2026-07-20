@@ -96,11 +96,11 @@ const TestContext = struct {
 };
 
 fn firstHandler(_: *const TestContext) Response {
-    return .{ .status = .ok, .body = "first" };
+    return .{ .status = .ok, .body = .{ .bytes = "first" } };
 }
 
 fn secondHandler(_: *const TestContext) Response {
-    return .{ .status = .ok, .body = "second" };
+    return .{ .status = .ok, .body = .{ .bytes = "second" } };
 }
 
 fn fallibleHandler(_: *const TestContext) error{Failure}!Response {
@@ -145,7 +145,7 @@ test "route invokes an infallible handler" {
     const context = TestContext{ .events = &events };
     const response = try value.invoke(&context);
 
-    try std.testing.expectEqualStrings("first", response.body);
+    try std.testing.expectEqualStrings("first", response.body.asBytes().?);
 }
 
 test "route propagates a handler error" {

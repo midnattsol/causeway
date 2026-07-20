@@ -51,6 +51,10 @@ pub fn Cors(comptime options: Options) type {
             }
 
             var response = try next.run(context);
+            errdefer {
+                response.body.finalize();
+                response.complete(.{ .failure = error.ResponseAbandoned });
+            }
             const request_origin = origin orelse return response;
             if (!originAllowed(request_origin)) return response;
 

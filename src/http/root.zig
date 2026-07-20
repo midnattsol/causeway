@@ -6,6 +6,7 @@ pub const app = @import("app.zig");
 pub const context = @import("context.zig");
 pub const server = @import("server.zig");
 pub const request = @import("request.zig");
+pub const request_body = @import("request_body.zig");
 pub const response = @import("response.zig");
 pub const status = @import("status.zig");
 pub const routing = @import("routing/root.zig");

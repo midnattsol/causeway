@@ -6,6 +6,7 @@ const Response = causeway.http.response.Response;
 const routing = causeway.http.routing;
 const extractors = causeway.http.extractors;
 const middleware = causeway.http.middleware;
+const Stream = causeway.http.response.Stream;
 
 const Io = std.Io;
 const net = Io.net;
@@ -165,7 +166,8 @@ const HeaderIterator = struct {
     }
 };
 
-fn parseResponse(raw: []const u8, offset: usize) !ParsedResponse {
+fn parseResponse(raw: []u8, offset: usize) !ParsedResponse {
+    if (offset > raw.len) return error.IncompleteResponseHead;
     const head_relative_end = std.mem.find(u8, raw[offset..], "\r\n\r\n") orelse return error.IncompleteResponseHead;
     const head_end = offset + head_relative_end;
     const first_line_relative_end = std.mem.find(u8, raw[offset..head_end], "\r\n") orelse return error.InvalidStatusLine;
@@ -183,6 +185,17 @@ fn parseResponse(raw: []const u8, offset: usize) !ParsedResponse {
         .body = "",
         .next_offset = body_start,
     };
+    if (temporary.header("transfer-encoding")) |value| {
+        if (!headerValueHasToken(value, "chunked")) return error.UnsupportedTransferEncoding;
+        const decoded_body, const next_offset = try decodeChunkedBody(raw, body_start);
+        return .{
+            .status = status,
+            .header_block = header_block,
+            .body = decoded_body,
+            .next_offset = next_offset,
+        };
+    }
+
     const content_length = if (temporary.header("content-length")) |value|
         try std.fmt.parseInt(usize, value, 10)
     else
@@ -195,6 +208,47 @@ fn parseResponse(raw: []const u8, offset: usize) !ParsedResponse {
         .body = raw[body_start..body_end],
         .next_offset = body_end,
     };
+}
+
+fn headerValueHasToken(value: []const u8, expected: []const u8) bool {
+    var tokens = std.mem.splitScalar(u8, value, ',');
+    while (tokens.next()) |token| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, token, " \t"), expected)) return true;
+    }
+    return false;
+}
+
+fn decodeChunkedBody(raw: []u8, body_start: usize) !struct { []const u8, usize } {
+    var cursor = body_start;
+    var decoded_end = body_start;
+
+    while (true) {
+        if (cursor > raw.len) return error.IncompleteChunk;
+        const size_line_length = std.mem.find(u8, raw[cursor..], "\r\n") orelse return error.IncompleteChunk;
+        const size_line = raw[cursor .. cursor + size_line_length];
+        const extension_start = std.mem.findScalar(u8, size_line, ';') orelse size_line.len;
+        const size_text = std.mem.trim(u8, size_line[0..extension_start], " \t");
+        if (size_text.len == 0) return error.InvalidChunkSize;
+        const chunk_size = std.fmt.parseInt(usize, size_text, 16) catch return error.InvalidChunkSize;
+        cursor = std.math.add(usize, cursor, size_line_length + 2) catch return error.ResponseTooLarge;
+
+        if (chunk_size == 0) {
+            while (true) {
+                if (cursor > raw.len) return error.IncompleteChunkTrailers;
+                const trailer_length = std.mem.find(u8, raw[cursor..], "\r\n") orelse return error.IncompleteChunkTrailers;
+                cursor = std.math.add(usize, cursor, trailer_length + 2) catch return error.ResponseTooLarge;
+                if (trailer_length == 0) return .{ raw[body_start..decoded_end], cursor };
+            }
+        }
+
+        const chunk_end = std.math.add(usize, cursor, chunk_size) catch return error.ResponseTooLarge;
+        const framed_end = std.math.add(usize, chunk_end, 2) catch return error.ResponseTooLarge;
+        if (framed_end > raw.len) return error.IncompleteChunk;
+        if (!std.mem.eql(u8, raw[chunk_end..framed_end], "\r\n")) return error.InvalidChunkTerminator;
+        std.mem.copyForwards(u8, raw[decoded_end .. decoded_end + chunk_size], raw[cursor..chunk_end]);
+        decoded_end += chunk_size;
+        cursor = framed_end;
+    }
 }
 
 fn decompressGzip(allocator: std.mem.Allocator, compressed: []const u8) ![]u8 {
@@ -252,7 +306,7 @@ fn flowHandler(
     return .{
         .status = .ok,
         .headers = .{ .items = &.{.{ .name = "content-type", .value = "text/plain" }} },
-        .body = "flow-ok",
+        .body = .{ .bytes = "flow-ok" },
         .connection = .close,
     };
 }
@@ -302,7 +356,7 @@ fn keepAliveHandler(state: extractors.State(KeepAliveState)) Response {
     state.value.count += 1;
     return .{
         .status = .ok,
-        .body = if (state.value.count == 1) "one" else "two",
+        .body = .{ .bytes = if (state.value.count == 1) "one" else "two" },
     };
 }
 
@@ -385,7 +439,7 @@ fn encodingHandler() Response {
     return .{
         .status = .ok,
         .headers = .{ .items = &.{.{ .name = "content-type", .value = "text/plain; charset=utf-8" }} },
-        .body = encoding_body,
+        .body = .{ .bytes = encoding_body },
         .connection = .close,
     };
 }
@@ -472,13 +526,13 @@ fn generatedCsrfToken(_: anytype) []const u8 {
 
 fn createSession(session: extractors.Local(?SessionValue, "session")) Response {
     session.value.* = .{ .count = 1 };
-    return .{ .status = .ok, .body = "created", .connection = .close };
+    return .{ .status = .ok, .body = .{ .bytes = "created" }, .connection = .close };
 }
 
 fn useSession(session: extractors.Local(?SessionValue, "session")) Response {
     const value = session.value.* orelse return .{ .status = .unauthorized, .connection = .close };
     session.value.* = .{ .count = value.count + 1 };
-    return .{ .status = .ok, .body = "loaded", .connection = .close };
+    return .{ .status = .ok, .body = .{ .bytes = "loaded" }, .connection = .close };
 }
 
 const SessionRouter = routing.router.Router(.{
@@ -541,4 +595,401 @@ test "end-to-end session and CSRF cookies round-trip through sequential requests
     try testing.expectEqual(@as(usize, 1), state.loads);
     try testing.expectEqual(@as(usize, 2), state.saves);
     try testing.expectEqual(@as(usize, 2), state.stored.?.count);
+}
+
+const StreamingState = struct {
+    request_bytes: usize = 0,
+    producer_calls: usize = 0,
+    finalize_calls: usize = 0,
+    completed_responses: usize = 0,
+    completion_param_ok: bool = false,
+};
+
+fn streamingRequestHandler(
+    state: extractors.State(StreamingState),
+    body: extractors.BodyStream,
+) !Response {
+    var buffer: [3]u8 = undefined;
+    while (true) {
+        const count = try body.value.read(&buffer);
+        if (count == 0) break;
+        state.value.request_bytes += count;
+    }
+    return .{
+        .status = .ok,
+        .body = .{ .bytes = "uploaded" },
+        .connection = .close,
+    };
+}
+
+const StreamingContext = causeway.http.context.Context(StreamingState);
+
+fn streamingResponseHandler(context: *const StreamingContext) !Response {
+    const Producer = struct {
+        state: *StreamingState,
+
+        pub fn produce(self: *@This(), writer: *Io.Writer) !void {
+            self.state.producer_calls += 1;
+            try writer.writeAll("stream-");
+            try writer.writeAll("response");
+        }
+
+        pub fn finalize(self: *@This()) void {
+            self.state.finalize_calls += 1;
+        }
+    };
+
+    const stream = try Stream.init(context.execution.allocator, Producer{
+        .state = context.execution.state,
+    }, .{ .content_length = "stream-response".len });
+    return Response.streaming(.ok, .empty, stream);
+}
+
+const StreamingCallbacks = struct {
+    pub fn onComplete(context: *const StreamingContext, result: causeway.http.response.CompletionResult) void {
+        switch (result) {
+            .success => {
+                context.execution.state.completed_responses += 1;
+                if (context.params.get("id")) |id| {
+                    context.execution.state.completion_param_ok = std.mem.eql(u8, id, "42");
+                }
+            },
+            .failure => {},
+        }
+    }
+};
+const StreamingRouter = routing.router.Router(.{
+    routing.route.route(.POST, "/upload", streamingRequestHandler)
+        .withBodyLimit(16)
+        .withMiddleware(.{middleware.Logging(StreamingCallbacks)}),
+    routing.route.route(.GET, "/download/:id", streamingResponseHandler)
+        .withMiddleware(.{middleware.Logging(StreamingCallbacks)}),
+});
+const StreamingApp = app_module.AppWithOptions(StreamingState, StreamingRouter, .{});
+
+test "end-to-end request and response bodies stream through the real connection" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(16));
+    const io = threaded.io();
+    var state: StreamingState = .{};
+    var app = StreamingApp.init(testing.allocator, io, &state, server_options);
+    defer app.deinit();
+    var harness = Harness(StreamingApp).init(&app);
+    try harness.start();
+    defer harness.stop() catch {};
+
+    const upload_raw = try rawRequest(
+        testing.allocator,
+        io,
+        harness.address,
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 7\r\nConnection: close\r\n\r\npayload",
+    );
+    defer testing.allocator.free(upload_raw);
+    const upload = try parseResponse(upload_raw, 0);
+    try testing.expectEqual(@as(u16, 200), upload.status);
+    try testing.expectEqualStrings("uploaded", upload.body);
+
+    const download_raw = try rawRequest(
+        testing.allocator,
+        io,
+        harness.address,
+        "GET /download/42 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    defer testing.allocator.free(download_raw);
+    const download = try parseResponse(download_raw, 0);
+    try testing.expectEqual(@as(u16, 200), download.status);
+    try testing.expectEqualStrings("stream-response", download.body);
+
+    try harness.stop();
+    try testing.expectEqual(@as(usize, 7), state.request_bytes);
+    try testing.expectEqual(@as(usize, 1), state.producer_calls);
+    try testing.expectEqual(@as(usize, 1), state.finalize_calls);
+    try testing.expectEqual(@as(usize, 2), state.completed_responses);
+    try testing.expect(state.completion_param_ok);
+}
+
+const UnknownStreamState = struct {
+    stream_calls: usize = 0,
+    followup_calls: usize = 0,
+    finalize_calls: usize = 0,
+};
+
+const UnknownStreamContext = causeway.http.context.Context(UnknownStreamState);
+
+fn unknownStreamHandler(context: *const UnknownStreamContext) !Response {
+    const Producer = struct {
+        state: *UnknownStreamState,
+
+        pub fn produce(self: *@This(), writer: *Io.Writer) !void {
+            self.state.stream_calls += 1;
+            try writer.writeAll("first-");
+            try writer.writeAll("second-");
+            try writer.writeAll("third");
+        }
+
+        pub fn finalize(self: *@This()) void {
+            self.state.finalize_calls += 1;
+        }
+    };
+
+    const stream = try Stream.init(
+        context.execution.allocator,
+        Producer{ .state = context.execution.state },
+        .{},
+    );
+    return Response.streaming(.ok, .empty, stream);
+}
+
+fn unknownStreamFollowup(state: extractors.State(UnknownStreamState)) Response {
+    state.value.followup_calls += 1;
+    return .{ .status = .ok, .body = .{ .bytes = "followup" }, .connection = .close };
+}
+
+const UnknownStreamRouter = routing.router.Router(.{
+    routing.route.route(.GET, "/unknown", unknownStreamHandler),
+    routing.route.route(.GET, "/followup", unknownStreamFollowup),
+});
+const UnknownStreamApp = app_module.AppWithOptions(UnknownStreamState, UnknownStreamRouter, .{});
+
+test "end-to-end unknown-length response stays framed across keep-alive requests" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(16));
+    const io = threaded.io();
+    var state: UnknownStreamState = .{};
+    var app = UnknownStreamApp.init(testing.allocator, io, &state, server_options);
+    defer app.deinit();
+    var harness = Harness(UnknownStreamApp).init(&app);
+    try harness.start();
+    defer harness.stop() catch {};
+
+    const raw = try rawRequest(
+        testing.allocator,
+        io,
+        harness.address,
+        "GET /unknown HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+            "GET /followup HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    defer testing.allocator.free(raw);
+
+    const first = try parseResponse(raw, 0);
+    const second = try parseResponse(raw, first.next_offset);
+    try testing.expectEqual(@as(u16, 200), first.status);
+    try testing.expectEqualStrings("first-second-third", first.body);
+    try testing.expect(headerValueHasToken(first.header("transfer-encoding").?, "chunked"));
+    try testing.expect(first.header("content-length") == null);
+    try testing.expectEqual(@as(u16, 200), second.status);
+    try testing.expectEqualStrings("followup", second.body);
+    try testing.expectEqual(raw.len, second.next_offset);
+
+    try harness.stop();
+    try testing.expectEqual(@as(usize, 1), state.stream_calls);
+    try testing.expectEqual(@as(usize, 1), state.followup_calls);
+    try testing.expectEqual(@as(usize, 1), state.finalize_calls);
+}
+
+const gzip_stream_body =
+    "gzip-stream-part-one/" ++
+    "gzip-stream-part-two/" ++
+    "gzip-stream-part-three";
+
+const GzipStreamState = struct {
+    producer_calls: usize = 0,
+    finalize_calls: usize = 0,
+};
+
+const GzipStreamContext = causeway.http.context.Context(GzipStreamState);
+
+fn gzipStreamHandler(context: *const GzipStreamContext) !Response {
+    const Producer = struct {
+        state: *GzipStreamState,
+
+        pub fn produce(self: *@This(), writer: *Io.Writer) !void {
+            self.state.producer_calls += 1;
+            try writer.writeAll("gzip-stream-part-one/");
+            try writer.writeAll("gzip-stream-part-two/");
+            try writer.writeAll("gzip-stream-part-three");
+        }
+
+        pub fn finalize(self: *@This()) void {
+            self.state.finalize_calls += 1;
+        }
+    };
+
+    const stream = try Stream.init(
+        context.execution.allocator,
+        Producer{ .state = context.execution.state },
+        .{},
+    );
+    var response = Response.streaming(.ok, .{ .items = &.{.{ .name = "content-type", .value = "text/plain" }} }, stream);
+    response.connection = .close;
+    return response;
+}
+
+const GzipStreamRouter = routing.router.Router(.{
+    routing.route.route(.GET, "/gzip-stream", gzipStreamHandler),
+});
+const GzipStreamStack = middleware.Chain(.{
+    middleware.Compression(.{ .minimum_size = 1 }),
+}, GzipStreamRouter);
+const GzipStreamApp = app_module.AppWithOptions(GzipStreamState, GzipStreamStack, .{});
+
+test "end-to-end unknown-length gzip stream is chunked over TCP and decompresses" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(16));
+    const io = threaded.io();
+    var state: GzipStreamState = .{};
+    var app = GzipStreamApp.init(testing.allocator, io, &state, server_options);
+    defer app.deinit();
+    var harness = Harness(GzipStreamApp).init(&app);
+    try harness.start();
+    defer harness.stop() catch {};
+
+    const raw = try rawRequest(
+        testing.allocator,
+        io,
+        harness.address,
+        "GET /gzip-stream HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+    );
+    defer testing.allocator.free(raw);
+    const response = try parseResponse(raw, 0);
+    try testing.expectEqual(@as(u16, 200), response.status);
+    try testing.expectEqualStrings("gzip", response.header("content-encoding").?);
+    try testing.expect(headerValueHasToken(response.header("transfer-encoding").?, "chunked"));
+    try testing.expect(response.header("content-length") == null);
+    const decompressed = try decompressGzip(testing.allocator, response.body);
+    defer testing.allocator.free(decompressed);
+    try testing.expectEqualStrings(gzip_stream_body, decompressed);
+
+    try harness.stop();
+    try testing.expectEqual(@as(usize, 1), state.producer_calls);
+    try testing.expectEqual(@as(usize, 1), state.finalize_calls);
+}
+
+test "end-to-end chunked BodyStream exceeding route limit returns 413 and closes" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(16));
+    const io = threaded.io();
+    var state: StreamingState = .{};
+    var app = StreamingApp.init(testing.allocator, io, &state, server_options);
+    defer app.deinit();
+    var harness = Harness(StreamingApp).init(&app);
+    try harness.start();
+    defer harness.stop() catch {};
+
+    const raw = try rawRequest(
+        testing.allocator,
+        io,
+        harness.address,
+        "POST /upload HTTP/1.1\r\n" ++
+            "Host: localhost\r\n" ++
+            "Transfer-Encoding: chunked\r\n\r\n" ++
+            "3\r\nabc\r\n" ++
+            "5\r\ndefgh\r\n" ++
+            "9\r\nijklmnopq\r\n" ++
+            "0\r\n\r\n",
+    );
+    defer testing.allocator.free(raw);
+    const response = try parseResponse(raw, 0);
+    try testing.expectEqual(@as(u16, 413), response.status);
+    try testing.expectEqualStrings("request body too large", response.body);
+    try testing.expectEqualStrings("close", response.header("connection").?);
+    try testing.expectEqual(raw.len, response.next_offset);
+
+    try harness.stop();
+    try testing.expectEqual(@as(usize, 16), state.request_bytes);
+    try testing.expectEqual(@as(usize, 0), state.completed_responses);
+}
+
+const ShutdownStreamState = struct {
+    started: Io.Event = .unset,
+    block: Io.Event = .unset,
+    producer_calls: std.atomic.Value(usize) = .init(0),
+    finalize_calls: std.atomic.Value(usize) = .init(0),
+    canceled: std.atomic.Value(bool) = .init(false),
+};
+
+const ShutdownStreamContext = causeway.http.context.Context(ShutdownStreamState);
+
+fn shutdownStreamHandler(context: *const ShutdownStreamContext) !Response {
+    const Producer = struct {
+        state: *ShutdownStreamState,
+        io: Io,
+
+        pub fn produce(self: *@This(), writer: *Io.Writer) !void {
+            _ = self.state.producer_calls.fetchAdd(1, .acq_rel);
+            try writer.writeAll("stream-started");
+            self.state.started.set(self.io);
+            self.state.block.wait(self.io) catch |err| {
+                if (err == error.Canceled) self.state.canceled.store(true, .release);
+                return err;
+            };
+            try writer.writeAll("stream-finished");
+        }
+
+        pub fn finalize(self: *@This()) void {
+            _ = self.state.finalize_calls.fetchAdd(1, .acq_rel);
+        }
+    };
+
+    const stream = try Stream.init(
+        context.execution.allocator,
+        Producer{ .state = context.execution.state, .io = context.execution.io },
+        .{},
+    );
+    return Response.streaming(.ok, .empty, stream);
+}
+
+const ShutdownStreamRouter = routing.router.Router(.{
+    routing.route.route(.GET, "/long-stream", shutdownStreamHandler),
+});
+const ShutdownStreamApp = app_module.AppWithOptions(ShutdownStreamState, ShutdownStreamRouter, .{});
+
+const shutdown_stream_options: server_module.ServerOptions = .{
+    .shutdown_timeout = .fromMilliseconds(50),
+};
+
+test "graceful shutdown times out and cancels an active long stream without live tasks" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(16));
+    const io = threaded.io();
+    var state: ShutdownStreamState = .{};
+    var app = ShutdownStreamApp.init(testing.allocator, io, &state, shutdown_stream_options);
+    defer app.deinit();
+    var harness = Harness(ShutdownStreamApp).init(&app);
+    try harness.start();
+    defer {
+        state.block.set(io);
+        harness.stop() catch {};
+    }
+
+    const stream = try net.IpAddress.connect(&harness.address, io, .{ .mode = .stream });
+    defer stream.close(io);
+    var write_buffer: [512]u8 = undefined;
+    var stream_writer = stream.writer(io, &write_buffer);
+    try stream_writer.interface.writeAll("GET /long-stream HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try stream_writer.interface.flush();
+
+    try state.started.waitTimeout(io, .{ .duration = .{
+        .raw = .fromSeconds(5),
+        .clock = .awake,
+    } });
+    try testing.expectError(error.ShutdownTimeout, app.shutdown());
+
+    const serve_thread = harness.thread orelse return error.MissingServeThread;
+    serve_thread.join();
+    harness.thread = null;
+    if (harness.serve_error) |err| return err;
+
+    const status = try app.server.serverStatus();
+    try testing.expectEqual(server_module.ServerState.stopped, status.state);
+    try testing.expectEqual(@as(usize, 0), status.active_connections);
+    try testing.expectEqual(@as(usize, 1), status.canceled_connections);
+    try testing.expect(state.canceled.load(.acquire));
+    try testing.expectEqual(@as(usize, 1), state.producer_calls.load(.acquire));
+    try testing.expectEqual(@as(usize, 1), state.finalize_calls.load(.acquire));
 }

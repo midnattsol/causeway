@@ -108,6 +108,10 @@ pub fn Session(comptime options: anytype) type {
             }
 
             var response = try next.run(context);
+            errdefer {
+                response.body.finalize();
+                response.complete(.{ .failure = error.ResponseAbandoned });
+            }
             if (@field(context.locals.*, field)) |value| {
                 if (loaded_id) |id| {
                     try Store.save(id, value, context);

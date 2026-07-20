@@ -8,6 +8,7 @@ const Problem = enum {
     generic,
     variadic,
     parameter_type,
+    incompatible_body_access,
     return_type,
 };
 
@@ -26,6 +27,7 @@ pub fn validate(comptime handler: anytype, comptime ContextType: type) void {
         .generic => @compileError("handler must not be generic"),
         .variadic => @compileError("handler must not be variadic"),
         .parameter_type => @compileError("handler arguments must be *const ContextType or HTTP extractors"),
+        .incompatible_body_access => @compileError("handler cannot combine BodyStream with another body extractor"),
         .return_type => @compileError("handler must return Response or !Response"),
     }
 }
@@ -66,12 +68,18 @@ fn problem(comptime handler: anytype, comptime ContextType: type) ?Problem {
     if (function_info.is_generic) return .generic;
     if (function_info.attrs.varargs) return .variadic;
 
+    var body_access_count: usize = 0;
+    var has_streaming_body = false;
     inline for (function_info.param_types) |maybe_parameter_type| {
         const parameter_type = maybe_parameter_type orelse return .generic;
-        if (parameter_type != *const ContextType and !isExtractor(parameter_type)) {
-            return .parameter_type;
+        if (comptime parameter_type == *const ContextType) continue;
+        if (comptime !isExtractor(parameter_type)) return .parameter_type;
+        if (comptime @hasDecl(parameter_type, "body_access")) {
+            body_access_count += 1;
+            if (parameter_type.body_access == .streaming) has_streaming_body = true;
         }
     }
+    if (has_streaming_body and body_access_count > 1) return .incompatible_body_access;
 
     const return_type = function_info.return_type orelse return .return_type;
     if (return_type == Response) return null;
@@ -118,6 +126,30 @@ fn mixedHandler(_: *const TestContext, _: TestExtractor) Response {
     return .{ .status = .ok };
 }
 
+const BufferedBodyExtractor = struct {
+    pub const is_http_extractor = true;
+    pub const body_access = .buffered;
+    pub fn extract(_: anytype) !@This() {
+        return .{};
+    }
+};
+
+const StreamingBodyExtractor = struct {
+    pub const is_http_extractor = true;
+    pub const body_access = .streaming;
+    pub fn extract(_: anytype) !@This() {
+        return .{};
+    }
+};
+
+fn streamingBodyHandler(_: StreamingBodyExtractor) Response {
+    return .{ .status = .ok };
+}
+
+fn incompatibleBodyHandler(_: StreamingBodyExtractor, _: BufferedBodyExtractor) Response {
+    return .{ .status = .ok };
+}
+
 fn noArgumentsHandler() Response {
     return .{ .status = .ok };
 }
@@ -144,6 +176,7 @@ test "validate accepts context extractor mixed and zero-argument handlers" {
     validate(extractedHandler, TestContext);
     validate(mixedHandler, TestContext);
     validate(noArgumentsHandler, TestContext);
+    validate(streamingBodyHandler, TestContext);
 }
 
 test "signature exposes function metadata behind a function pointer" {
@@ -163,6 +196,13 @@ test "signature rejects generic handlers" {
 
 test "signature rejects an incorrect argument type" {
     try std.testing.expectEqual(Problem.parameter_type, problem(wrongArgumentHandler, TestContext).?);
+}
+
+test "signature rejects streaming combined with another body extractor" {
+    try std.testing.expectEqual(
+        Problem.incompatible_body_access,
+        problem(incompatibleBodyHandler, TestContext).?,
+    );
 }
 
 test "signature rejects incorrect return types" {

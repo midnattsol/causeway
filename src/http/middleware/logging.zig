@@ -1,27 +1,62 @@
 //! Callback-based HTTP request lifecycle observation.
 
 const std = @import("std");
-const Response = @import("../response.zig").Response;
+const response_module = @import("../response.zig");
+const Completion = response_module.Completion;
+const CompletionResult = response_module.CompletionResult;
+const Response = response_module.Response;
 
 /// Invokes the static callbacks declared by `Callbacks`. Supported callbacks
-/// are `onRequest(context)`, `onResponse(context, response)`, and
-/// `onError(context, err)`. At least one must be declared.
+/// are `onRequest(context)`, `onResponse(context, response)`,
+/// `onError(context, err)`, and `onComplete(context, result)`. `onResponse`
+/// observes the selected response before emission; `onComplete` observes the
+/// actual connection write outcome. At least one callback must be declared.
 pub fn Logging(comptime Callbacks: type) type {
     const has_request = @hasDecl(Callbacks, "onRequest");
     const has_response = @hasDecl(Callbacks, "onResponse");
     const has_error = @hasDecl(Callbacks, "onError");
-    if (!has_request and !has_response and !has_error) {
+    const has_complete = @hasDecl(Callbacks, "onComplete");
+    if (!has_request and !has_response and !has_error and !has_complete) {
         @compileError("Logging Callbacks must declare at least one lifecycle callback");
     }
 
     return struct {
         pub fn handle(context: anytype, next: anytype) !Response {
             if (has_request) Callbacks.onRequest(context);
-            const response = next.run(context) catch |err| {
+            var response = next.run(context) catch |err| {
                 if (has_error) Callbacks.onError(context, err);
                 return err;
             };
+            errdefer {
+                response.body.finalize();
+                response.complete(.{ .failure = error.ResponseAbandoned });
+            }
             if (has_response) Callbacks.onResponse(context, response);
+            if (has_complete) {
+                const Context = switch (@typeInfo(@TypeOf(context))) {
+                    .pointer => |pointer| pointer.child,
+                    else => @compileError("logging context must be a pointer"),
+                };
+                var snapshot = context.*;
+                if (comptime @hasField(Context, "params")) {
+                    snapshot.params.items = try context.execution.allocator.dupe(
+                        @TypeOf(context.params.items[0]),
+                        context.params.items,
+                    );
+                }
+                const Observer = struct {
+                    snapshot: Context,
+
+                    pub fn complete(self: *@This(), result: CompletionResult) void {
+                        Callbacks.onComplete(&self.snapshot, result);
+                    }
+                };
+                response.completion = try Completion.create(
+                    context.execution.allocator,
+                    Observer{ .snapshot = snapshot },
+                    response.completion,
+                );
+            }
             return response;
         }
     };
@@ -78,4 +113,35 @@ test "Logging permits a single optional callback" {
     defer context.events.deinit(std.testing.allocator);
     _ = try Logging(RequestOnly).handle(&context, SuccessNext{});
     try std.testing.expectEqualStrings("rn", context.events.items);
+}
+
+test "Logging observes actual response completion exactly once" {
+    const CompleteContext = struct {
+        execution: struct { allocator: std.mem.Allocator },
+        completed: *bool,
+    };
+    const CompleteCallbacks = struct {
+        pub fn onComplete(context: *const CompleteContext, result: CompletionResult) void {
+            std.debug.assert(result == .success);
+            context.completed.* = true;
+        }
+    };
+    const CompleteNext = struct {
+        pub fn run(_: *CompleteContext) !Response {
+            return .{ .status = .ok, .body = .{ .bytes = "ok" } };
+        }
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var completed = false;
+    var context = CompleteContext{
+        .execution = .{ .allocator = arena.allocator() },
+        .completed = &completed,
+    };
+    var response = try Logging(CompleteCallbacks).handle(&context, CompleteNext);
+    try std.testing.expect(!completed);
+    response.complete(.success);
+    response.complete(.success);
+    try std.testing.expect(completed);
 }

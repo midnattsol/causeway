@@ -4,6 +4,7 @@ const std = @import("std");
 const Response = @import("../response.zig").Response;
 const HttpContext = @import("../context.zig").Context;
 const Request = @import("../request.zig").Request;
+const RequestBody = @import("../request_body.zig").RequestBody;
 const Params = @import("params.zig").Params;
 const Pattern = @import("pattern.zig").Pattern;
 const handler_module = @import("../handlers/handler.zig");
@@ -35,6 +36,12 @@ pub fn Router(comptime routes: anytype) type {
 /// - `fallback`: a handler called when no route matches;
 /// - `method_mismatch`: `.not_found` (default) or `.method_not_allowed`.
 ///
+/// Explicit `HEAD` and `OPTIONS` routes take priority. Without an explicit
+/// match, `HEAD` invokes the matching `GET` route, while `OPTIONS` returns 204
+/// for a matching path without invoking route middleware. `Allow` preserves
+/// explicit route registration order, inserts implicit `HEAD` immediately after
+/// `GET`, and appends automatic `OPTIONS` when it is not explicit.
+///
 /// Routes are validated and ordered by specificity at compile time. At runtime,
 /// dispatch only matches request data, injects borrowed path parameters, and
 /// invokes the selected handler.
@@ -58,6 +65,15 @@ pub fn RouterWithOptions(comptime routes: anytype, comptime options: anytype) ty
                     return matched.maximum;
                 }
             }
+
+            if (method == .HEAD) {
+                inline for (0..maximum_specificity + 1) |offset| {
+                    const specificity = maximum_specificity - offset;
+                    if (bodyLimitForRoutes(routes, specificity, .GET, path)) |matched| {
+                        return matched.maximum;
+                    }
+                }
+            }
             return null;
         }
 
@@ -65,7 +81,28 @@ pub fn RouterWithOptions(comptime routes: anytype, comptime options: anytype) ty
         pub fn dispatch(context: anytype) !Response {
             inline for (0..maximum_specificity + 1) |offset| {
                 const specificity = maximum_specificity - offset;
-                if (try dispatchRoutes(routes, specificity, context)) |response| return response;
+                if (try dispatchRoutes(routes, specificity, context.request.method, context)) |response| {
+                    return response;
+                }
+            }
+
+            if (context.request.method == .HEAD) {
+                inline for (0..maximum_specificity + 1) |offset| {
+                    const specificity = maximum_specificity - offset;
+                    if (try dispatchRoutes(routes, specificity, .GET, context)) |response| {
+                        return response;
+                    }
+                }
+            }
+
+            if (context.request.method == .OPTIONS) {
+                inline for (0..maximum_specificity + 1) |offset| {
+                    const specificity = maximum_specificity - offset;
+                    if (automaticOptions(routes, specificity, context.request.path)) |response| {
+                        return response;
+                    }
+                }
+                return fallbackResponse(options, context);
             }
 
             if (comptime method_mismatch == .method_not_allowed) {
@@ -195,13 +232,14 @@ fn bodyLimitForRoutes(
 fn dispatchRoutes(
     comptime routes: anytype,
     comptime specificity: usize,
+    method: std.http.Method,
     context: anytype,
 ) !?Response {
     inline for (routes) |route_value| {
         const RoutePattern = Pattern(route_value.pattern);
         if (comptime RoutePattern.static_segment_count != specificity) continue;
 
-        if (context.request.method == route_value.method) {
+        if (method == route_value.method) {
             if (RoutePattern.match(context.request.path)) |matched| {
                 var routed_context = context.*;
                 routed_context.params = matched.params();
@@ -217,6 +255,23 @@ fn methodNotAllowed(
     comptime specificity: usize,
     path: []const u8,
 ) ?Response {
+    return automaticResponse(routes, specificity, path, .method_not_allowed);
+}
+
+fn automaticOptions(
+    comptime routes: anytype,
+    comptime specificity: usize,
+    path: []const u8,
+) ?Response {
+    return automaticResponse(routes, specificity, path, .no_content);
+}
+
+fn automaticResponse(
+    comptime routes: anytype,
+    comptime specificity: usize,
+    path: []const u8,
+    status: std.http.Status,
+) ?Response {
     inline for (routes) |route_value| {
         const RoutePattern = Pattern(route_value.pattern);
         if (comptime RoutePattern.static_segment_count != specificity) continue;
@@ -224,7 +279,7 @@ fn methodNotAllowed(
         if (RoutePattern.match(path) != null) {
             const allow = allowHeaderValue(routes, route_value.pattern);
             return .{
-                .status = .method_not_allowed,
+                .status = status,
                 .headers = .{ .items = &.{.{ .name = "allow", .value = allow }} },
             };
         }
@@ -234,15 +289,41 @@ fn methodNotAllowed(
 
 fn allowHeaderValue(comptime routes: anytype, comptime target_pattern: []const u8) []const u8 {
     comptime var value: []const u8 = "";
+    const has_explicit_head = comptime hasMethod(routes, target_pattern, .HEAD);
+    const has_explicit_options = comptime hasMethod(routes, target_pattern, .OPTIONS);
+
     inline for (routes) |route_value| {
         if (comptime std.mem.eql(u8, route_value.pattern, target_pattern)) {
-            value = if (value.len == 0)
-                @tagName(route_value.method)
-            else
-                std.fmt.comptimePrint("{s}, {s}", .{ value, @tagName(route_value.method) });
+            value = comptime appendMethod(value, route_value.method);
+            if (comptime route_value.method == .GET and !has_explicit_head) {
+                value = comptime appendMethod(value, .HEAD);
+            }
         }
     }
+    if (!has_explicit_options) value = comptime appendMethod(value, .OPTIONS);
     return value;
+}
+
+fn hasMethod(
+    comptime routes: anytype,
+    comptime target_pattern: []const u8,
+    comptime method: std.http.Method,
+) bool {
+    inline for (routes) |route_value| {
+        if (comptime route_value.method == method and
+            std.mem.eql(u8, route_value.pattern, target_pattern))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn appendMethod(comptime value: []const u8, comptime method: std.http.Method) []const u8 {
+    return if (value.len == 0)
+        @tagName(method)
+    else
+        std.fmt.comptimePrint("{s}, {s}", .{ value, @tagName(method) });
 }
 
 fn fallbackResponse(comptime options: anytype, context: anytype) !Response {
@@ -262,22 +343,23 @@ const TestRequest = struct {
 const TestContext = struct {
     request: TestRequest,
     params: Params = .empty,
+    route_calls: ?*usize = null,
 };
 
 fn staticHandler(_: *const TestContext) Response {
-    return .{ .status = .ok, .body = "static" };
+    return .{ .status = .ok, .body = .{ .bytes = "static" } };
 }
 
 fn otherHandler(_: *const TestContext) Response {
-    return .{ .status = .created, .body = "other" };
+    return .{ .status = .created, .body = .{ .bytes = "other" } };
 }
 
 fn parameterHandler(context: *const TestContext) Response {
-    return .{ .status = .ok, .body = context.params.get("id").? };
+    return .{ .status = .ok, .body = .{ .bytes = context.params.get("id").? } };
 }
 
 fn generalHandler(_: *const TestContext) Response {
-    return .{ .status = .ok, .body = "general" };
+    return .{ .status = .ok, .body = .{ .bytes = "general" } };
 }
 
 fn multipleParametersHandler(context: *const TestContext) error{InvalidParameters}!Response {
@@ -285,14 +367,14 @@ fn multipleParametersHandler(context: *const TestContext) error{InvalidParameter
         return error.InvalidParameters;
     }
     const post_id = context.params.get("post_id") orelse return error.InvalidParameters;
-    return .{ .status = .ok, .body = post_id };
+    return .{ .status = .ok, .body = .{ .bytes = post_id } };
 }
 
 fn requestDataHandler(context: *const TestContext) error{MissingRequestData}!Response {
     const query = context.request.query orelse return error.MissingRequestData;
     const body = context.request.body orelse return error.MissingRequestData;
     if (!std.mem.eql(u8, query, "notify=true")) return error.MissingRequestData;
-    return .{ .status = .ok, .body = body };
+    return .{ .status = .ok, .body = .{ .bytes = body } };
 }
 
 fn failingHandler(_: *const TestContext) error{Failure}!Response {
@@ -300,8 +382,23 @@ fn failingHandler(_: *const TestContext) error{Failure}!Response {
 }
 
 fn fallbackHandler(context: *const TestContext) Response {
-    return .{ .status = .ok, .body = context.request.path };
+    return .{ .status = .ok, .body = .{ .bytes = context.request.path } };
 }
+
+fn headHandler(_: *const TestContext) Response {
+    return .{ .status = .accepted, .body = .{ .bytes = "head" } };
+}
+
+fn optionsHandler(_: *const TestContext) Response {
+    return .{ .status = .ok, .body = .{ .bytes = "options" } };
+}
+
+const CountRouteCalls = struct {
+    pub fn handle(context: anytype, next: anytype) !Response {
+        if (context.route_calls) |calls| calls.* += 1;
+        return next.run(context);
+    }
+};
 
 test "Router dispatches static routes by method and path" {
     const AppRouter = Router(.{
@@ -310,10 +407,10 @@ test "Router dispatches static routes by method and path" {
     });
 
     const get_context = TestContext{ .request = .{ .method = .GET, .path = "/health" } };
-    try std.testing.expectEqualStrings("static", (try AppRouter.dispatch(&get_context)).body);
+    try std.testing.expectEqualStrings("static", (try AppRouter.dispatch(&get_context)).body.asBytes().?);
 
     const post_context = TestContext{ .request = .{ .method = .POST, .path = "/users" } };
-    try std.testing.expectEqualStrings("other", (try AppRouter.dispatch(&post_context)).body);
+    try std.testing.expectEqualStrings("other", (try AppRouter.dispatch(&post_context)).body.asBytes().?);
 }
 
 test "Router captures path parameters without mutating the original context" {
@@ -323,7 +420,7 @@ test "Router captures path parameters without mutating the original context" {
     const context = TestContext{ .request = .{ .method = .GET, .path = "/users/42" } };
     const response = try AppRouter.dispatch(&context);
 
-    try std.testing.expectEqualStrings("42", response.body);
+    try std.testing.expectEqualStrings("42", response.body.asBytes().?);
     try std.testing.expect(context.params.isEmpty());
 }
 
@@ -333,7 +430,7 @@ test "Router captures multiple path parameters" {
     });
     const context = TestContext{ .request = .{ .method = .GET, .path = "/users/42/posts/7" } };
 
-    try std.testing.expectEqualStrings("7", (try AppRouter.dispatch(&context)).body);
+    try std.testing.expectEqualStrings("7", (try AppRouter.dispatch(&context)).body.asBytes().?);
 }
 
 test "Router orders overlapping routes by static-segment specificity" {
@@ -344,13 +441,13 @@ test "Router orders overlapping routes by static-segment specificity" {
     });
 
     const static_context = TestContext{ .request = .{ .method = .GET, .path = "/users/me" } };
-    try std.testing.expectEqualStrings("static", (try AppRouter.dispatch(&static_context)).body);
+    try std.testing.expectEqualStrings("static", (try AppRouter.dispatch(&static_context)).body.asBytes().?);
 
     const parameter_context = TestContext{ .request = .{ .method = .GET, .path = "/users/42" } };
-    try std.testing.expectEqualStrings("42", (try AppRouter.dispatch(&parameter_context)).body);
+    try std.testing.expectEqualStrings("42", (try AppRouter.dispatch(&parameter_context)).body.asBytes().?);
 
     const general_context = TestContext{ .request = .{ .method = .GET, .path = "/posts/7" } };
-    try std.testing.expectEqualStrings("general", (try AppRouter.dispatch(&general_context)).body);
+    try std.testing.expectEqualStrings("general", (try AppRouter.dispatch(&general_context)).body.asBytes().?);
 }
 
 test "Router preserves query and body for the handler" {
@@ -364,7 +461,7 @@ test "Router preserves query and body for the handler" {
         .body = "payload",
     } };
 
-    try std.testing.expectEqualStrings("payload", (try AppRouter.dispatch(&context)).body);
+    try std.testing.expectEqualStrings("payload", (try AppRouter.dispatch(&context)).body.asBytes().?);
 }
 
 test "Router propagates handler and fallback errors" {
@@ -380,7 +477,7 @@ test "Router uses a custom fallback" {
     const AppRouter = RouterWithOptions(.{}, .{ .fallback = fallbackHandler });
     const context = TestContext{ .request = .{ .method = .GET, .path = "/missing" } };
 
-    try std.testing.expectEqualStrings("/missing", (try AppRouter.dispatch(&context)).body);
+    try std.testing.expectEqualStrings("/missing", (try AppRouter.dispatch(&context)).body.asBytes().?);
 }
 
 test "Router defaults method mismatches to its not-found fallback" {
@@ -401,7 +498,7 @@ test "Router can return method not allowed with an Allow header" {
     const response = try AppRouter.dispatch(&context);
 
     try std.testing.expectEqual(.method_not_allowed, response.status);
-    try std.testing.expectEqualStrings("GET, DELETE", response.headers.get("allow").?);
+    try std.testing.expectEqualStrings("GET, HEAD, DELETE, OPTIONS", response.headers.get("allow").?);
 }
 
 test "Router only reports methods for the most specific matched pattern" {
@@ -412,7 +509,135 @@ test "Router only reports methods for the most specific matched pattern" {
     const context = TestContext{ .request = .{ .method = .DELETE, .path = "/users/42" } };
     const response = try AppRouter.dispatch(&context);
 
-    try std.testing.expectEqualStrings("GET", response.headers.get("allow").?);
+    try std.testing.expectEqualStrings("GET, HEAD, OPTIONS", response.headers.get("allow").?);
+}
+
+test "explicit HEAD has priority over GET fallback across pattern specificity" {
+    const AppRouter = Router(.{
+        route_module.route(.GET, "/users/me", staticHandler),
+        route_module.route(.HEAD, "/:entity/:id", headHandler),
+    });
+    const context = TestContext{ .request = .{ .method = .HEAD, .path = "/users/me" } };
+    const response = try AppRouter.dispatch(&context);
+
+    try std.testing.expectEqual(.accepted, response.status);
+    try std.testing.expectEqualStrings("head", response.body.asBytes().?);
+}
+
+test "HEAD falls back to the most specific GET route and runs its middleware" {
+    const AppRouter = Router(.{
+        route_module.routeWith(.GET, "/:entity/:id", generalHandler, .{CountRouteCalls}),
+        route_module.routeWith(.GET, "/users/:id", parameterHandler, .{CountRouteCalls}),
+    });
+    var route_calls: usize = 0;
+    const context = TestContext{
+        .request = .{ .method = .HEAD, .path = "/users/42" },
+        .route_calls = &route_calls,
+    };
+    const response = try AppRouter.dispatch(&context);
+
+    try std.testing.expectEqualStrings("42", response.body.asBytes().?);
+    try std.testing.expectEqual(@as(usize, 1), route_calls);
+}
+
+test "HEAD body limits use explicit metadata before GET fallback metadata" {
+    @setEvalBranchQuota(5000);
+    const ExplicitRouter = Router(.{
+        route_module.withBodyLimit(route_module.route(.GET, "/users/me", staticHandler), 100),
+        route_module.withBodyLimit(route_module.route(.HEAD, "/:entity/:id", headHandler), 200),
+    });
+    try std.testing.expectEqual(@as(?usize, 200), ExplicitRouter.bodyLimit(.HEAD, "/users/me"));
+
+    const FallbackRouter = Router(.{
+        route_module.withBodyLimit(route_module.route(.GET, "/users/:id", parameterHandler), 300),
+    });
+    try std.testing.expectEqual(@as(?usize, 300), FallbackRouter.bodyLimit(.HEAD, "/users/42"));
+
+    const UnlimitedExplicitRouter = Router(.{
+        route_module.withBodyLimit(route_module.route(.GET, "/users/:id", parameterHandler), 400),
+        route_module.route(.HEAD, "/users/:id", headHandler),
+    });
+    try std.testing.expectEqual(@as(?usize, null), UnlimitedExplicitRouter.bodyLimit(.HEAD, "/users/42"));
+}
+
+test "explicit OPTIONS has priority over automatic OPTIONS across pattern specificity" {
+    const AppRouter = Router(.{
+        route_module.route(.GET, "/users/me", staticHandler),
+        route_module.routeWith(.OPTIONS, "/:entity/:id", optionsHandler, .{CountRouteCalls}),
+    });
+    var route_calls: usize = 0;
+    const context = TestContext{
+        .request = .{ .method = .OPTIONS, .path = "/users/me" },
+        .route_calls = &route_calls,
+    };
+    const response = try AppRouter.dispatch(&context);
+
+    try std.testing.expectEqual(.ok, response.status);
+    try std.testing.expectEqualStrings("options", response.body.asBytes().?);
+    try std.testing.expectEqual(@as(usize, 1), route_calls);
+}
+
+test "automatic OPTIONS returns 204 with Allow and skips route middleware" {
+    const AppRouter = Router(.{
+        route_module.routeWith(.POST, "/items/:id", otherHandler, .{CountRouteCalls}),
+        route_module.routeWith(.GET, "/items/:id", parameterHandler, .{CountRouteCalls}),
+        route_module.routeWith(.DELETE, "/items/:id", parameterHandler, .{CountRouteCalls}),
+    });
+    var route_calls: usize = 0;
+    const context = TestContext{
+        .request = .{ .method = .OPTIONS, .path = "/items/42" },
+        .route_calls = &route_calls,
+    };
+    const response = try AppRouter.dispatch(&context);
+
+    try std.testing.expectEqual(.no_content, response.status);
+    try std.testing.expectEqualStrings("POST, GET, HEAD, DELETE, OPTIONS", response.headers.get("allow").?);
+    try std.testing.expectEqual(@as(usize, 0), route_calls);
+}
+
+test "Allow preserves explicit order without duplicating HEAD or OPTIONS" {
+    const AppRouter = RouterWithOptions(.{
+        route_module.route(.OPTIONS, "/items/:id", optionsHandler),
+        route_module.route(.GET, "/items/:id", parameterHandler),
+        route_module.route(.HEAD, "/items/:id", headHandler),
+        route_module.route(.DELETE, "/items/:id", parameterHandler),
+    }, .{ .method_mismatch = .method_not_allowed });
+    const context = TestContext{ .request = .{ .method = .PATCH, .path = "/items/42" } };
+    const response = try AppRouter.dispatch(&context);
+
+    try std.testing.expectEqual(.method_not_allowed, response.status);
+    try std.testing.expectEqualStrings("OPTIONS, GET, HEAD, DELETE", response.headers.get("allow").?);
+}
+
+test "OPTIONS ignores mismatch policy while other methods respect it" {
+    const AppRouter = Router(.{
+        route_module.route(.GET, "/health", staticHandler),
+    });
+
+    const options_context = TestContext{ .request = .{ .method = .OPTIONS, .path = "/health" } };
+    try std.testing.expectEqual(.no_content, (try AppRouter.dispatch(&options_context)).status);
+
+    const post_context = TestContext{ .request = .{ .method = .POST, .path = "/health" } };
+    try std.testing.expectEqual(.not_found, (try AppRouter.dispatch(&post_context)).status);
+
+    const missing_options = TestContext{ .request = .{ .method = .OPTIONS, .path = "/missing" } };
+    try std.testing.expectEqual(.not_found, (try AppRouter.dispatch(&missing_options)).status);
+}
+
+test "405 and automatic OPTIONS use only the most specific matching pattern" {
+    const AppRouter = RouterWithOptions(.{
+        route_module.route(.PUT, "/:entity/:id", generalHandler),
+        route_module.route(.GET, "/users/:id", parameterHandler),
+        route_module.route(.DELETE, "/users/:id", parameterHandler),
+    }, .{ .method_mismatch = .method_not_allowed });
+
+    const mismatch = TestContext{ .request = .{ .method = .PATCH, .path = "/users/42" } };
+    const mismatch_response = try AppRouter.dispatch(&mismatch);
+    try std.testing.expectEqualStrings("GET, HEAD, DELETE, OPTIONS", mismatch_response.headers.get("allow").?);
+
+    const options = TestContext{ .request = .{ .method = .OPTIONS, .path = "/users/42" } };
+    const options_response = try AppRouter.dispatch(&options);
+    try std.testing.expectEqualStrings("GET, HEAD, DELETE, OPTIONS", options_response.headers.get("allow").?);
 }
 
 test "Router returns not found for path and trailing slash mismatches" {
@@ -474,7 +699,7 @@ const RealContext = HttpContext(RealState);
 
 fn realContextHandler(context: *const RealContext) Response {
     context.execution.state.calls += 1;
-    return .{ .status = .ok, .body = context.params.get("id").? };
+    return .{ .status = .ok, .body = .{ .bytes = context.params.get("id").? } };
 }
 
 const ExtractedRealQuery = struct {
@@ -489,7 +714,7 @@ fn extractedRealHandler(
     state.value.calls += 1;
     state.value.extracted_id = id.value;
     state.value.details = query.value.details;
-    return .{ .status = .ok, .body = "extracted" };
+    return .{ .status = .ok, .body = .{ .bytes = "extracted" } };
 }
 
 test "Router dispatches with the real HTTP Context" {
@@ -497,20 +722,21 @@ test "Router dispatches with the real HTTP Context" {
     defer threaded.deinit();
 
     var state = RealState{};
+    var body_state = RequestBody.State.initAbsent();
     const context = RealContext{
         .execution = .{
             .state = &state,
             .allocator = std.testing.allocator,
             .io = threaded.io(),
         },
-        .request = try Request.init("/users/42?details=true", .GET, .empty, null),
+        .request = try Request.init("/users/42?details=true", .GET, .empty, RequestBody.init(&body_state)),
     };
     const AppRouter = Router(.{
         route_module.route(.GET, "/users/:id", realContextHandler),
     });
     const response = try AppRouter.dispatch(&context);
 
-    try std.testing.expectEqualStrings("42", response.body);
+    try std.testing.expectEqualStrings("42", response.body.asBytes().?);
     try std.testing.expectEqual(@as(usize, 1), state.calls);
     try std.testing.expectEqualStrings("details=true", context.request.query.?);
     try std.testing.expect(context.params.isEmpty());
@@ -521,19 +747,20 @@ test "Router invokes handlers with typed extractors" {
     defer threaded.deinit();
 
     var state = RealState{};
+    var body_state = RequestBody.State.initAbsent();
     const context = RealContext{
         .execution = .{
             .state = &state,
             .allocator = std.testing.allocator,
             .io = threaded.io(),
         },
-        .request = try Request.init("/users/42?details=true", .GET, .empty, null),
+        .request = try Request.init("/users/42?details=true", .GET, .empty, RequestBody.init(&body_state)),
     };
     const AppRouter = Router(.{
         route_module.route(.GET, "/users/:id", extractedRealHandler),
     });
 
-    try std.testing.expectEqualStrings("extracted", (try AppRouter.dispatch(&context)).body);
+    try std.testing.expectEqualStrings("extracted", (try AppRouter.dispatch(&context)).body.asBytes().?);
     try std.testing.expectEqual(@as(usize, 1), state.calls);
     try std.testing.expectEqual(@as(u32, 42), state.extracted_id);
     try std.testing.expect(state.details);
@@ -552,7 +779,7 @@ fn generatedRequestId(_: anytype) []const u8 {
 fn requestIdHandler(
     request_id: @import("../extractors/local.zig").Local([]const u8, "request_id"),
 ) Response {
-    return .{ .status = .ok, .body = request_id.value.* };
+    return .{ .status = .ok, .body = .{ .bytes = request_id.value.* } };
 }
 
 test "global middleware shares typed locals with routed handler extractors" {
@@ -563,6 +790,7 @@ test "global middleware shares typed locals with routed handler extractors" {
 
     var state = RealState{};
     var locals = RequestLocals{};
+    var body_state = RequestBody.State.initAbsent();
     const context = RequestLocalContext{
         .execution = .{
             .state = &state,
@@ -571,7 +799,7 @@ test "global middleware shares typed locals with routed handler extractors" {
         },
         .request = try Request.init("/request-id", .GET, .{ .items = &.{
             .{ .name = "X-Request-Id", .value = "incoming-42" },
-        } }, null),
+        } }, RequestBody.init(&body_state)),
         .locals = &locals,
     };
     const AppRouter = Router(.{
@@ -582,7 +810,7 @@ test "global middleware shares typed locals with routed handler extractors" {
     }, AppRouter);
 
     const response = try Dispatcher.dispatch(&context);
-    try std.testing.expectEqualStrings("incoming-42", response.body);
+    try std.testing.expectEqualStrings("incoming-42", response.body.asBytes().?);
     try std.testing.expectEqualStrings("incoming-42", locals.request_id);
     try std.testing.expectEqualStrings("incoming-42", response.headers.get("x-request-id").?);
 }

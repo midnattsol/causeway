@@ -85,6 +85,10 @@ pub fn RequestId(comptime options: anytype) type {
 
             @field(context.locals.*, field) = request_id;
             var response = try next.run(context);
+            errdefer {
+                response.body.finalize();
+                response.complete(.{ .failure = error.ResponseAbandoned });
+            }
             response.headers = try header_helpers.set(
                 context.execution.allocator,
                 response.headers,

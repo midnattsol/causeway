@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Response = @import("../response.zig").Response;
+const RequestBody = @import("../request_body.zig").RequestBody;
 const signature = @import("signature.zig");
 
 /// Validates and invokes a handler using the supplied context.
@@ -37,12 +38,12 @@ const TestContext = struct {
 };
 
 fn infallibleHandler(_: *const TestContext) Response {
-    return .{ .status = .ok, .body = "infallible" };
+    return .{ .status = .ok, .body = .{ .bytes = "infallible" } };
 }
 
 fn fallibleHandler(context: *const TestContext) error{Failure}!Response {
     if (context.fail) return error.Failure;
-    return .{ .status = .ok, .body = "fallible" };
+    return .{ .status = .ok, .body = .{ .bytes = "fallible" } };
 }
 
 fn noArgumentsHandler() Response {
@@ -53,14 +54,14 @@ test "invoke normalizes an infallible handler to !Response" {
     const context = TestContext{};
     const response = try invoke(infallibleHandler, &context);
 
-    try std.testing.expectEqualStrings("infallible", response.body);
+    try std.testing.expectEqualStrings("infallible", response.body.asBytes().?);
 }
 
 test "invoke returns a successful response from a fallible handler" {
     const context = TestContext{};
     const response = try invoke(fallibleHandler, &context);
 
-    try std.testing.expectEqualStrings("fallible", response.body);
+    try std.testing.expectEqualStrings("fallible", response.body.asBytes().?);
 }
 
 test "invoke propagates a handler error" {
@@ -101,7 +102,7 @@ const ExtractedContext = struct {
     request: struct {
         headers: Headers,
         query: ?[]const u8,
-        body: ?[]const u8,
+        body: RequestBody,
     },
     params: Params,
 };
@@ -118,7 +119,7 @@ fn extractedHandler(
     state.value.id = id.value;
     state.value.active = query.value.active;
     state.value.token = token.value;
-    return .{ .status = .ok, .body = body.value };
+    return .{ .status = .ok, .body = .{ .bytes = body.value } };
 }
 
 fn requiredPathHandler(_: Path(u32, "id")) Response {
@@ -127,6 +128,7 @@ fn requiredPathHandler(_: Path(u32, "id")) Response {
 
 test "invoke extracts typed handler arguments from context" {
     var state: ExtractedState = .{};
+    var body_state = RequestBody.State.initBuffered("payload");
     const context = ExtractedContext{
         .execution = .{
             .state = &state,
@@ -135,13 +137,13 @@ test "invoke extracts typed handler arguments from context" {
         .request = .{
             .headers = .{ .items = &.{.{ .name = "Authorization", .value = "Bearer token" }} },
             .query = "active=true",
-            .body = "payload",
+            .body = .init(&body_state),
         },
         .params = .{ .items = &.{.{ .name = "id", .value = "42" }} },
     };
 
     const response = try invoke(extractedHandler, &context);
-    try std.testing.expectEqualStrings("payload", response.body);
+    try std.testing.expectEqualStrings("payload", response.body.asBytes().?);
     try std.testing.expectEqual(@as(u32, 42), state.id);
     try std.testing.expect(state.active);
     try std.testing.expectEqualStrings("Bearer token", state.token);
@@ -149,9 +151,10 @@ test "invoke extracts typed handler arguments from context" {
 
 test "invoke propagates extractor errors before calling the handler" {
     var state: ExtractedState = .{};
+    var body_state = RequestBody.State.initAbsent();
     const context = ExtractedContext{
         .execution = .{ .state = &state, .allocator = std.testing.allocator },
-        .request = .{ .headers = .empty, .query = null, .body = null },
+        .request = .{ .headers = .empty, .query = null, .body = .init(&body_state) },
         .params = .empty,
     };
 

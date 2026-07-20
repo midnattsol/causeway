@@ -1,13 +1,16 @@
 //! Response compression middleware.
 //!
-//! Zig 0.17.0-dev.1413+addc3c3b8 exposes gzip compression through
+//! The local Zig standard library exposes gzip compression through
 //! `std.compress.flate.Compress`, but `std.compress.zstd` exposes only
 //! `Decompress`. Consequently zstd is not advertised or selected by this
 //! implementation until the standard library provides a zstd compressor.
 
 const std = @import("std");
 const Headers = @import("../headers.zig").Headers;
-const Response = @import("../response.zig").Response;
+const response_mod = @import("../response.zig");
+const Response = response_mod.Response;
+const ResponseBody = response_mod.ResponseBody;
+const Stream = response_mod.Stream;
 const header_helpers = @import("header_helpers.zig");
 
 /// Whether this Zig standard library provides the zstd compression API needed
@@ -48,15 +51,38 @@ pub fn Compression(comptime options: Options) type {
             const preferences = parseAcceptEncoding(context.request.headers);
             const encoding = preferences.select(options) orelse {
                 if (preferences.identityQuality() != 0) return response;
-                return .{ .status = .not_acceptable };
+                finalizeBody(&response.body);
+                return .{
+                    .status = .not_acceptable,
+                    .completion = response.completion,
+                    .write_deadline = response.write_deadline,
+                };
             };
 
             const allocator = context.execution.allocator;
-            const compressed = switch (encoding) {
-                .gzip => try compressGzip(allocator, response.body),
+            errdefer {
+                finalizeBody(&response.body);
+                response.complete(.{ .failure = error.ResponseAbandoned });
+            }
+            var compressed_bytes: ?[]u8 = null;
+            errdefer if (compressed_bytes) |bytes| allocator.free(bytes);
+
+            response.body = switch (encoding) {
+                .gzip => switch (response.body) {
+                    .empty => unreachable,
+                    .bytes => |bytes| blk: {
+                        const compressed = try compressGzip(allocator, bytes);
+                        compressed_bytes = compressed;
+                        break :blk .{ .bytes = compressed };
+                    },
+                    .stream => |stream| .{ .stream = try Stream.init(
+                        allocator,
+                        GzipProducer{ .inner = stream },
+                        .{ .content_length = null },
+                    ) },
+                },
                 .zstd => unreachable,
             };
-            errdefer allocator.free(compressed);
 
             var mutations: [2]header_helpers.Mutation = undefined;
             mutations[0] = .{
@@ -79,7 +105,6 @@ pub fn Compression(comptime options: Options) type {
                 response.headers,
                 mutations[0..mutation_count],
             );
-            response.body = compressed;
             return response;
         }
     };
@@ -205,7 +230,13 @@ fn parseQuality(value: []const u8) ?u16 {
 }
 
 fn eligible(comptime options: Options, method: std.http.Method, response: Response) bool {
-    if (response.body.len == 0 or response.body.len < options.minimum_size) return false;
+    switch (response.body) {
+        .empty => return false,
+        .bytes => |bytes| if (bytes.len < options.minimum_size) return false,
+        .stream => |stream| if (stream.content_length) |content_length| {
+            if (content_length < options.minimum_size) return false;
+        },
+    }
     if (method == .HEAD) return false;
     if (response.status.class() == .informational or
         response.status == .no_content or
@@ -240,6 +271,30 @@ fn varyIncludesAcceptEncoding(headers: Headers) bool {
     }
     return false;
 }
+
+fn finalizeBody(body: *ResponseBody) void {
+    if (body.* == .stream) body.stream.finalize();
+}
+
+const GzipProducer = struct {
+    inner: Stream,
+
+    pub fn produce(self: *@This(), writer: *std.Io.Writer) !void {
+        var history: [std.compress.flate.max_window_len]u8 = undefined;
+        var compressor = try std.compress.flate.Compress.init(
+            writer,
+            &history,
+            .gzip,
+            .default,
+        );
+        try self.inner.produce(&compressor.writer);
+        try compressor.finish();
+    }
+
+    pub fn finalize(self: *@This()) void {
+        self.inner.finalize();
+    }
+};
 
 fn compressGzip(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var output: std.Io.Writer.Allocating = try .initCapacity(allocator, @min(input.len + 32, 4096));
@@ -308,7 +363,37 @@ fn compressibleResponse() Response {
     return .{
         .status = .ok,
         .headers = .{ .items = &.{.{ .name = "Content-Type", .value = "text/plain; charset=utf-8" }} },
-        .body = compressible_body,
+        .body = .{ .bytes = compressible_body },
+    };
+}
+
+const TestStreamProducer = struct {
+    bytes: []const u8,
+    finalized_count: *usize,
+
+    pub fn produce(self: *@This(), writer: *std.Io.Writer) !void {
+        try writer.writeAll(self.bytes);
+    }
+
+    pub fn finalize(self: *@This()) void {
+        self.finalized_count.* += 1;
+    }
+};
+
+fn streamingResponse(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    content_length: ?u64,
+    finalized_count: *usize,
+) !Response {
+    return .{
+        .status = .ok,
+        .headers = .{ .items = &.{.{ .name = "Content-Type", .value = "text/plain" }} },
+        .body = .{ .stream = try Stream.init(
+            allocator,
+            TestStreamProducer{ .bytes = bytes, .finalized_count = finalized_count },
+            .{ .content_length = content_length },
+        ) },
     };
 }
 
@@ -328,13 +413,85 @@ test "Compression emits valid gzip allocated for the execution lifetime" {
     var context = testContext(arena.allocator(), .GET, "gzip");
 
     const response = try Compression(.{}).handle(&context, TestNext{ .response = compressibleResponse() });
+    const compressed = response.body.asBytes().?;
     try std.testing.expectEqualStrings("gzip", response.headers.get("content-encoding").?);
-    try std.testing.expect(response.body.len < compressible_body.len);
-    try std.testing.expectEqualSlices(u8, &.{ 0x1f, 0x8b }, response.body[0..2]);
+    try std.testing.expect(compressed.len < compressible_body.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0x1f, 0x8b }, compressed[0..2]);
 
-    const decompressed = try decompressGzip(std.testing.allocator, response.body);
+    const decompressed = try decompressGzip(std.testing.allocator, compressed);
     defer std.testing.allocator.free(decompressed);
     try std.testing.expectEqualSlices(u8, compressible_body, decompressed);
+}
+
+test "Compression wraps an unknown-length stream in gzip and delegates finalization once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var finalized_count: usize = 0;
+    var context = testContext(arena.allocator(), .GET, "gzip");
+
+    var response = try Compression(.{}).handle(&context, TestNext{ .response = try streamingResponse(
+        arena.allocator(),
+        compressible_body,
+        null,
+        &finalized_count,
+    ) });
+    try std.testing.expect(response.body == .stream);
+    try std.testing.expectEqual(@as(?u64, null), response.body.stream.content_length);
+    try std.testing.expectEqualStrings("gzip", response.headers.get("content-encoding").?);
+
+    var compressed: std.Io.Writer.Allocating = try .initCapacity(std.testing.allocator, 4096);
+    defer compressed.deinit();
+    try response.body.stream.produce(&compressed.writer);
+    response.body.stream.finalize();
+    response.body.stream.finalize();
+
+    const decompressed = try decompressGzip(std.testing.allocator, compressed.written());
+    defer std.testing.allocator.free(decompressed);
+    try std.testing.expectEqualSlices(u8, compressible_body, decompressed);
+    try std.testing.expectEqual(@as(usize, 1), finalized_count);
+}
+
+test "Compression preserves a stream whose known length is below minimum_size" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var finalized_count: usize = 0;
+    var context = testContext(arena.allocator(), .GET, "gzip");
+
+    var response = try Compression(.{}).handle(&context, TestNext{ .response = try streamingResponse(
+        arena.allocator(),
+        "small",
+        5,
+        &finalized_count,
+    ) });
+    try std.testing.expect(response.body == .stream);
+    try std.testing.expectEqual(@as(?u64, 5), response.body.stream.content_length);
+    try std.testing.expect(response.headers.get("content-encoding") == null);
+
+    var output: std.Io.Writer.Allocating = try .initCapacity(std.testing.allocator, 32);
+    defer output.deinit();
+    try response.body.stream.produce(&output.writer);
+    response.body.stream.finalize();
+
+    try std.testing.expectEqualStrings("small", output.written());
+    try std.testing.expectEqual(@as(usize, 1), finalized_count);
+}
+
+test "Compression finalizes an eligible stream rejected with 406" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var finalized_count: usize = 0;
+    var context = testContext(arena.allocator(), .GET, "gzip;q=0, *;q=0");
+
+    const response = try Compression(.{}).handle(&context, TestNext{ .response = try streamingResponse(
+        arena.allocator(),
+        compressible_body,
+        null,
+        &finalized_count,
+    ) });
+
+    try std.testing.expectEqual(std.http.Status.not_acceptable, response.status);
+    try std.testing.expect(response.body == .empty);
+    try std.testing.expectEqual(@as(usize, 1), finalized_count);
 }
 
 test "quality selection, wildcard, case, and qvalue precision choose gzip when available" {
@@ -367,7 +524,7 @@ test "identity fallback preserves the original response and forbidden identity y
         &identity_context,
         TestNext{ .response = original },
     );
-    try std.testing.expectEqualStrings(original.body, identity_response.body);
+    try std.testing.expectEqualStrings(original.body.asBytes().?, identity_response.body.asBytes().?);
     try std.testing.expect(identity_response.headers.get("content-encoding") == null);
 
     var rejected_context = testContext(arena.allocator(), .GET, "gzip;q=0, *;q=0");
@@ -376,7 +533,7 @@ test "identity fallback preserves the original response and forbidden identity y
         TestNext{ .response = original },
     );
     try std.testing.expectEqual(std.http.Status.not_acceptable, rejected.status);
-    try std.testing.expectEqualStrings("", rejected.body);
+    try std.testing.expectEqualStrings("", rejected.body.asBytes().?);
 }
 
 test "unavailable zstd is not advertised or selected by the gzip default" {
@@ -416,20 +573,20 @@ test "empty small HEAD and bodyless statuses are excluded" {
         const response = try Compression(.{}).handle(&context, TestNext{ .response = .{
             .status = case.status,
             .headers = .{ .items = &.{.{ .name = "Content-Type", .value = "text/plain" }} },
-            .body = case.body,
+            .body = .fromBytes(case.body),
         } });
-        try std.testing.expectEqualStrings(case.body, response.body);
+        try std.testing.expectEqualStrings(case.body, response.body.asBytes().?);
         try std.testing.expect(response.headers.get("content-encoding") == null);
     }
 }
 
 test "missing or disallowed content type and existing content encoding are excluded" {
     const responses = [_]Response{
-        .{ .status = .ok, .body = compressible_body },
+        .{ .status = .ok, .body = .{ .bytes = compressible_body } },
         .{
             .status = .ok,
             .headers = .{ .items = &.{.{ .name = "Content-Type", .value = "image/png" }} },
-            .body = compressible_body,
+            .body = .{ .bytes = compressible_body },
         },
         .{
             .status = .ok,
@@ -437,7 +594,7 @@ test "missing or disallowed content type and existing content encoding are exclu
                 .{ .name = "Content-Type", .value = "application/json" },
                 .{ .name = "Content-Encoding", .value = "br" },
             } },
-            .body = compressible_body,
+            .body = .{ .bytes = compressible_body },
         },
     };
 
@@ -446,7 +603,7 @@ test "missing or disallowed content type and existing content encoding are exclu
         defer arena.deinit();
         var context = testContext(arena.allocator(), .GET, "gzip, identity;q=0");
         const response = try Compression(.{}).handle(&context, TestNext{ .response = original });
-        try std.testing.expectEqualStrings(original.body, response.body);
+        try std.testing.expectEqualStrings(original.body.asBytes().?, response.body.asBytes().?);
         if (index == 2) {
             try std.testing.expectEqualStrings("br", response.headers.get("content-encoding").?);
         } else {
@@ -455,7 +612,7 @@ test "missing or disallowed content type and existing content encoding are exclu
     }
 }
 
-test "Vary is appended once and Content-Length is left untouched" {
+test "Vary is appended once" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var context = testContext(arena.allocator(), .GET, "gzip");
@@ -463,13 +620,11 @@ test "Vary is appended once and Content-Length is left untouched" {
         .status = .ok,
         .headers = .{ .items = &.{
             .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
-            .{ .name = "Content-Length", .value = "9999" },
             .{ .name = "Vary", .value = "Origin" },
         } },
-        .body = compressible_body,
+        .body = .{ .bytes = compressible_body },
     } });
 
-    try std.testing.expectEqualStrings("9999", response.headers.get("content-length").?);
     var vary = response.headers.values("vary");
     try std.testing.expectEqualStrings("Origin", vary.next().?);
     try std.testing.expectEqualStrings("Accept-Encoding", vary.next().?);
@@ -486,7 +641,7 @@ test "existing comma-separated Vary Accept-Encoding is not duplicated" {
             .{ .name = "Content-Type", .value = "image/svg+xml" },
             .{ .name = "Vary", .value = "Origin, ACCEPT-ENCODING" },
         } },
-        .body = compressible_body,
+        .body = .{ .bytes = compressible_body },
     } });
 
     try std.testing.expectEqual(@as(usize, 3), response.headers.len());

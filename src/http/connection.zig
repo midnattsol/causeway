@@ -6,7 +6,10 @@ const Headers = @import("headers.zig").Headers;
 const context_module = @import("context.zig");
 const HttpContext = context_module.Context;
 const Request = @import("request.zig").Request;
-const Response = @import("response.zig").Response;
+const RequestBody = @import("request_body.zig").RequestBody;
+const response_module = @import("response.zig");
+const Response = response_module.Response;
+const Stream = response_module.Stream;
 const extractor_errors = @import("extractors/errors.zig");
 const Io = std.Io;
 const net = Io.net;
@@ -130,7 +133,36 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 const raw = try request_allocator.dupe(u8, incoming.head.target);
                 const headers = try copyHeaders(&incoming, request_allocator);
 
-                var request = Request.init(raw, incoming.head.method, headers, null) catch {
+                if (!expectationSupported(incoming.head.expect)) {
+                    incoming.head.expect = null;
+                    try incoming.respond("expectation failed", .{
+                        .status = .expectation_failed,
+                        .keep_alive = false,
+                    });
+                    return;
+                }
+                if (incoming.head.expect) |expect| {
+                    if (!std.mem.eql(u8, expect, "100-continue")) {
+                        incoming.head.expect = "100-continue";
+                    }
+                }
+                if (requestHasFraming(&incoming) and !incoming.head.method.requestHasBody()) {
+                    incoming.head.expect = null;
+                    try incoming.respond("request body not allowed for method", .{
+                        .status = .bad_request,
+                        .keep_alive = false,
+                    });
+                    return;
+                }
+
+                var body_state = RequestBody.State.initAbsent();
+                const request = Request.init(
+                    raw,
+                    incoming.head.method,
+                    headers,
+                    .init(&body_state),
+                ) catch {
+                    incoming.head.expect = null;
                     try incoming.respond("bad request", .{
                         .status = .bad_request,
                         .keep_alive = false,
@@ -156,18 +188,15 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     return;
                 }
 
-                const body = readBody(&incoming, request_allocator, transfer_buffer, body_limit) catch |err| switch (err) {
-                    error.StreamTooLong => {
-                        try incoming.respond("request body too large", .{
-                            .status = .payload_too_large,
-                            .keep_alive = false,
-                        });
-                        return;
-                    },
-                    else => return err,
-                };
+                if (requestHasFramedBody(&incoming)) {
+                    body_state = .initPending(
+                        &incoming,
+                        request_allocator,
+                        transfer_buffer,
+                        body_limit,
+                    );
+                }
 
-                request.body = body;
                 var locals: if (Locals) |RequestLocals| RequestLocals else void = if (Locals != null) .{} else {};
                 const context = if (Locals) |_| Context{
                     .execution = .{
@@ -186,33 +215,43 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     .request = request,
                 };
 
-                const keep_alive = incoming.head.keep_alive and !requestLimitReached(self.options.max_requests, request_count);
-                const response = Dispatcher.dispatch(&context) catch |err| {
-                    const failure: DispatchFailure = if (extractor_errors.status(err)) |status|
-                        .{ .status = status, .body = "bad request" }
-                    else switch (self.options.handler_error_policy) {
-                        .internal_server_error => .{
-                            .status = .internal_server_error,
-                            .body = "internal server error",
-                        },
-                        .propagate => return err,
-                    };
+                const connection_keep_alive = incoming.head.keep_alive and
+                    !requestLimitReached(self.options.max_requests, request_count);
+                var response = Dispatcher.dispatch(&context) catch |err| {
+                    const failure = dispatchFailure(err, self.options.handler_error_policy) orelse return err;
+                    const failure_keep_alive = connection_keep_alive and requestBodyComplete(request.body);
+                    suppressUnusedExpectation(&incoming, request.body);
                     try incoming.respond(failure.body, .{
                         .status = failure.status,
-                        .keep_alive = keep_alive,
+                        .keep_alive = failure_keep_alive,
                     });
-                    if (!keep_alive) return;
+                    if (!failure_keep_alive) return;
                     _ = arena.reset(.retain_capacity);
                     continue;
                 };
 
-                const response_headers = try responseHeaders(response, request_allocator);
-                const response_keep_alive = keep_alive and response.connection == .keep_alive;
-                try incoming.respond(response.body, .{
-                    .status = response.status,
-                    .keep_alive = response_keep_alive,
-                    .extra_headers = response_headers,
-                });
+                const response_headers = responseHeaders(response, request_allocator) catch |err| {
+                    response.body.finalize();
+                    response.complete(.{ .failure = err });
+                    return err;
+                };
+                const response_keep_alive = connection_keep_alive and
+                    requestBodyComplete(request.body) and
+                    response.connection == .keep_alive;
+                suppressUnusedExpectation(&incoming, request.body);
+                writeResponseWithDeadline(
+                    io,
+                    &incoming,
+                    &response,
+                    request_allocator,
+                    transfer_buffer,
+                    response_headers,
+                    response_keep_alive,
+                ) catch |err| {
+                    response.complete(.{ .failure = err });
+                    return err;
+                };
+                response.complete(.success);
                 if (!response_keep_alive) return;
                 _ = arena.reset(.retain_capacity);
             }
@@ -245,28 +284,12 @@ fn copyHeaders(incoming: *const std.http.Server.Request, allocator: std.mem.Allo
     return .{ .items = items.items };
 }
 
-fn readBody(
-    incoming: *std.http.Server.Request,
-    allocator: std.mem.Allocator,
-    transfer_buffer: []u8,
-    maximum: usize,
-) !?[]const u8 {
-    const framed = incoming.head.content_length != null or incoming.head.transfer_encoding == .chunked;
-    if (!framed or !incoming.head.method.requestHasBody()) return null;
-
-    const reader = try incoming.readerExpectContinue(transfer_buffer);
-    const read_limit: Io.Limit = if (maximum == std.math.maxInt(usize))
-        .unlimited
-    else
-        .limited(maximum + 1);
-    const body = try reader.allocRemaining(allocator, read_limit);
-    if (body.len > maximum) return error.StreamTooLong;
-    return body;
+fn requestHasFraming(incoming: *const std.http.Server.Request) bool {
+    return incoming.head.content_length != null or incoming.head.transfer_encoding == .chunked;
 }
 
 fn requestHasFramedBody(incoming: *const std.http.Server.Request) bool {
-    return incoming.head.method.requestHasBody() and
-        (incoming.head.content_length != null or incoming.head.transfer_encoding == .chunked);
+    return incoming.head.method.requestHasBody() and requestHasFraming(incoming);
 }
 
 fn effectiveBodyLimit(
@@ -290,6 +313,201 @@ fn bodyExceedsKnownLimit(content_length: ?u64, maximum: usize) bool {
 
 fn requestLimitReached(maximum: ?usize, count: usize) bool {
     return if (maximum) |limit| count >= limit else false;
+}
+
+fn expectationSupported(expect: ?[]const u8) bool {
+    const value = expect orelse return true;
+    return std.ascii.eqlIgnoreCase(value, "100-continue");
+}
+
+fn requestBodyComplete(body: RequestBody) bool {
+    return switch (body.status()) {
+        .absent, .buffered, .consumed => true,
+        .pending, .streaming, .failed => false,
+    };
+}
+
+fn suppressUnusedExpectation(incoming: *std.http.Server.Request, body: RequestBody) void {
+    if (!requestBodyComplete(body)) incoming.head.expect = null;
+}
+
+fn dispatchFailure(err: anyerror, policy: HandlerErrorPolicy) ?DispatchFailure {
+    if (err == error.StreamTooLong) {
+        return .{ .status = .payload_too_large, .body = "request body too large" };
+    }
+    if (err == error.HttpExpectationFailed) {
+        return .{ .status = .expectation_failed, .body = "expectation failed" };
+    }
+    if (extractor_errors.status(err)) |status| {
+        return .{ .status = status, .body = "bad request" };
+    }
+    return switch (policy) {
+        .internal_server_error => .{
+            .status = .internal_server_error,
+            .body = "internal server error",
+        },
+        .propagate => null,
+    };
+}
+
+fn writeResponseWithDeadline(
+    io: Io,
+    incoming: *std.http.Server.Request,
+    response: *Response,
+    allocator: std.mem.Allocator,
+    stream_buffer: []u8,
+    headers: []const std.http.Header,
+    keep_alive: bool,
+) !void {
+    const deadline = response.write_deadline orelse return writeResponse(
+        incoming,
+        response,
+        allocator,
+        stream_buffer,
+        headers,
+        keep_alive,
+    );
+    const Race = union(enum) {
+        write: anyerror!void,
+        timeout: anyerror!void,
+    };
+    const Runner = struct {
+        fn run(
+            request: *std.http.Server.Request,
+            value: *Response,
+            request_allocator: std.mem.Allocator,
+            buffer: []u8,
+            extra_headers: []const std.http.Header,
+            reusable: bool,
+        ) anyerror!void {
+            return writeResponse(request, value, request_allocator, buffer, extra_headers, reusable);
+        }
+    };
+
+    var results: [2]Race = undefined;
+    var select = Io.Select(Race).init(io, &results);
+    select.async(.write, Runner.run, .{ incoming, response, allocator, stream_buffer, headers, keep_alive });
+    select.async(.timeout, waitUntil, .{ io, deadline });
+
+    const result = select.await() catch |err| {
+        select.cancelDiscard();
+        return err;
+    };
+    defer select.cancelDiscard();
+    switch (result) {
+        .write => |write_result| try write_result,
+        .timeout => |timeout_result| {
+            try timeout_result;
+            return error.ResponseTimeout;
+        },
+    }
+}
+
+fn waitUntil(io: Io, deadline: Io.Clock.Timestamp) anyerror!void {
+    try deadline.wait(io);
+}
+
+fn writeResponse(
+    incoming: *std.http.Server.Request,
+    response: *Response,
+    allocator: std.mem.Allocator,
+    stream_buffer: []u8,
+    headers: []const std.http.Header,
+    keep_alive: bool,
+) !void {
+    if (!statusAllowsBody(response.status)) {
+        response.body.finalize();
+        return respondBodyless(
+            incoming,
+            allocator,
+            response.status,
+            headers,
+            keep_alive,
+        );
+    }
+
+    switch (response.body) {
+        .empty => try incoming.respond("", .{
+            .status = response.status,
+            .keep_alive = keep_alive,
+            .extra_headers = headers,
+        }),
+        .bytes => |bytes| try incoming.respond(bytes, .{
+            .status = response.status,
+            .keep_alive = keep_alive,
+            .extra_headers = headers,
+        }),
+        .stream => |*stream| {
+            defer stream.finalize();
+            var body_writer = try incoming.respondStreaming(stream_buffer, .{
+                .content_length = stream.content_length,
+                .respond_options = .{
+                    .status = response.status,
+                    .keep_alive = keep_alive,
+                    .extra_headers = headers,
+                },
+            });
+            if (body_writer.isEliding()) {
+                if (stream.content_length) |length| {
+                    try accountElidedContentLength(&body_writer.writer, length);
+                }
+            } else {
+                try stream.produce(&body_writer.writer);
+            }
+            try body_writer.end();
+        },
+    }
+}
+
+/// Lets std.http update its request/keep-alive state, then removes the
+/// synthesized `content-length: 0` field that is invalid for 1xx/204 and not
+/// generally meaningful for 304.
+fn respondBodyless(
+    incoming: *std.http.Server.Request,
+    allocator: std.mem.Allocator,
+    status: std.http.Status,
+    headers: []const std.http.Header,
+    keep_alive: bool,
+) !void {
+    var capture: Io.Writer.Allocating = .init(allocator);
+    defer capture.deinit();
+
+    const network_output = incoming.server.out;
+    incoming.server.out = &capture.writer;
+    defer incoming.server.out = network_output;
+
+    try incoming.respondUnflushed("", .{
+        .status = status,
+        .keep_alive = keep_alive,
+        .extra_headers = headers,
+    });
+    incoming.server.out = network_output;
+
+    const generated = capture.written();
+    const marker = "content-length: 0\r\n";
+    const marker_start = std.mem.find(u8, generated, marker) orelse
+        return error.MissingManagedContentLength;
+    try network_output.writeAll(generated[0..marker_start]);
+    try network_output.writeAll(generated[marker_start + marker.len ..]);
+    try network_output.flush();
+}
+
+/// Advances an eliding HEAD writer's validation counter without executing the
+/// response producer or emitting bytes. `splatByteAll` reaches the eliding
+/// writer vtable directly for lengths larger than its small buffer.
+fn accountElidedContentLength(writer: *Io.Writer, length: u64) !void {
+    var remaining = length;
+    while (remaining != 0) {
+        const amount: usize = @intCast(@min(remaining, std.math.maxInt(usize)));
+        try writer.splatByteAll(0, amount);
+        remaining -= amount;
+    }
+}
+
+fn statusAllowsBody(status: std.http.Status) bool {
+    return status.class() != .informational and
+        status != .no_content and
+        status != .not_modified;
 }
 
 fn responseHeaders(response: Response, allocator: std.mem.Allocator) ![]const std.http.Header {
@@ -317,6 +535,34 @@ fn writeProtocolError(output: *Io.Writer, status: std.http.Status, body: []const
 
 const TestState = struct {
     requests: usize = 0,
+    produced: usize = 0,
+    finalized: usize = 0,
+};
+
+const TestProducer = struct {
+    state: *TestState,
+
+    pub fn produce(self: *@This(), writer: *Io.Writer) !void {
+        self.state.produced += 1;
+        try writer.writeAll("streamed");
+    }
+
+    pub fn finalize(self: *@This()) void {
+        self.state.finalized += 1;
+    }
+};
+
+const SlowTestProducer = struct {
+    state: *TestState,
+    io: Io,
+
+    pub fn produce(self: *@This(), _: *Io.Writer) !void {
+        try Io.sleep(self.io, .fromSeconds(60), .awake);
+    }
+
+    pub fn finalize(self: *@This()) void {
+        self.state.finalized += 1;
+    }
 };
 
 const TestDispatcher = struct {
@@ -325,17 +571,53 @@ const TestDispatcher = struct {
         return null;
     }
 
-    fn dispatch(context: *const HttpContext(TestState)) error{ HandlerFailed, InvalidQuery }!Response {
+    fn dispatch(context: *const HttpContext(TestState)) !Response {
         context.execution.state.requests += 1;
         if (std.mem.eql(u8, context.request.path, "/fail")) return error.HandlerFailed;
         if (std.mem.eql(u8, context.request.path, "/bad-request")) return error.InvalidQuery;
         if (std.mem.eql(u8, context.request.path, "/close")) {
-            return .{ .status = .ok, .body = "close", .connection = .close };
+            return .{ .status = .ok, .body = .{ .bytes = "close" }, .connection = .close };
+        }
+        if (std.mem.eql(u8, context.request.path, "/ignore")) {
+            return .{ .status = .unauthorized, .connection = .close };
+        }
+        if (std.mem.eql(u8, context.request.path, "/not-modified")) {
+            return .{ .status = .not_modified };
+        }
+        if (std.mem.eql(u8, context.request.path, "/slow-stream")) {
+            const stream = try Stream.init(
+                context.execution.allocator,
+                SlowTestProducer{
+                    .state = context.execution.state,
+                    .io = context.execution.io,
+                },
+                .{},
+            );
+            var response = Response.streaming(.ok, .empty, stream);
+            response.write_deadline = .fromNow(context.execution.io, .{
+                .raw = .fromMilliseconds(1),
+                .clock = .awake,
+            });
+            return response;
+        }
+        if (std.mem.eql(u8, context.request.path, "/stream") or
+            std.mem.eql(u8, context.request.path, "/no-content-stream"))
+        {
+            const stream = try Stream.init(
+                context.execution.allocator,
+                TestProducer{ .state = context.execution.state },
+                .{ .content_length = "streamed".len },
+            );
+            return Response.streaming(
+                if (std.mem.eql(u8, context.request.path, "/stream")) .ok else .no_content,
+                .empty,
+                stream,
+            );
         }
         return .{
             .status = .ok,
             .headers = .{ .items = &.{.{ .name = "x-causeway", .value = "test" }} },
-            .body = context.request.body orelse context.request.path,
+            .body = .{ .bytes = (try context.request.body.readAll()) orelse context.request.path },
         };
     }
 };
@@ -359,7 +641,7 @@ test "HandlerWithLocals creates fresh default-initialized locals for a request" 
         pub fn dispatch(context: anytype) error{}!Response {
             std.debug.assert(context.locals.request_id.len == 0);
             context.locals.request_id = "request-local";
-            return .{ .status = .ok, .body = context.locals.request_id };
+            return .{ .status = .ok, .body = .{ .bytes = context.locals.request_id } };
         }
     };
 
@@ -405,6 +687,148 @@ test "connection reads a bounded request body" {
 
     try std.testing.expectEqual(@as(usize, 1), state.requests);
     try std.testing.expect(std.mem.endsWith(u8, output, "hello"));
+}
+
+test "connection streams responses and finalizes their producers" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "GET /stream HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.endsWith(u8, output, "streamed"));
+    try std.testing.expectEqual(@as(usize, 1), state.produced);
+    try std.testing.expectEqual(@as(usize, 1), state.finalized);
+}
+
+test "204 and 304 preserve keep-alive without body framing" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "GET /no-content-stream HTTP/1.1\r\nhost: example.com\r\n\r\n" ++
+            "GET /not-modified HTTP/1.1\r\nhost: example.com\r\n\r\n" ++
+            "GET /next HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    const second_start = std.mem.findPosLinear(u8, output, 1, "HTTP/1.1") orelse
+        return error.MissingSecondResponse;
+    const third_start = std.mem.findPosLinear(u8, output, second_start + 1, "HTTP/1.1") orelse
+        return error.MissingThirdResponse;
+    const no_content = output[0..second_start];
+    const not_modified = output[second_start..third_start];
+
+    try std.testing.expect(std.mem.find(u8, no_content, "204 No Content") != null);
+    try std.testing.expect(std.mem.find(u8, not_modified, "304 Not Modified") != null);
+    try std.testing.expect(std.mem.find(u8, no_content, "content-length") == null);
+    try std.testing.expect(std.mem.find(u8, no_content, "transfer-encoding") == null);
+    try std.testing.expect(std.mem.find(u8, not_modified, "content-length") == null);
+    try std.testing.expect(std.mem.find(u8, not_modified, "transfer-encoding") == null);
+    try std.testing.expectEqual(@as(usize, 3), state.requests);
+}
+
+test "connection deadline cancels and finalizes a slow response stream" {
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(2));
+    var input = Io.Reader.fixed(
+        "GET /slow-stream HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+    );
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: TestState = .{};
+    var handler = Handler(TestState, TestDispatcher).init(std.testing.allocator, &state, .{});
+
+    try std.testing.expectError(
+        error.ResponseTimeout,
+        handler.serve(&input, &output.writer, threaded.io()),
+    );
+    try std.testing.expectEqual(@as(usize, 1), state.finalized);
+}
+
+test "HEAD and bodyless statuses skip production but finalize streams" {
+    var head_state: TestState = .{};
+    const head_output = try serveTest(
+        "HEAD /stream HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &head_state,
+    );
+    defer std.testing.allocator.free(head_output);
+    try std.testing.expect(std.mem.find(u8, head_output, "content-length: 8") != null);
+    try std.testing.expect(std.mem.find(u8, head_output, "transfer-encoding") == null);
+    try std.testing.expect(!std.mem.endsWith(u8, head_output, "streamed"));
+    try std.testing.expectEqual(@as(usize, 0), head_state.produced);
+    try std.testing.expectEqual(@as(usize, 1), head_state.finalized);
+
+    var no_content_state: TestState = .{};
+    const no_content_output = try serveTest(
+        "GET /no-content-stream HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
+        .{},
+        &no_content_state,
+    );
+    defer std.testing.allocator.free(no_content_output);
+    try std.testing.expect(std.mem.find(u8, no_content_output, "204 No Content") != null);
+    try std.testing.expect(std.mem.find(u8, no_content_output, "content-length") == null);
+    try std.testing.expect(std.mem.find(u8, no_content_output, "transfer-encoding") == null);
+    try std.testing.expect(!std.mem.endsWith(u8, no_content_output, "streamed"));
+    try std.testing.expectEqual(@as(usize, 0), no_content_state.produced);
+    try std.testing.expectEqual(@as(usize, 1), no_content_state.finalized);
+}
+
+test "unread Expect body is rejected without sending 100 Continue" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "POST /ignore HTTP/1.1\r\nhost: example.com\r\ncontent-length: 7\r\nexpect: 100-continue\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.find(u8, output, "401 Unauthorized") != null);
+    try std.testing.expect(std.mem.find(u8, output, "100 Continue") == null);
+    try std.testing.expect(std.mem.find(u8, output, "connection: close") != null);
+}
+
+test "mixed-case 100-continue is normalized before lazy body reads" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "POST /echo HTTP/1.1\r\nhost: example.com\r\ncontent-length: 5\r\nexpect: 100-Continue\r\nconnection: close\r\n\r\nhello",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.find(u8, output, "100 Continue") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "hello"));
+}
+
+test "framed bodies on unsupported methods are rejected before dispatch" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "DELETE /ignore HTTP/1.1\r\nhost: example.com\r\ncontent-length: 5\r\n\r\nhello",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.find(u8, output, "400 Bad Request") != null);
+    try std.testing.expectEqual(@as(usize, 0), state.requests);
+}
+
+test "connection rejects unsupported expectations" {
+    var state: TestState = .{};
+    const output = try serveTest(
+        "POST /ignore HTTP/1.1\r\nhost: example.com\r\ncontent-length: 1\r\nexpect: magic\r\n\r\n",
+        .{},
+        &state,
+    );
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.find(u8, output, "417 Expectation Failed") != null);
+    try std.testing.expectEqual(@as(usize, 0), state.requests);
 }
 
 test "connection applies a stricter route body limit before dispatch" {
