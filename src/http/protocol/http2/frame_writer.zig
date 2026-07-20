@@ -29,6 +29,11 @@ pub const Encoder = struct {
         try self.output.writeVecAll(&vectors);
     }
 
+    pub fn writeSettings(self: *Encoder, payload: []const u8) !void {
+        if (payload.len % 6 != 0) return error.FrameSizeError;
+        try self.write(.settings, 0, 0, payload);
+    }
+
     pub fn writeSettingsAck(self: *Encoder) !void {
         try self.write(.settings, frame.Flag.ack, 0, &.{});
     }
@@ -41,6 +46,28 @@ pub const Encoder = struct {
         var payload: [4]u8 = undefined;
         frame.writeU32(&payload, @intFromEnum(code));
         try self.write(.rst_stream, 0, stream_id, &payload);
+    }
+
+    pub fn writeGoaway(
+        self: *Encoder,
+        last_stream_id: u32,
+        code: @import("error.zig").Code,
+        debug_data: []const u8,
+    ) !void {
+        if (last_stream_id > 0x7fff_ffff) return error.InvalidStreamId;
+        if (debug_data.len > self.peer_max_frame_size -| 8) return error.FrameSizeError;
+        var prefix: [8]u8 = undefined;
+        frame.writeU32(prefix[0..4], last_stream_id);
+        frame.writeU32(prefix[4..8], @intFromEnum(code));
+        const header: frame.Header = .{
+            .length = @intCast(8 + debug_data.len),
+            .frame_type = .goaway,
+            .flags = 0,
+            .stream_id = 0,
+        };
+        const header_bytes = try header.encode();
+        var vectors: [3][]const u8 = .{ &header_bytes, &prefix, debug_data };
+        try self.output.writeVecAll(&vectors);
     }
 
     pub fn writeWindowUpdate(self: *Encoder, stream_id: u32, increment: u32) !void {

@@ -8,6 +8,7 @@ pub const frame_reader = @import("frame_reader.zig");
 pub const frame_writer = @import("frame_writer.zig");
 pub const header_semantics = @import("header_semantics.zig");
 pub const hpack = @import("hpack/root.zig");
+pub const settings = @import("settings.zig");
 
 // -----------------------------------------------------------------------------
 // Tests
