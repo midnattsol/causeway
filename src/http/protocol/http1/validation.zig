@@ -1,4 +1,4 @@
-//! Strict HTTP/1 request-head validation before std.http parsing.
+//! Strict lexical and structural validation for HTTP/1 request heads.
 
 const std = @import("std");
 const syntax = @import("syntax.zig");
@@ -75,6 +75,7 @@ pub fn validateWithLimits(head: []const u8, limits: Limits) Error!Result {
             var tokens = std.mem.splitScalar(u8, value, ',');
             while (tokens.next()) |raw_token| {
                 const token = std.mem.trim(u8, raw_token, " \t");
+                if (!syntax.isToken(token)) return error.InvalidRequestHead;
                 if (std.ascii.eqlIgnoreCase(token, "close")) result.connection_close = true;
                 if (std.ascii.eqlIgnoreCase(token, "keep-alive")) result.connection_keep_alive = true;
             }

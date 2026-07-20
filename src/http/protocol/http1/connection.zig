@@ -438,7 +438,11 @@ fn validateOptions(options: Options) ConfigurationError!void {
     if (options.max_body_size == 0) return error.InvalidBodySize;
     if (options.max_encoded_body_size == 0) return error.InvalidEncodedBodySize;
     if (options.max_chunk_count == 0) return error.InvalidChunkCount;
-    if (options.max_chunk_extension_size == 0) return error.InvalidChunkExtensionSize;
+    if (options.max_chunk_extension_size == 0 or
+        options.max_chunk_extension_size > std.math.maxInt(usize) - 32)
+    {
+        return error.InvalidChunkExtensionSize;
+    }
     if (options.max_trailer_count == 0) return error.InvalidTrailerCount;
     if (options.max_trailer_size == 0) return error.InvalidTrailerSize;
     if (options.max_response_trailer_count == 0) return error.InvalidResponseTrailerCount;

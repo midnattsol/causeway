@@ -2,8 +2,9 @@
 
 Causeway is a typed, modular HTTP API library for Zig. Its protocol-independent
 request pipeline is separated from wire-protocol engines and network transport.
-The current HTTP/1.x engine builds on Zig's standard-library parser and `std.Io`
-transport primitives rather than maintaining a separate wire parser.
+The current HTTP/1.x engine owns request parsing, message framing, response
+serialization, and connection reuse while using Zig's `std.Io` transport and
+compression primitives.
 
 ## Status
 
@@ -11,8 +12,9 @@ The HTTP/1.1 core is implemented: lifecycle-managed servers and hot listeners,
 typed compile-time routing, extractors and middleware, buffered and streaming
 request/response bodies, keep-alive, limits, deadlines, graceful shutdown,
 cookies, sessions, CSRF, compression, ETags, request content decoding,
-request/response trailers, informational responses, Upgrade/CONNECT takeover,
-extension methods, request-smuggling validation, bounded unread-body draining,
+strictly announced request/response trailers, informational responses,
+Upgrade/CONNECT takeover, extension methods, request-smuggling validation,
+bounded unread-body draining,
 typed forms, streaming multipart uploads, SSE, WebSocket framing, efficient file
 responses, multipart byte ranges, conditional requests, Cache-Control utilities,
 and real TCP integration tests.
@@ -37,8 +39,10 @@ zig build --fuzz http1-fuzz
 zig build test
 ```
 
-`zig build http1-fuzz` runs the finite corpus smoke pass. Coverage-guided fuzzing
-uses LLVM only for the fuzz artifact because the default backend in Zig
+`zig build http1-fuzz` runs the finite corpus smoke pass. The coverage-guided
+target mutates the complete parser, authority and target handling, chunked
+framing, response planning and headers, and in-memory connection sequences.
+It uses LLVM only for the fuzz artifact because the default backend in Zig
 `0.17.0-dev.1413+addc3c3b8` does not emit the required coverage points. Use an
 iteration limit for CI and omit it for an interactive, continuous campaign.
 

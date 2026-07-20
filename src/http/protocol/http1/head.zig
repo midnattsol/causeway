@@ -87,7 +87,9 @@ pub fn parse(
     if (expect_continue and version != .http_1_1) return error.UnsupportedExpectation;
 
     const framing: Framing = if (transfer_encoding) |value| blk: {
-        if (!validChunkedTransferEncoding(value)) return error.UnsupportedTransferCoding;
+        if (version != .http_1_1 or !validChunkedTransferEncoding(value)) {
+            return error.UnsupportedTransferCoding;
+        }
         break :blk .chunked;
     } else if (content_length) |length| .{ .content_length = length } else .none;
     try trailer_policy.validateNames(trailer_names.items);
@@ -215,7 +217,7 @@ test "Head requires request trailers to use announced HTTP/1.1 chunked framing" 
         arena.allocator(),
         limits,
     ));
-    try std.testing.expectError(error.TrailersRequireHttp11, parse(
+    try std.testing.expectError(error.UnsupportedTransferCoding, parse(
         "POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\nTrailer: Digest\r\n\r\n",
         arena.allocator(),
         limits,

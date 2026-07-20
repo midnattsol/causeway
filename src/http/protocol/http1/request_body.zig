@@ -45,9 +45,14 @@ pub const Adapter = struct {
             },
             .chunked => blk: {
                 const chunked = try allocator.create(body_reader.Chunked);
+                const extension_capacity = std.math.add(
+                    usize,
+                    self.max_chunk_extension_size,
+                    32,
+                ) catch return error.InvalidChunkExtensionSize;
                 const line_buffer = try allocator.alloc(
                     u8,
-                    @max(self.max_chunk_extension_size + 32, self.max_trailer_size),
+                    @max(extension_capacity, self.max_trailer_size),
                 );
                 self.chunked = chunked;
                 break :blk chunked.init(

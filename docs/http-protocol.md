@@ -1,6 +1,6 @@
 # HTTP/1.x protocol behavior
 
-Causeway's HTTP/1 engine builds on Zig's `std.http.Server` parser while owning request lifecycle, dispatch, response framing, timeouts, and protocol extensions.
+Causeway's HTTP/1 engine owns request-head parsing, request and response framing, serialization, keep-alive, timeouts, and protocol extensions. It uses generic `std.Io.Reader` and `std.Io.Writer` streams and does not delegate wire semantics to `std.http.Server`.
 
 ## Package boundaries
 
@@ -43,7 +43,8 @@ A framed request body is exposed independently of the method. Causeway does not 
 A response-specific `Response.write_deadline` overrides the default. The server-level `connection_timeout` remains an independent upper bound for the whole connection task.
 
 `connection.Options` also bounds request lines, header counts and field sizes,
-decoded bodies, trailers, transfer buffers, and requests per connection.
+encoded and decoded bodies, chunk counts and extensions, request and response
+trailers, transfer buffers, and requests per connection.
 Responses receive an allocation-free `Date` field by default when the real-time
 clock is available.
 
@@ -59,19 +60,20 @@ Causeway reserves `100 Continue` for lazy request-body activation and `101 Switc
 
 ## Trailers
 
-Chunked request trailers become available after complete body consumption:
+Chunked request trailers must be announced by the request's `Trailer` field and
+become available after complete body consumption:
 
 ```zig
 const trailers = try context.request.body.trailers();
 ```
 
-For response trailers, a stream advertises names before the body and returns values after production. Causeway writes the `Trailer` field, validates declared names, and terminates the chunked body with those fields. Framing, routing, authentication, and other forbidden trailer names are rejected.
+For response trailers, a stream advertises names before the body and returns values after production. Causeway writes the `Trailer` field, validates declared names, enforces count and wire-size limits, and terminates the chunked body with those fields. Unannounced fields and framing, routing, authentication, response-control, or content-processing names are rejected.
 
 ## Upgrade and CONNECT
 
 `response.Takeover` transfers the buffered input and output interfaces to a handler after a valid handshake:
 
-- `Response.upgrade` requires an HTTP/1.1 GET with matching `Connection: upgrade` and `Upgrade` fields and emits `101`;
+- `Response.upgrade` requires an HTTP/1.1 GET, a valid selected protocol token present in the client's `Upgrade` list, and `Connection: upgrade`, then emits `101`;
 - `Response.tunnel` requires CONNECT and a successful status and emits no HTTP body framing.
 
 The takeover runs inside the connection task, so server connection limits, cancellation, graceful shutdown, and the outer stream lifetime remain valid. `http.websocket` builds RFC 6455 handshake validation, masked frame decoding, fragmentation, ping/pong, close handling, UTF-8 validation, and message limits on this primitive.
@@ -88,10 +90,12 @@ Causeway responds using the request's HTTP version. Unknown-length HTTP/1.1 stre
 
 ## Connection reuse and security
 
-Causeway prevalidates the request head before `std.http` parsing. Ambiguous
-`Content-Length`/`Transfer-Encoding`, duplicate framing, invalid field names,
-missing or duplicate HTTP/1.1 `Host`, obsolete folding, and malformed request
-lines are rejected before dispatch and force safe framing behavior.
+Causeway parses request heads with strict RFC 9110/9112 syntax. Ambiguous
+`Content-Length`/`Transfer-Encoding`, duplicate framing, chunked encoding in
+HTTP/1.0, invalid fields or authorities, missing or duplicate HTTP/1.1 `Host`,
+obsolete folding, and malformed request lines are rejected before dispatch.
+Framing errors force connection closure so body bytes cannot become another
+request.
 
 Unread request bodies close the connection by default. The opt-in `.drain`
 policy discards only up to `max_unread_body_drain_size` under an idle timeout;

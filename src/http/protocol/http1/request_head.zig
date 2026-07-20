@@ -27,11 +27,11 @@ pub fn receive(
     const head_buffer = receiveWithTimeout(io, input, allocator, maximum, timeout, keep_alive) catch |err| switch (err) {
         error.HttpConnectionClosing => return .close,
         error.HttpHeadersOversize => {
-            try writeProtocolError(io, output, automatic_date, .request_header_fields_too_large, "request headers too large");
+            try writeProtocolError(io, output, automatic_date, .@"HTTP/1.1", .request_header_fields_too_large, "request headers too large");
             return .close;
         },
         error.HttpRequestTruncated => {
-            try writeProtocolError(io, output, automatic_date, .bad_request, "bad request");
+            try writeProtocolError(io, output, automatic_date, .@"HTTP/1.1", .bad_request, "bad request");
             return .close;
         },
         else => return err,
@@ -55,7 +55,7 @@ pub fn receive(
             .unsupported_media_type => "unsupported content encoding",
             else => "bad request",
         };
-        try writeProtocolError(io, output, automatic_date, status, body);
+        try writeProtocolError(io, output, automatic_date, responseVersion(head_buffer), status, body);
         return .close;
     } };
 }
@@ -128,10 +128,19 @@ fn waitForTimeout(io: Io, duration: Io.Duration) anyerror!void {
     try Io.sleep(io, duration, .awake);
 }
 
+fn responseVersion(head: []const u8) std.http.Version {
+    const line_end = std.mem.find(u8, head, "\r\n") orelse return .@"HTTP/1.1";
+    return if (std.mem.endsWith(u8, head[0..line_end], " HTTP/1.0"))
+        .@"HTTP/1.0"
+    else
+        .@"HTTP/1.1";
+}
+
 fn writeProtocolError(
     io: Io,
     output: *Io.Writer,
     automatic_date: bool,
+    version: std.http.Version,
     status: std.http.Status,
     body: []const u8,
 ) !void {
@@ -139,7 +148,7 @@ fn writeProtocolError(
         io,
         output,
         automatic_date,
-        .@"HTTP/1.1",
+        version,
         status,
         body,
         false,

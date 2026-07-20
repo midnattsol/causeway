@@ -157,7 +157,7 @@ fn stream(context: *const AppContext) !causeway.http.response.Response {
 
 When `content_length` is omitted, Causeway uses HTTP/1.1 chunked transfer encoding. HTTP/1.0 falls back to a close-delimited stream and disables keep-alive. The producer is invoked once for the whole response, not once per chunk.
 
-A producer can advertise `Stream.Options.trailer_names` and implement `trailers()` to emit validated fields after a chunked body. Trailers are forbidden with a known content length and with HTTP/1.0.
+A producer can advertise `Stream.Options.trailer_names` and implement `trailers()` to emit validated fields after a chunked body. Returned fields must have been announced, are bounded by the connection's response-trailer limits, and cannot affect framing, routing, authentication, response control, or content processing. Trailers are forbidden with a known content length and with HTTP/1.0.
 
 ### Server-Sent Events
 
