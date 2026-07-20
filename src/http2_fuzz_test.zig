@@ -1,6 +1,7 @@
 const std = @import("std");
 const frame = @import("http/protocol/http2/frame.zig");
 const frame_reader = @import("http/protocol/http2/frame_reader.zig");
+const header_semantics = @import("http/protocol/http2/header_semantics.zig");
 const hpack = @import("http/protocol/http2/hpack/codec.zig");
 const huffman = @import("http/protocol/http2/hpack/huffman.zig");
 const integer = @import("http/protocol/http2/hpack/integer.zig");
@@ -64,6 +65,9 @@ fn fuzzHpackBlock(input: []const u8) !void {
     defer decoder.deinit();
     var block = decoder.decode(std.testing.allocator, input) catch return;
     defer block.deinit();
+    _ = header_semantics.parseRequest(block.items, input.len & 1 != 0) catch {};
+    _ = header_semantics.parseResponse(block.items) catch {};
+    _ = header_semantics.validateTrailers(block.items) catch {};
 
     var encoder = try hpack.Encoder.init(std.testing.allocator, limits.dynamic_table_size);
     defer encoder.deinit();
