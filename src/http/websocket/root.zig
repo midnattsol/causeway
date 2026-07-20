@@ -10,6 +10,8 @@ pub const Connection = connection.Connection;
 pub const Message = connection.Message;
 pub const Opcode = connection.Opcode;
 
+const version_headers = [_]Header{.{ .name = "sec-websocket-version", .value = "13" }};
+
 pub const Options = struct {
     connection: connection.Options = .{},
     subprotocol: ?[]const u8 = null,
@@ -25,7 +27,11 @@ pub fn upgrade(context: anytype, handler: anytype, options: Options) !Response {
     if (!valueHasToken(headers, "connection", "upgrade") or
         !valueHasToken(headers, "upgrade", "websocket")) return error.InvalidWebSocketHandshake;
     if (!std.mem.eql(u8, singleHeader(headers, "sec-websocket-version") orelse return error.InvalidWebSocketHandshake, "13")) {
-        return error.UnsupportedWebSocketVersion;
+        return .{
+            .status = .upgrade_required,
+            .headers = .{ .items = &version_headers },
+            .connection = .close,
+        };
     }
     const key = singleHeader(headers, "sec-websocket-key") orelse return error.InvalidWebSocketHandshake;
     var decoded_key: [16]u8 = undefined;
@@ -147,6 +153,19 @@ test "upgrade validates and computes the RFC WebSocket accept value" {
     defer if (result.takeover) |*takeover| takeover.finalize();
     try std.testing.expectEqual(.switching_protocols, result.status);
     try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", result.headers.get("sec-websocket-accept").?);
+}
+
+test "upgrade advertises the supported version" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const headers: Headers = .{ .items = &.{
+        .{ .name = "connection", .value = "Upgrade" },
+        .{ .name = "upgrade", .value = "websocket" },
+        .{ .name = "sec-websocket-version", .value = "12" },
+    } };
+    const result = try upgrade(testContext(headers, arena.allocator()), TestHandler{}, .{});
+    try std.testing.expectEqual(.upgrade_required, result.status);
+    try std.testing.expectEqualStrings("13", result.headers.get("sec-websocket-version").?);
 }
 
 test "upgrade rejects malformed handshakes" {

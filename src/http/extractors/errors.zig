@@ -21,7 +21,6 @@ pub const Error = error{
     TooManyMultipartParts,
     TooManyMultipartHeaders,
     InvalidWebSocketHandshake,
-    UnsupportedWebSocketVersion,
     InvalidWebSocketSubprotocol,
 };
 
@@ -45,7 +44,6 @@ pub fn status(err: anyerror) ?std.http.Status {
         error.InvalidWebSocketHandshake,
         error.InvalidWebSocketSubprotocol,
         => .bad_request,
-        error.UnsupportedWebSocketVersion => .upgrade_required,
         error.TooManyMultipartParts,
         error.TooManyMultipartHeaders,
         => .payload_too_large,

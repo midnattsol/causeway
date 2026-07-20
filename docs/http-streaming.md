@@ -94,6 +94,19 @@ Known oversized identity `Content-Length` values are rejected before dispatch. C
 
 After a chunked body reaches EOF, `context.request.body.trailers()` returns validated request trailers copied into request-owned memory. Access before complete consumption fails.
 
+### Forms and multipart
+
+`extractors.Form(T)` buffers and decodes an
+`application/x-www-form-urlencoded` body into a typed struct using the same
+scalar rules as query extraction.
+
+`extractors.Multipart(options)` claims the body stream and yields sequential
+parts. Part headers and disposition metadata are request-owned, while each part
+body is read incrementally with `Part.read`; uploaded files are not silently
+buffered. A part must reach EOF or be discarded before requesting the next one.
+Part count, per-part header count, parser buffer size, and the route/global body
+limits bound resource use.
+
 ## Response bodies
 
 `Response.body` is a uniform tagged union:
@@ -145,6 +158,13 @@ fn stream(context: *const AppContext) !causeway.http.response.Response {
 When `content_length` is omitted, Causeway uses HTTP/1.1 chunked transfer encoding. HTTP/1.0 falls back to a close-delimited stream and disables keep-alive. The producer is invoked once for the whole response, not once per chunk.
 
 A producer can advertise `Stream.Options.trailer_names` and implement `trailers()` to emit validated fields after a chunked body. Trailers are forbidden with a known content length and with HTTP/1.0.
+
+### Server-Sent Events
+
+`http.sse.response` adapts a source with `next() !?Event` to a streaming
+`text/event-stream` response. It formats multiline data, comments/heartbeats,
+IDs, event names, and retry hints, flushing after each event. SSE responses are
+excluded from automatic compression to avoid intermediary buffering.
 
 ### Producer cleanup
 

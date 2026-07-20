@@ -12,8 +12,10 @@ typed compile-time routing, extractors and middleware, buffered and streaming
 request/response bodies, keep-alive, limits, deadlines, graceful shutdown,
 cookies, sessions, CSRF, compression, ETags, request content decoding,
 request/response trailers, informational responses, Upgrade/CONNECT takeover,
-efficient file responses, multipart byte ranges, conditional requests,
-Cache-Control utilities, and real TCP integration tests.
+extension methods, request-smuggling validation, bounded unread-body draining,
+typed forms, streaming multipart uploads, SSE, WebSocket framing, efficient file
+responses, multipart byte ranges, conditional requests, Cache-Control utilities,
+and real TCP integration tests.
 
 REST, GraphQL, OpenAPI, and adapters remain separate higher-level phases.
 
@@ -33,6 +35,11 @@ zig build http1-fuzz
 zig build --fuzz http1-fuzz
 zig build test
 ```
+
+`zig build http1-fuzz` runs the finite fuzz smoke pass. The coverage-guided
+`--fuzz` mode is wired correctly, but Zig `0.17.0-dev.1413+addc3c3b8` currently
+aborts inside Maker after discovery; this is a toolchain issue rather than a
+Causeway input crash.
 
 The project uses the active ZVM master toolchain (`0.17.0-dev`).
 
