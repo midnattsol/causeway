@@ -123,6 +123,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_http2_compliance_tests = b.addRunArtifact(http2_compliance_tests);
 
+    const http3_compliance_tests = b.addTest(.{
+        .name = "HTTP3 compliance tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/http3_compliance_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_http3_compliance_tests = b.addRunArtifact(http3_compliance_tests);
+
     const http2_benchmark = b.addExecutable(.{
         .name = "http2-benchmark",
         .root_module = b.createModule(.{
@@ -177,6 +187,9 @@ pub fn build(b: *std.Build) void {
     const http2_compliance_step = b.step("http2-compliance", "Run the HTTP/2 RFC compliance matrix");
     http2_compliance_step.dependOn(&run_http2_compliance_tests.step);
 
+    const http3_compliance_step = b.step("http3-compliance", "Run the HTTP/3 RFC compliance matrix");
+    http3_compliance_step.dependOn(&run_http3_compliance_tests.step);
+
     const http2_benchmark_step = b.step("http2-bench", "Benchmark HTTP/2 frame and HPACK hot paths");
     http2_benchmark_step.dependOn(&run_http2_benchmark.step);
 
@@ -192,6 +205,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&http3_example.step);
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_http2_compliance_tests.step);
+    test_step.dependOn(&run_http3_compliance_tests.step);
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_smoke_tests.step);
 }

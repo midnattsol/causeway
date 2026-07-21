@@ -1,5 +1,7 @@
 const std = @import("std");
 const http3 = @import("http/protocol/http3/root.zig");
+const Response = @import("http/message/response.zig").Response;
+const support = @import("http/protocol/http3/connection/test_support.zig");
 
 const corpus = &.{
     "\x04\x00",
@@ -8,15 +10,28 @@ const corpus = &.{
     "\x00\x04\x01\x00\x07\x00",
     "\x3f\xbd\x01",
     "\x00\x00\xd1\xd7",
+    // Script seeds: open/feed a control stream, request stream, poll, and shutdown.
+    "\x02\x02\x03\x00\x04\x00\x07\x08\x09",
+    "\x00\x00\x05\x01\x03\x00\x00\xd1\xd7\x01\x00\x07",
 };
 
-test "fuzz HTTP/3 and QPACK wire primitives" {
+const FuzzState = struct { requests: std.atomic.Value(usize) = .init(0) };
+const FuzzDispatcher = struct {
+    pub fn dispatch(context: anytype) !Response {
+        _ = context.execution.state.requests.fetchAdd(1, .acq_rel);
+        return .{ .status = .ok, .body = .{ .bytes = "ok" } };
+    }
+};
+const FuzzSession = http3.Session(FuzzState, FuzzDispatcher, support.FakeConnection, support.small_config);
+
+test "fuzz HTTP/3 wire QPACK and complete sessions" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
     try std.testing.fuzz(threaded.io(), fuzzProtocol, .{ .corpus = corpus });
 }
 
-fn fuzzProtocol(_: std.Io, smith: *std.testing.Smith) !void {
+fn fuzzProtocol(io: std.Io, smith: *std.testing.Smith) !void {
     var storage: [4096]u8 = undefined;
     const input = storage[0..smith.slice(&storage)];
     fuzzFrames(input);
@@ -26,6 +41,73 @@ fn fuzzProtocol(_: std.Io, smith: *std.testing.Smith) !void {
     try fuzzHuffman(input);
     fuzzInstructions(input);
     fuzzFields(input);
+    fuzzConnection(io, input);
+}
+
+fn fuzzConnection(io: std.Io, input: []const u8) void {
+    var transport: support.FakeConnection = .{};
+    var state: FuzzState = .{};
+    var session = FuzzSession.init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    var cursor: usize = 0;
+    var operation: usize = 0;
+    var now: u64 = 1;
+
+    while (cursor < input.len and operation < 64) : (operation += 1) {
+        const instruction = input[cursor];
+        cursor += 1;
+        const action = instruction % 10;
+        const ordinal: u64 = (instruction / 10) % 4;
+
+        switch (action) {
+            0, 2 => {
+                if (cursor >= input.len) break;
+                const requested: usize = input[cursor] % 65;
+                cursor += 1;
+                const length = @min(requested, input.len - cursor);
+                const id = if (action == 0)
+                    support.requestId(ordinal) catch break
+                else
+                    support.clientUniId(ordinal) catch break;
+                transport.feed(id, input[cursor .. cursor + length], false) catch break;
+                cursor += length;
+            },
+            1 => {
+                const id = support.requestId(ordinal) catch break;
+                transport.feed(id, "", true) catch break;
+            },
+            3 => {
+                const id = support.clientUniId(ordinal) catch break;
+                transport.feed(id, "", true) catch break;
+            },
+            4 => {
+                const id = support.requestId(ordinal) catch break;
+                transport.receiveReset(id, instruction) catch break;
+            },
+            5 => {
+                const id = support.requestId(ordinal) catch break;
+                transport.receiveStopped(id, instruction) catch break;
+            },
+            6 => {
+                const id = support.requestId(ordinal) catch break;
+                transport.acknowledgeFinish(id) catch break;
+            },
+            7 => {},
+            8 => session.beginShutdown(now) catch break,
+            9 => session.finishShutdown(now) catch break,
+            else => unreachable,
+        }
+
+        _ = session.poll(now) catch break;
+        now +%= 1;
+    }
+
+    _ = session.poll(now) catch {};
+    session.beginShutdown(now +| 1) catch {};
+    _ = session.poll(now +| 2) catch {};
+    session.finishShutdown(now +| 3) catch {};
+    std.mem.doNotOptimizeAway(state.requests.load(.acquire));
+    std.mem.doNotOptimizeAway(transport.close_code);
 }
 
 fn fuzzFrames(input: []const u8) void {

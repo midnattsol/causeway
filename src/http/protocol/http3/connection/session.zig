@@ -138,10 +138,14 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 if (self.response) |*response| response.complete(result);
             }
 
+            fn abort(self: *RequestSlot, err: anyerror) void {
+                if (self.input) |input| input.fail(err);
+                if (self.output) |output| output.abort(err);
+                self.notifyCompletion(.{ .failure = err });
+            }
+
             fn deinit(self: *RequestSlot) void {
-                if (self.input) |input| input.fail(error.ConnectionClosed);
-                if (self.output) |output| output.abort(error.ConnectionClosed);
-                self.notifyCompletion(.{ .failure = error.ConnectionClosed });
+                self.abort(error.ConnectionClosed);
                 if (self.arena) |*arena| arena.deinit();
                 self.* = .{};
             }
@@ -175,6 +179,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         message_storage: [config.control_queue_capacity]Message = undefined,
         messages: MessageQueue = undefined,
         messages_initialized: bool = false,
+        pending_tasks: usize = 0,
 
         encoder_bytes: [config.qpack_capacity]u8 = undefined,
         encoder_entries: [config.qpack_entries]qpack.table.Entry = undefined,
@@ -202,7 +207,9 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         pub fn deinit(self: *Self) void {
+            for (&self.requests) |*slot| if (slot.occupied or slot.arena != null) slot.abort(error.ConnectionClosed);
             self.tasks.cancel(self.io);
+            self.pending_tasks = 0;
             for (&self.requests) |*slot| if (slot.occupied or slot.arena != null) slot.deinit();
             self.active = false;
         }
@@ -295,6 +302,8 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 for (buffer[0..count]) |message| switch (message) {
                     .response_ready => |slot| self.startResponse(slot) catch |err| self.failRequest(slot, .internal_error, err),
                     .task_done => |done| {
+                        std.debug.assert(self.pending_tasks != 0);
+                        self.pending_tasks -= 1;
                         done.slot.task_done = true;
                         if (done.err) |err| self.failRequest(done.slot, .internal_error, err);
                         if (!done.slot.receive_finished and !done.slot.abandoned_input) {
@@ -371,6 +380,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 return self.processUni(slot, now);
             }
             const slot = self.findRequest(id) orelse return error.UnknownRequestStream;
+            if (slot.output_done) return;
             self.processRequestBytes(slot, now) catch |err| switch (err) {
                 error.Blocked => return,
                 error.MessageError, error.BodyTooLarge => self.failRequest(slot, if (err == error.MessageError) .message_error else .excessive_load, err),
@@ -466,7 +476,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             return .{
                 .frame_type = @enumFromInt(type_value.value),
                 .length = std.math.cast(usize, length_value.value) orelse return error.FrameTooLarge,
-                .encoded = type_value.length + length_value.length,
+                .encoded = @as(usize, type_value.length) + @as(usize, length_value.length),
             };
         }
 
@@ -530,7 +540,12 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             slot.body_state = state_value;
             slot.request = try request_adapter.build(head, .init(state_value));
             slot.dispatched = true;
-            self.tasks.async(self.io, dispatchTask, .{ self, slot });
+            self.pending_tasks += 1;
+            self.tasks.concurrent(self.io, dispatchTask, .{ self, slot }) catch |err| {
+                self.pending_tasks -= 1;
+                slot.dispatched = false;
+                return err;
+            };
         }
 
         fn receiveFinished(self: *Self, id: StreamId, now: u64) !void {
@@ -556,7 +571,10 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 return error.Truncated;
             }
             if (slot.frame_len != 0) return error.Truncated;
-            try slot.state.closed();
+            slot.state.closed() catch |err| {
+                self.failRequest(slot, if (err == error.RequestIncomplete) .request_incomplete else .message_error, err);
+                return;
+            };
             try self.ensureRequest(slot, false);
             if (slot.content_length) |expected| if (slot.received_body != expected) {
                 self.failRequest(slot, .message_error, error.ContentLengthMismatch);
@@ -937,11 +955,12 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         fn retryRequests(self: *Self, now: u64) !void {
             for (&self.requests) |*slot| {
-                if (!slot.occupied or slot.wire == null or slot.payload_staged != 0) continue;
+                if (!slot.occupied or slot.output_done or slot.wire == null or slot.payload_staged != 0) continue;
                 self.processRequestBytes(slot, now) catch |err| switch (err) {
                     error.Blocked => continue,
                     else => return err,
                 };
+                try self.finishInputIfReady(slot);
             }
         }
 
