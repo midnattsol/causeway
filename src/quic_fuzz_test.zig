@@ -8,6 +8,7 @@ const packet_number = @import("quic/packet/number.zig");
 const packet_protection = @import("quic/packet/protection.zig");
 const retry = @import("quic/packet/retry.zig");
 const version_negotiation = @import("quic/packet/version_negotiation.zig");
+const connection_module = @import("quic/connection/root.zig");
 const congestion = @import("quic/recovery/congestion.zig");
 const loss = @import("quic/recovery/loss.zig");
 const packet_space = @import("quic/recovery/packet_space.zig");
@@ -23,7 +24,7 @@ const corpus = &.{
     "\xc2\x19\x7c\x5e\xff\x14\xe8\x8c",
 };
 
-test "fuzz QUIC wire primitives" {
+test "fuzz QUIC wire primitives and bounded server connections" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     try std.testing.fuzz(threaded.io(), fuzzQuic, .{ .corpus = corpus });
@@ -56,6 +57,7 @@ fn fuzzQuic(_: std.Io, smith: *std.testing.Smith) !void {
     _ = retry.validate(input, &.{}, &.{}, &retry_scratch) catch {};
     _ = version_negotiation.validate(input, &.{}, &.{}, 1, false) catch {};
     fuzzInitialProtection(input);
+    fuzzConnection(input);
     fuzzAckTracker(input);
     fuzzLossDetection(input);
     fuzzStreamReceive(input);
@@ -68,6 +70,66 @@ fn fuzzQuic(_: std.Io, smith: *std.testing.Smith) !void {
         const full = packet_number.reconstruct(truncated, encoded_length, largest) catch return;
         var encoded: [4]u8 = undefined;
         _ = try packet_number.encode(&encoded, full, encoded_length);
+    }
+}
+
+fn fuzzConnection(input: []const u8) void {
+    const limits: connection_module.Limits = .{
+        .crypto_receive_bytes = 512,
+        .crypto_send_bytes = 1024,
+        .crypto_ranges = 8,
+        .ack_ranges = 8,
+        .sent_packets = 16,
+        .tls_output_bytes = 2048,
+        .tls_transcript_bytes = 4096,
+        .max_datagram_size = 1200,
+        .max_streams = 4,
+        .max_closed_streams = 16,
+        .stream_receive_bytes = 256,
+        .stream_send_bytes = 256,
+        .stream_receive_ranges = 8,
+        .stream_send_ranges = 8,
+        .active_connection_ids = 2,
+        .path_events = 2,
+        .paths = 2,
+    };
+    const Connection = connection_module.Connection(limits);
+    var storage: connection_module.Storage(limits) = .{};
+    var transcript: [limits.tls_transcript_bytes]u8 = undefined;
+    const pair = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x71)) catch unreachable;
+    const credentials: quic_tls.ServerCredentials = .{ .ed25519 = .{ .chain = &.{"certificate"}, .key_pair = pair } };
+    var connection = Connection.init(&storage, .{
+        .original_destination_id = "original",
+        .client_source_id = "client",
+        .server_connection_id = "server",
+        .tls = .{
+            .credentials = &credentials,
+            .server_random = @splat(0x53),
+            .x25519 = .{ .seed = @splat(0x22) },
+            .transport_parameters = "\x04\x02\x40\x40",
+            .transcript_scratch = &transcript,
+        },
+        .now = 0,
+    }) catch return;
+
+    var cursor: usize = 0;
+    var operation: usize = 0;
+    var now: u64 = 1;
+    var datagram: [1200]u8 = undefined;
+    var output: [limits.max_datagram_size]u8 = undefined;
+    while (cursor < input.len and operation < 16) : (operation += 1) {
+        const selector = input[cursor];
+        cursor += 1;
+        const amount = @min(input.len - cursor, @as(usize, selector) + 1);
+        @memcpy(datagram[0..amount], input[cursor .. cursor + amount]);
+        cursor += amount;
+        connection.receiveDatagram(datagram[0..amount], now) catch {};
+        const built = connection.buildDatagram(&output, now) catch &.{};
+        std.mem.doNotOptimizeAway(built);
+        if (selector & 1 != 0) connection.onTimeout(now +| 1);
+        std.mem.doNotOptimizeAway(connection.state);
+        std.mem.doNotOptimizeAway(connection.close_info);
+        now +%= 2;
     }
 }
 
