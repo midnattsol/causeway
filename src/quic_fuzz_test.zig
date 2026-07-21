@@ -1,5 +1,7 @@
 const std = @import("std");
 const varint = @import("quic/varint.zig");
+const packet_header = @import("quic/packet/header.zig");
+const packet_number = @import("quic/packet/number.zig");
 
 const corpus = &.{
     "\x00",
@@ -18,8 +20,19 @@ test "fuzz QUIC wire primitives" {
 fn fuzzQuic(_: std.Io, smith: *std.testing.Smith) !void {
     var bytes: [2048]u8 = undefined;
     const input = bytes[0..smith.slice(&bytes)];
-    const decoded = varint.decode(input) catch return;
-    var encoded: [8]u8 = undefined;
-    const canonical = try varint.encode(&encoded, decoded.value);
-    try std.testing.expectEqual(decoded.value, (try varint.decode(canonical)).value);
+    if (varint.decode(input)) |decoded| {
+        var encoded: [8]u8 = undefined;
+        const canonical = try varint.encode(&encoded, decoded.value);
+        try std.testing.expectEqual(decoded.value, (try varint.decode(canonical)).value);
+    } else |_| {}
+
+    _ = packet_header.parse(input, if (input.len == 0) 0 else input[0] % 21) catch {};
+    if (input.len >= 6) {
+        const encoded_length: u3 = @intCast(input[0] % 4 + 1);
+        const truncated = try packet_number.decodeTruncated(input[1 .. 1 + encoded_length]);
+        const largest = std.mem.readInt(u32, input[2..6], .big);
+        const full = packet_number.reconstruct(truncated, encoded_length, largest) catch return;
+        var encoded: [4]u8 = undefined;
+        _ = try packet_number.encode(&encoded, full, encoded_length);
+    }
 }

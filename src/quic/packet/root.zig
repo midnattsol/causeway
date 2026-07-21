@@ -1,9 +1,9 @@
-//! QUIC transport implementation for Causeway.
+//! QUIC packet headers, packet numbers, and protection.
 
 const std = @import("std");
 
-pub const varint = @import("varint.zig");
-pub const packet = @import("packet/root.zig");
+pub const header = @import("header.zig");
+pub const number = @import("number.zig");
 
 // -----------------------------------------------------------------------------
 // Tests
