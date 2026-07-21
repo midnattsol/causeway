@@ -1,5 +1,7 @@
 const std = @import("std");
+const connection = @import("http/protocol/http2/connection.zig");
 const frame = @import("http/protocol/http2/frame.zig");
+const Response = @import("http/message/response.zig").Response;
 const frame_reader = @import("http/protocol/http2/frame_reader.zig");
 const header_semantics = @import("http/protocol/http2/header_semantics.zig");
 const hpack = @import("http/protocol/http2/hpack/codec.zig");
@@ -13,19 +15,56 @@ const corpus = &.{
     "\x00\x00\x08\x06\x00\x00\x00\x00\x0012345678",
     "\x00\x00\x04\x08\x00\x00\x00\x00\x00\x00\x00\x00\x01",
     "\x00\x00\x08\x07\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00",
+    frame.client_preface ++
+        "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++
+        "\x00\x00\x03\x01\x05\x00\x00\x00\x01\x82\x87\x84",
 };
 
-test "fuzz HTTP/2 wire and HPACK primitives" {
-    try std.testing.fuzz({}, fuzzProtocol, .{ .corpus = corpus });
+const FuzzState = struct {};
+const FuzzDispatcher = struct {
+    pub fn dispatch(_: anytype) !Response {
+        return .{ .status = .ok, .body = .{ .bytes = "ok" } };
+    }
+};
+
+test "fuzz HTTP/2 wire HPACK and complete connections" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    try std.testing.fuzz(threaded.io(), fuzzProtocol, .{ .corpus = corpus });
 }
 
-fn fuzzProtocol(_: void, smith: *std.testing.Smith) !void {
+fn fuzzProtocol(io: std.Io, smith: *std.testing.Smith) !void {
     var bytes: [4096]u8 = undefined;
     const length = smith.slice(&bytes);
     const input = bytes[0..length];
     try fuzzHpack(input);
     try fuzzHpackBlock(input);
     fuzzFrame(input);
+    fuzzConnection(io, input);
+}
+
+fn fuzzConnection(io: std.Io, input: []const u8) void {
+    var reader: std.Io.Reader = .fixed(input);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: FuzzState = .{};
+    var handler = connection.Handler(FuzzState, FuzzDispatcher).init(std.testing.allocator, &state, .{
+        .max_concurrent_streams = 8,
+        .frame_queue_slots = 2,
+        .max_header_block_size = 4096,
+        .max_header_list_size = 4096,
+        .max_header_count = 32,
+        .max_header_string_size = 2048,
+        .header_table_size = 1024,
+        .max_body_size = 4096,
+        .response_body_buffer_size = 1024,
+        .response_writer_buffer_size = 256,
+        .control_queue_capacity = 32,
+        .request_body_timeout = .fromMilliseconds(2),
+        .response_write_timeout = .fromMilliseconds(2),
+    });
+    handler.serve(&reader, &output.writer, io) catch {};
 }
 
 fn fuzzFrame(input: []const u8) void {
