@@ -32,6 +32,7 @@ pub const server = transport.server;
 pub const connection = protocol.http1.connection;
 pub const http1 = protocol.http1;
 pub const http2 = protocol.http2;
+pub const http3 = protocol.http3;
 pub const protocol_negotiation = protocol.negotiation;
 
 // -----------------------------------------------------------------------------
