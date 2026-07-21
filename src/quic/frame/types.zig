@@ -42,6 +42,11 @@ pub const Stream = struct {
 
 pub const Crypto = struct { offset: u64, data: []const u8 };
 pub const ResetStream = struct { id: u64, application_error: u64, final_size: u64 };
+pub const ResetStreamAt = struct { id: u64, application_error: u64, final_size: u64, reliable_size: u64 };
+pub const reset_stream_at_type: u64 = 0x24;
+pub const reset_stream_at_is_ack_eliciting = true;
+pub const reset_stream_at_is_congestion_controlled = true;
+pub const reset_stream_at_is_retransmittable = true;
 pub const StopSending = struct { id: u64, application_error: u64 };
 pub const StreamLimit = struct { id: u64, maximum: u64 };
 pub const StreamBlocked = struct { id: u64, limit: u64 };
@@ -65,6 +70,11 @@ pub const datagram_is_retransmittable = false;
 
 pub const PacketKind = enum { initial, zero_rtt, handshake, one_rtt };
 
+/// RESET_STREAM_AT uses the application data packet number space, including 0-RTT.
+pub fn resetStreamAtAllowedIn(kind: PacketKind) bool {
+    return kind == .zero_rtt or kind == .one_rtt;
+}
+
 pub fn isDatagramType(frame_type: u64) bool {
     return frame_type == datagram_type or frame_type == datagram_len_type;
 }
@@ -79,6 +89,7 @@ pub const Frame = union(enum) {
     ping,
     ack: Ack,
     reset_stream: ResetStream,
+    reset_stream_at: ResetStreamAt,
     stop_sending: StopSending,
     crypto: Crypto,
     new_token: []const u8,

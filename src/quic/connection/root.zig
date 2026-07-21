@@ -357,6 +357,14 @@ pub fn Connection(comptime limits: Limits) type {
         pub fn resetStream(self: *Self, id: Self.StreamId, application_error: u64) !void {
             return self.application.reset(id, application_error);
         }
+        /// Reliably delivers at least `reliable_size` prefix bytes before exposing
+        /// the reset. Requires the peer's reset_stream_at transport parameter.
+        pub fn resetStreamAt(self: *Self, id: Self.StreamId, application_error: u64, reliable_size: u64) !void {
+            return self.application.resetAt(id, application_error, reliable_size);
+        }
+        pub fn peerSupportsResetStreamAt(self: *const Self) bool {
+            return self.application.parameters_applied and self.application.peer.reset_stream_at;
+        }
         pub fn stopSending(self: *Self, id: Self.StreamId, application_error: u64) !void {
             return self.application.stopSending(id, application_error);
         }
@@ -962,6 +970,110 @@ test "application stream frames round trip through protected packets" {
         };
     }
     try std.testing.expect(found_response);
+}
+
+test "protected RESET_STREAM_AT is negotiated and enforces normative transport errors" {
+    const packet_writer = @import("../packet/writer.zig");
+    const frame = @import("../frame/root.zig");
+    const transport_parameters = @import("../crypto/transport_parameters.zig");
+    const limits: Limits = .{
+        .crypto_receive_bytes = 64,
+        .crypto_send_bytes = 64,
+        .tls_output_bytes = 128,
+        .max_streams = 2,
+        .stream_receive_bytes = 16,
+        .stream_send_bytes = 16,
+    };
+    const keys: protection.Keys = .{ .aes_128_gcm = .{ .key = @splat(0x31), .iv = @splat(0x42), .hp = @splat(0x53) } };
+    const credentials = testCredentials();
+    const local: transport_parameters.Values = .{
+        .initial_max_data = 8,
+        .initial_max_stream_data_uni = 8,
+        .initial_max_streams_uni = 1,
+        .reset_stream_at = true,
+    };
+
+    var storage: Storage(limits) = .{};
+    var transcript: [512]u8 = undefined;
+    var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+    connection.application_remote = keys;
+    connection.state = .active;
+    try connection.application.applyTransportParameters(local, .{});
+
+    var frame_storage: [32]u8 = undefined;
+    const reset_frame = try frame.writer.encode(&frame_storage, .{ .reset_stream_at = .{
+        .id = 2,
+        .application_error = 42,
+        .final_size = 8,
+        .reliable_size = 4,
+    } });
+    var packet_storage: [96]u8 = undefined;
+    const reset_packet = try packet_writer.writeOneRtt(&packet_storage, keys, .{
+        .destination_id = "server",
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = reset_frame,
+        .key_phase = false,
+    });
+    try connection.receiveDatagram(reset_packet.packet, 1);
+    try std.testing.expect(connection.close_info == null);
+    try std.testing.expectEqual(@as(u64, 2), connection.acceptStream().?.value);
+
+    var unsupported_storage: Storage(limits) = .{};
+    var unsupported_transcript: [512]u8 = undefined;
+    var unsupported = try Connection(limits).init(&unsupported_storage, testInit(&credentials, &unsupported_transcript));
+    unsupported.application_remote = keys;
+    unsupported.state = .active;
+    var disabled_local = local;
+    disabled_local.reset_stream_at = false;
+    try unsupported.application.applyTransportParameters(disabled_local, .{});
+    const unsupported_packet = try packet_writer.writeOneRtt(&packet_storage, keys, .{
+        .destination_id = "server",
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = reset_frame,
+        .key_phase = false,
+    });
+    try std.testing.expectError(error.ProtocolViolation, unsupported.receiveDatagram(unsupported_packet.packet, 1));
+    try std.testing.expectEqual(CloseCode.protocol_violation, unsupported.close_info.?.code);
+
+    var malformed_storage: Storage(limits) = .{};
+    var malformed_transcript: [512]u8 = undefined;
+    var malformed = try Connection(limits).init(&malformed_storage, testInit(&credentials, &malformed_transcript));
+    malformed.application_remote = keys;
+    malformed.state = .active;
+    try malformed.application.applyTransportParameters(local, .{});
+    const malformed_packet = try packet_writer.writeOneRtt(&packet_storage, keys, .{
+        .destination_id = "server",
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = "\x24\x02\x2a\x03\x04",
+        .key_phase = false,
+    });
+    try std.testing.expectError(error.FrameEncodingError, malformed.receiveDatagram(malformed_packet.packet, 1));
+    try std.testing.expectEqual(CloseCode.frame_encoding_error, malformed.close_info.?.code);
+
+    var flow_storage: Storage(limits) = .{};
+    var flow_transcript: [512]u8 = undefined;
+    var flow = try Connection(limits).init(&flow_storage, testInit(&credentials, &flow_transcript));
+    flow.application_remote = keys;
+    flow.state = .active;
+    try flow.application.applyTransportParameters(local, .{});
+    const flow_frame = try frame.writer.encode(&frame_storage, .{ .reset_stream_at = .{
+        .id = 2,
+        .application_error = 42,
+        .final_size = 9,
+        .reliable_size = 4,
+    } });
+    const flow_packet = try packet_writer.writeOneRtt(&packet_storage, keys, .{
+        .destination_id = "server",
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = flow_frame,
+        .key_phase = false,
+    });
+    try std.testing.expectError(error.FlowControlError, flow.receiveDatagram(flow_packet.packet, 1));
+    try std.testing.expectEqual(CloseCode.flow_control_error, flow.close_info.?.code);
 }
 
 test "application receive promotes only valid peer phase and accepts reordered previous phase" {

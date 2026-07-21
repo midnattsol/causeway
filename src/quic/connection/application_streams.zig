@@ -24,6 +24,7 @@ pub const Control = union(enum) {
     max_streams_bidi: u64,
     max_streams_uni: u64,
     reset_stream: struct { id: stream.Id, application_error: u64, final_size: u64 },
+    reset_stream_at: struct { id: stream.Id, application_error: u64, final_size: u64, reliable_size: u64 },
     stop_sending: struct { id: stream.Id, application_error: u64 },
 };
 
@@ -65,6 +66,8 @@ pub fn Application(
             occupied: bool = false,
             id: stream.Id = .{ .value = 0 },
             final_size: u64 = 0,
+            reset_error: ?u64 = null,
+            reliable_size: ?u64 = null,
         };
 
         const Slot = struct {
@@ -85,6 +88,7 @@ pub fn Application(
             receive_finished_notified: bool = false,
             send_finished_notified: bool = false,
             reset_event: bool = false,
+            reset_notified: bool = false,
             stopped_event: bool = false,
         };
 
@@ -193,6 +197,7 @@ pub fn Application(
                 }
                 if (slot.reset_event) {
                     slot.reset_event = false;
+                    slot.reset_notified = true;
                     return .{ .reset = .{ .id = slot.id, .application_error = slot.receiver.?.reset_error.? } };
                 }
                 if (slot.stopped_event) {
@@ -269,6 +274,15 @@ pub fn Application(
             slot.reset_pending = true;
         }
 
+        pub fn resetAt(self: *Self, id: stream.Id, application_error: u64, reliable_size: u64) !void {
+            try self.requireParameters();
+            if (!self.peer.reset_stream_at) return error.ResetStreamAtNotNegotiated;
+            const slot = self.find(id) orelse return error.StreamNotFound;
+            var sender = &(slot.sender orelse return error.StreamNotSendable);
+            _ = try sender.resetAt(application_error, reliable_size);
+            slot.reset_pending = true;
+        }
+
         pub fn stopSending(self: *Self, id: stream.Id, application_error: u64) !void {
             if (application_error > stream.id.maximum) return error.InvalidApplicationError;
             const slot = self.find(id) orelse return error.StreamNotFound;
@@ -298,9 +312,37 @@ pub fn Application(
                 try self.resetInto(slot, value);
                 return;
             }
-            if (self.findClosedReceive(id)) |closed| return validateClosedReset(closed, value);
+            if (self.findClosedReceiveMut(id)) |closed| {
+                try validateClosedReset(closed.*, value, self.local.reset_stream_at);
+                closed.reset_error = value.application_error;
+                closed.reliable_size = null;
+                return;
+            }
             const slot = try self.incoming(id);
             try self.resetInto(slot, value);
+        }
+
+        pub fn onResetStreamAt(self: *Self, value: frame.ResetStreamAt) !void {
+            try self.requireParameters();
+            if (!self.local.reset_stream_at) return error.ProtocolViolation;
+            const id = try stream.Id.init(value.id);
+            if (!id.canReceive(.server)) return error.StreamStateError;
+            if (self.find(id)) |slot| {
+                try self.resetAtInto(slot, value);
+                return;
+            }
+            if (self.findClosedReceiveMut(id)) |closed| {
+                try validateClosedResetAt(closed.*, value);
+                if (closed.reset_error == null) {
+                    closed.reset_error = value.application_error;
+                    closed.reliable_size = value.reliable_size;
+                } else if (closed.reliable_size) |current| {
+                    closed.reliable_size = @min(current, value.reliable_size);
+                }
+                return;
+            }
+            const slot = try self.incoming(id);
+            try self.resetAtInto(slot, value);
         }
 
         pub fn onStopSending(self: *Self, value: frame.StopSending) !void {
@@ -313,8 +355,10 @@ pub fn Application(
             };
             var sender = &(slot.sender orelse return error.StreamStateError);
             if (sender.state == .data_received or sender.state == .reset_received) return;
-            _ = try sender.onStopSending(value.application_error);
-            slot.reset_pending = true;
+            if (sender.reset_error == null) {
+                _ = try sender.onStopSending(value.application_error);
+                slot.reset_pending = true;
+            }
             slot.stop_error = value.application_error;
             slot.stopped_event = true;
         }
@@ -373,9 +417,13 @@ pub fn Application(
                 if (!slot.occupied) continue;
                 if (slot.reset_pending or slot.stop_pending) return true;
                 if (slot.receiver != null and slot.receive_flow.?.pending_max_stream_data != null) return true;
-                if (slot.sender != null and (slot.send_flow.?.blocked_pending or slot.sender.?.lost.count != 0 or
-                    slot.sender.?.fin_lost or slot.sender.?.sent_offset < slot.sender.?.write_offset or
-                    (slot.sender.?.final_size != null and !slot.sender.?.fin_sent))) return true;
+                if (slot.sender) |sender| {
+                    if (slot.send_flow.?.blocked_pending) return true;
+                    if (sender.state == .reset_sent or sender.state == .reset_received or sender.state == .data_received) continue;
+                    const transmission_end = if (sender.reliable_reset) sender.reliable_size.? else sender.write_offset;
+                    if (sender.lost.count != 0 or sender.fin_lost or sender.sent_offset < transmission_end or
+                        (!sender.reliable_reset and sender.final_size != null and !sender.fin_sent)) return true;
+                }
             }
             return false;
         }
@@ -387,12 +435,15 @@ pub fn Application(
             if (!self.parameters_applied) return true;
             for (self.slots) |slot| {
                 if (!slot.occupied or slot.sender == null) continue;
+                if (slot.reset_pending) return false;
                 const sender = slot.sender.?;
+                if (sender.state == .reset_sent or sender.state == .reset_received or sender.state == .data_received) continue;
                 if (sender.lost.count != 0 or sender.fin_lost) return false;
-                if (sender.sent_offset < sender.write_offset and
+                const transmission_end = if (sender.reliable_reset) sender.reliable_size.? else sender.write_offset;
+                if (sender.sent_offset < transmission_end and
                     sender.sent_offset < slot.send_flow.?.maximum_stream_data and
                     self.send_connection.allowance() != 0) return false;
-                if (sender.final_size != null and !sender.fin_sent and
+                if (!sender.reliable_reset and sender.final_size != null and !sender.fin_sent and
                     sender.sent_offset <= slot.send_flow.?.maximum_stream_data) return false;
             }
             return true;
@@ -422,7 +473,25 @@ pub fn Application(
             if (self.max_streams_uni_pending) |maximum|
                 return .{ .value = .{ .max_streams_uni = maximum }, .item = .{ .control = .{ .max_streams_uni = maximum } } };
             for (&self.slots) |*slot| if (slot.occupied and slot.reset_pending) {
-                const sender = slot.sender.?;
+                const sender = &slot.sender.?;
+                _ = slot.send_flow.?.commit(sender.final_size.?, &self.send_connection) catch |err| switch (err) {
+                    error.StreamFlowControlBlocked, error.ConnectionFlowControlBlocked => continue,
+                    else => return err,
+                };
+                if (sender.reliable_reset) {
+                    const value = frame.ResetStreamAt{
+                        .id = slot.id.value,
+                        .application_error = sender.reset_error.?,
+                        .final_size = sender.final_size.?,
+                        .reliable_size = sender.reliable_size.?,
+                    };
+                    return .{ .value = .{ .reset_stream_at = value }, .item = .{ .control = .{ .reset_stream_at = .{
+                        .id = slot.id,
+                        .application_error = value.application_error,
+                        .final_size = value.final_size,
+                        .reliable_size = value.reliable_size,
+                    } } } };
+                }
                 return .{ .value = .{ .reset_stream = .{ .id = slot.id.value, .application_error = sender.reset_error.?, .final_size = sender.final_size.? } }, .item = .{ .control = .{ .reset_stream = .{ .id = slot.id, .application_error = sender.reset_error.?, .final_size = sender.final_size.? } } } };
             };
             for (&self.slots) |*slot| if (slot.occupied and slot.stop_pending)
@@ -459,7 +528,16 @@ pub fn Application(
                         self.max_streams_uni_pending = null;
                     },
                     .reset_stream => |value| {
-                        if (self.find(value.id)) |slot| slot.reset_pending = false;
+                        if (self.find(value.id)) |slot| {
+                            if (!slot.sender.?.reliable_reset) slot.reset_pending = false;
+                        }
+                    },
+                    .reset_stream_at => |value| {
+                        if (self.find(value.id)) |slot| {
+                            const sender = slot.sender.?;
+                            if (sender.reliable_reset and sender.reliable_size.? == value.reliable_size)
+                                slot.reset_pending = false;
+                        }
                     },
                     .stop_sending => |value| {
                         if (self.find(value.id)) |slot| slot.stop_pending = false;
@@ -480,6 +558,12 @@ pub fn Application(
                     .reset_stream => |value| if (self.find(value.id)) |slot| {
                         if (slot.sender.?.state == .reset_sent) try slot.sender.?.onResetAcknowledged();
                         if (slot.sender.?.state == .reset_received) self.queueSendFinished(slot);
+                    },
+                    .reset_stream_at => |value| if (self.find(value.id)) |slot| {
+                        const current = slot.sender.?.reliable_reset and slot.sender.?.reliable_size.? == value.reliable_size;
+                        try slot.sender.?.onResetAtAcknowledged(value.reliable_size);
+                        if (current) slot.reset_pending = false;
+                        if (slot.sender.?.state == .data_received) self.queueSendFinished(slot);
                     },
                     else => {},
                 },
@@ -523,6 +607,11 @@ pub fn Application(
                     .reset_stream => |value| if (self.find(value.id)) |slot| if (slot.sender.?.state == .reset_sent) {
                         slot.reset_pending = true;
                     },
+                    .reset_stream_at => |value| if (self.find(value.id)) |slot| {
+                        const sender = slot.sender.?;
+                        if (sender.reliable_reset and sender.state != .data_received and sender.reliable_size.? == value.reliable_size)
+                            slot.reset_pending = true;
+                    },
                     .stop_sending => |value| {
                         if (self.find(value.id)) |slot| slot.stop_pending = true;
                     },
@@ -546,8 +635,11 @@ pub fn Application(
                 if (!slot.occupied or slot.sender == null) continue;
                 var sender = &slot.sender.?;
                 var send_flow = &slot.send_flow.?;
-                const tx = (try sender.nextTransmission(maximum_data_length, send_flow.maximum_stream_data, self.send_connection.allowance())) orelse {
-                    if (sender.sent_offset < sender.write_offset) {
+                const reserved = send_flow.highest_sent -| sender.sent_offset;
+                const allowance = reserved +| self.send_connection.allowance();
+                const tx = (try sender.nextTransmission(maximum_data_length, send_flow.maximum_stream_data, allowance)) orelse {
+                    const transmission_end = if (sender.reliable_reset) sender.reliable_size.? else sender.write_offset;
+                    if (sender.sent_offset < transmission_end) {
                         if (sender.sent_offset >= send_flow.maximum_stream_data) send_flow.markBlocked();
                         if (self.send_connection.allowance() == 0) self.send_connection.markBlocked();
                     }
@@ -631,7 +723,8 @@ pub fn Application(
             _ = try receive_flow.accountHighest(receiver.highest_received, &self.receive_connection);
             if (value.fin) self.rememberClosedReceive(slot.id, receiver.final_size.?);
             if (result.became_readable) slot.readable_event = true;
-            if (result.complete and receiver.readable().len == 0) {
+            if (result.complete and receiver.reset_error != null) self.queueReset(slot);
+            if (result.complete and receiver.reset_error == null and receiver.readable().len == 0) {
                 try receiver.consume(0);
                 self.queueReceiveFinished(slot);
             }
@@ -643,12 +736,31 @@ pub fn Application(
             try self.ensureClosedReceiveCapacity(slot.id);
             const was_terminal = receiver.isFinished();
             const was_reset = receiver.state == .reset_received or receiver.state == .reset_read;
+            if (self.local.reset_stream_at) if (receiver.reset_error) |known| {
+                if (known != value.application_error) return error.StreamStateError;
+            };
             const result = try receiver.receiveReset(value.application_error, value.final_size);
             _ = try receive_flow.accountHighest(result.final_size, &self.receive_connection);
             const discarded = receive_flow.highest_received - receive_flow.consumed;
             if (discarded != 0) try receive_flow.consume(discarded, &self.receive_connection);
-            self.rememberClosedReceive(slot.id, result.final_size);
-            if (!was_terminal and !was_reset and receiver.state == .reset_received) slot.reset_event = true;
+            self.rememberClosedReset(slot.id, result.final_size, value.application_error, receiver.reliable_size);
+            if (!was_terminal and !was_reset and receiver.state == .reset_received) self.queueReset(slot);
+        }
+
+        fn resetAtInto(self: *Self, slot: *Slot, value: frame.ResetStreamAt) !void {
+            var receiver = &(slot.receiver orelse return error.StreamStateError);
+            var receive_flow = &(slot.receive_flow orelse return error.StreamStateError);
+            try self.ensureClosedReceiveCapacity(slot.id);
+            const result = try receiver.receiveResetAt(value.application_error, value.final_size, value.reliable_size);
+            _ = try receive_flow.accountHighest(result.final_size, &self.receive_connection);
+            self.rememberClosedReset(slot.id, result.final_size, value.application_error, receiver.reliable_size);
+            if (receiver.state == .data_received) self.queueReset(slot);
+            if (receiver.readable().len != 0) slot.readable_event = true;
+        }
+
+        fn queueReset(self: *Self, slot: *Slot) void {
+            _ = self;
+            if (!slot.reset_notified and !slot.reset_event) slot.reset_event = true;
         }
 
         fn queueReceiveFinished(self: *Self, slot: *Slot) void {
@@ -727,8 +839,27 @@ pub fn Application(
             unreachable;
         }
 
+        fn rememberClosedReset(self: *Self, id: stream.Id, final_size: u64, application_error: u64, reliable_size: ?u64) void {
+            self.rememberClosedReceive(id, final_size);
+            for (&self.closed_receives) |*closed| if (closed.occupied and closed.id.value == id.value) {
+                closed.reset_error = application_error;
+                if (reliable_size) |new_size| {
+                    closed.reliable_size = if (closed.reliable_size) |current| @min(current, new_size) else new_size;
+                } else {
+                    closed.reliable_size = null;
+                }
+                return;
+            };
+            unreachable;
+        }
+
         fn findClosedReceive(self: *const Self, id: stream.Id) ?ClosedReceive {
             for (self.closed_receives) |closed| if (closed.occupied and closed.id.value == id.value) return closed;
+            return null;
+        }
+
+        fn findClosedReceiveMut(self: *Self, id: stream.Id) ?*ClosedReceive {
+            for (&self.closed_receives) |*closed| if (closed.occupied and closed.id.value == id.value) return closed;
             return null;
         }
 
@@ -751,9 +882,18 @@ pub fn Application(
                 return error.FinalSizeError;
         }
 
-        fn validateClosedReset(closed: ClosedReceive, value: frame.ResetStream) !void {
+        fn validateClosedReset(closed: ClosedReceive, value: frame.ResetStream, enforce_error: bool) !void {
             if (value.application_error > stream.id.maximum) return error.InvalidApplicationError;
             if (value.final_size != closed.final_size) return error.FinalSizeError;
+            if (enforce_error or closed.reliable_size != null) if (closed.reset_error) |known| {
+                if (known != value.application_error) return error.StreamStateError;
+            };
+        }
+
+        fn validateClosedResetAt(closed: ClosedReceive, value: frame.ResetStreamAt) !void {
+            if (value.reliable_size > value.final_size) return error.FrameEncodingError;
+            if (value.final_size != closed.final_size) return error.FinalSizeError;
+            if (closed.reset_error) |known| if (known != value.application_error) return error.StreamStateError;
         }
 
         fn receiveMaximum(self: Self, id: stream.Id) u64 {
@@ -1203,6 +1343,161 @@ test "application fails closed when final-size history is exhausted" {
     _ = application.nextEvent();
     const second = try stream.Id.init(6);
     try std.testing.expectError(error.ClosedStreamCapacityExceeded, application.onStream(.{ .id = second.value, .offset = 0, .data = "", .fin = true }));
+}
+
+test "application RESET_STREAM_AT reserves final-size credit and survives loss" {
+    const A = TestApplication(2, 16);
+    var receive_bytes: [2][16]u8 = undefined;
+    var receive_ranges: [2][8]stream.range_set.Range = undefined;
+    var send_bytes: [2][16]u8 = undefined;
+    var ack_ranges: [2][8]stream.range_set.Range = undefined;
+    var lost_ranges: [2][8]stream.range_set.Range = undefined;
+    var application = A.init(&receive_bytes, &receive_ranges, &send_bytes, &ack_ranges, &lost_ranges);
+    var local = testLocal();
+    local.initial_max_streams_bidi = 0;
+    local.initial_max_streams_uni = 0;
+    var peer = testPeer();
+    peer.reset_stream_at = true;
+    peer.initial_max_data = 8;
+    peer.initial_max_stream_data_uni = 8;
+    try application.applyTransportParameters(local, peer);
+
+    const id = try application.open(.unidirectional);
+    _ = try application.write(id, "abcdefgh");
+    try application.resetAt(id, 42, 4);
+    const reset = (try application.prepare(16)).?;
+    try std.testing.expectEqual(frame.ResetStreamAt{ .id = id.value, .application_error = 42, .final_size = 8, .reliable_size = 4 }, reset.value.reset_stream_at);
+    application.onPacketSent(reset.item);
+    try application.onLost(reset.item);
+    const reset_retry = (try application.prepare(16)).?;
+    try std.testing.expectEqual(@as(u64, 4), reset_retry.value.reset_stream_at.reliable_size);
+    application.onPacketSent(reset_retry.item);
+
+    const data = (try application.prepare(16)).?;
+    try std.testing.expectEqualStrings("abcd", data.value.stream.data);
+    try std.testing.expectEqual(@as(u64, 8), application.send_connection.committed);
+    application.onPacketSent(data.item);
+    try application.onAcknowledged(data.item);
+    try std.testing.expectEqual(stream.send.State.data_sent, application.find(id).?.sender.?.state);
+    try application.onAcknowledged(reset_retry.item);
+    try std.testing.expectEqual(stream.send.State.data_received, application.find(id).?.sender.?.state);
+    try std.testing.expect(!application.hasPending());
+    try std.testing.expectEqual(Event{ .send_finished = id }, application.nextEvent().?);
+}
+
+test "late RESET_STREAM_AT acknowledgment cancels a queued retransmission" {
+    const A = TestApplication(1, 16);
+    var receive_bytes: [1][16]u8 = undefined;
+    var receive_ranges: [1][8]stream.range_set.Range = undefined;
+    var send_bytes: [1][16]u8 = undefined;
+    var ack_ranges: [1][8]stream.range_set.Range = undefined;
+    var lost_ranges: [1][8]stream.range_set.Range = undefined;
+    var application = A.init(&receive_bytes, &receive_ranges, &send_bytes, &ack_ranges, &lost_ranges);
+    var local = testLocal();
+    local.initial_max_streams_bidi = 0;
+    local.initial_max_streams_uni = 0;
+    var peer = testPeer();
+    peer.initial_max_streams_uni = 1;
+    peer.initial_max_stream_data_uni = 4;
+    peer.initial_max_data = 4;
+    peer.reset_stream_at = true;
+    try application.applyTransportParameters(local, peer);
+
+    const id = try application.open(.unidirectional);
+    _ = try application.write(id, "head");
+    try application.resetAt(id, 7, 4);
+    const reset = (try application.prepare(16)).?;
+    application.onPacketSent(reset.item);
+    try application.onLost(reset.item);
+    try application.onAcknowledged(reset.item);
+    const next = (try application.prepare(16)).?;
+    try std.testing.expect(next.value == .stream);
+}
+
+test "closed stream tombstones preserve reliable reset invariants" {
+    const A = TestApplication(1, 8);
+    var receive_bytes: [1][8]u8 = undefined;
+    var receive_ranges: [1][8]stream.range_set.Range = undefined;
+    var send_bytes: [1][8]u8 = undefined;
+    var ack_ranges: [1][8]stream.range_set.Range = undefined;
+    var lost_ranges: [1][8]stream.range_set.Range = undefined;
+    var application = A.init(&receive_bytes, &receive_ranges, &send_bytes, &ack_ranges, &lost_ranges);
+    var local = testLocal();
+    local.initial_max_streams_bidi = 0;
+    local.initial_max_streams_uni = 1;
+    local.reset_stream_at = true;
+    try application.applyTransportParameters(local, testPeer());
+
+    const id = try stream.Id.init(2);
+    try application.onStream(.{ .id = id.value, .offset = 0, .data = "", .fin = true });
+    _ = application.accept();
+    try std.testing.expectEqual(Event{ .receive_finished = id }, application.nextEvent().?);
+    try std.testing.expect(application.find(id) == null);
+
+    try application.onResetStreamAt(.{ .id = id.value, .application_error = 7, .final_size = 0, .reliable_size = 0 });
+    try std.testing.expectError(error.StreamStateError, application.onResetStreamAt(.{ .id = id.value, .application_error = 8, .final_size = 0, .reliable_size = 0 }));
+    try std.testing.expectError(error.StreamStateError, application.onResetStream(.{ .id = id.value, .application_error = 8, .final_size = 0 }));
+}
+
+test "application receives RESET_STREAM_AT only when negotiated and after its prefix" {
+    const A = TestApplication(2, 16);
+    var receive_bytes: [2][16]u8 = undefined;
+    var receive_ranges: [2][8]stream.range_set.Range = undefined;
+    var send_bytes: [2][16]u8 = undefined;
+    var ack_ranges: [2][8]stream.range_set.Range = undefined;
+    var lost_ranges: [2][8]stream.range_set.Range = undefined;
+    var application = A.init(&receive_bytes, &receive_ranges, &send_bytes, &ack_ranges, &lost_ranges);
+    var local = testLocal();
+    local.initial_max_streams_bidi = 0;
+    local.initial_max_streams_uni = 1;
+    local.reset_stream_at = true;
+    try application.applyTransportParameters(local, testPeer());
+
+    const id = try stream.Id.init(2);
+    try application.onResetStreamAt(.{ .id = id.value, .application_error = 42, .final_size = 8, .reliable_size = 4 });
+    _ = application.accept();
+    try std.testing.expect(application.nextEvent() == null);
+    try application.onStream(.{ .id = id.value, .offset = 0, .data = "abcd", .fin = false });
+    try std.testing.expectEqual(Event{ .readable = id }, application.nextEvent().?);
+    try std.testing.expectEqual(Event{ .reset = .{ .id = id, .application_error = 42 } }, application.nextEvent().?);
+    try std.testing.expectError(error.ReliableDataPending, application.readReset(id));
+    try application.consume(id, 4);
+    try std.testing.expectEqual(@as(u64, 42), try application.readReset(id));
+    try std.testing.expectEqual(@as(u64, 8), application.receive_connection.consumed);
+    try std.testing.expectEqual(Event{ .receive_finished = id }, application.nextEvent().?);
+
+    var disabled = A.init(&receive_bytes, &receive_ranges, &send_bytes, &ack_ranges, &lost_ranges);
+    var disabled_local = testLocal();
+    disabled_local.initial_max_streams_bidi = 0;
+    disabled_local.initial_max_streams_uni = 1;
+    try disabled.applyTransportParameters(disabled_local, testPeer());
+    try std.testing.expectError(error.ProtocolViolation, disabled.onResetStreamAt(.{ .id = 2, .application_error = 1, .final_size = 1, .reliable_size = 1 }));
+}
+
+test "STOP_SENDING after RESET_STREAM_AT preserves the committed reset fields" {
+    const A = TestApplication(1, 16);
+    var receive_bytes: [1][16]u8 = undefined;
+    var receive_ranges: [1][8]stream.range_set.Range = undefined;
+    var send_bytes: [1][16]u8 = undefined;
+    var ack_ranges: [1][8]stream.range_set.Range = undefined;
+    var lost_ranges: [1][8]stream.range_set.Range = undefined;
+    var application = A.init(&receive_bytes, &receive_ranges, &send_bytes, &ack_ranges, &lost_ranges);
+    var local = testLocal();
+    local.initial_max_streams_bidi = 0;
+    local.initial_max_streams_uni = 0;
+    var peer = testPeer();
+    peer.initial_max_streams_bidi = 1;
+    peer.reset_stream_at = true;
+    try application.applyTransportParameters(local, peer);
+
+    const id = try application.open(.bidirectional);
+    _ = try application.write(id, "header");
+    try application.resetAt(id, 7, 3);
+    try application.onStopSending(.{ .id = id.value, .application_error = 99 });
+    const sender = application.find(id).?.sender.?;
+    try std.testing.expect(sender.reliable_reset);
+    try std.testing.expectEqual(@as(?u64, 7), sender.reset_error);
+    try std.testing.expectEqual(@as(?u64, 3), sender.reliable_size);
 }
 
 test "application stream send ACK loss retransmission and lifecycle" {

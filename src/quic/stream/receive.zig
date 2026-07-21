@@ -15,7 +15,7 @@ pub const ReceiveResult = struct {
 };
 
 pub const ResetResult = struct {
-    /// Increase from the prior highest received offset to RESET_STREAM Final Size.
+    /// Increase from the prior highest received offset to the reset Final Size.
     newly_accounted: u64,
     final_size: u64,
 };
@@ -31,6 +31,8 @@ pub const Receiver = struct {
     max_stream_data: u64,
     state: State = .recv,
     reset_error: ?u64 = null,
+    /// Null for FIN and RESET_STREAM; non-null for RESET_STREAM_AT, including zero.
+    reliable_size: ?u64 = null,
 
     pub fn init(storage: []u8, range_storage: []ranges.Range, initial_max_stream_data: u64) !Receiver {
         if (initial_max_stream_data > id.maximum) return error.InvalidFlowControlLimit;
@@ -71,6 +73,14 @@ pub const Receiver = struct {
             const discarded: usize = @intCast(discarded_u64);
             insert_offset += discarded;
             insert_data = insert_data[discarded..];
+        }
+        if (self.reliable_size) |reliable| {
+            if (insert_offset >= reliable) {
+                insert_data = insert_data[0..0];
+            } else {
+                const retained: usize = @intCast(@min(@as(u64, @intCast(insert_data.len)), reliable - insert_offset));
+                insert_data = insert_data[0..retained];
+            }
         }
 
         var duplicate = insert_data.len == 0;
@@ -114,23 +124,62 @@ pub const Receiver = struct {
         if (application_error > id.maximum) return error.InvalidApplicationError;
         if (reset_final_size > id.maximum) return error.FinalSizeError;
         if (self.final_size) |known| if (known != reset_final_size) return error.FinalSizeError;
-        if (reset_final_size < self.highest_received) return error.FinalSizeError;
+        if (self.reliable_size != null) if (self.reset_error) |known| if (known != application_error) return error.StreamStateError;
+        if (reset_final_size < self.highest_received and self.final_size == null) return error.FinalSizeError;
         if (reset_final_size > self.max_stream_data) return error.FlowControlError;
-        if (self.state == .reset_received or self.state == .reset_read or self.state == .data_read) {
-            return .{ .newly_accounted = 0, .final_size = reset_final_size };
-        }
 
         const previous_highest = self.highest_received;
-        self.highest_received = reset_final_size;
+        self.highest_received = @max(self.highest_received, reset_final_size);
         self.final_size = reset_final_size;
         self.reset_error = application_error;
+        if (self.reliable_size != null) self.reliable_size = 0;
         self.received.clear();
         self.state = .reset_received;
-        return .{ .newly_accounted = reset_final_size - previous_highest, .final_size = reset_final_size };
+        return .{ .newly_accounted = reset_final_size -| previous_highest, .final_size = reset_final_size };
+    }
+
+    pub fn receiveResetAt(
+        self: *Receiver,
+        application_error: u64,
+        reset_final_size: u64,
+        new_reliable_size: u64,
+    ) !ResetResult {
+        if (application_error > id.maximum) return error.InvalidApplicationError;
+        if (reset_final_size > id.maximum) return error.FinalSizeError;
+        if (new_reliable_size > reset_final_size) return error.FrameEncodingError;
+        if (self.final_size) |known| if (known != reset_final_size) return error.FinalSizeError;
+        if (self.reset_error) |known| if (known != application_error) return error.StreamStateError;
+        if (reset_final_size < self.highest_received and self.final_size == null) return error.FinalSizeError;
+        if (reset_final_size > self.max_stream_data) return error.FlowControlError;
+
+        const previous_highest = self.highest_received;
+        self.highest_received = @max(self.highest_received, reset_final_size);
+        self.final_size = reset_final_size;
+        // RESET_STREAM is equivalent to Reliable Size 0. A reordered
+        // RESET_STREAM_AT can therefore only increase the size and is ignored.
+        if (self.reset_error != null and self.reliable_size == null) {
+            return .{ .newly_accounted = reset_final_size -| previous_highest, .final_size = reset_final_size };
+        }
+        self.reset_error = application_error;
+        if (self.reliable_size) |current| {
+            if (new_reliable_size > current) {
+                return .{ .newly_accounted = reset_final_size -| previous_highest, .final_size = reset_final_size };
+            }
+        }
+        self.reliable_size = new_reliable_size;
+        try self.received.remove(.{ .start = new_reliable_size, .end = id.maximum + 1 });
+        self.refreshState();
+        return .{ .newly_accounted = reset_final_size -| previous_highest, .final_size = reset_final_size };
     }
 
     pub fn readReset(self: *Receiver) !u64 {
         if (self.state == .reset_read) return self.reset_error.?;
+        if (self.reliable_size) |reliable| {
+            if (self.read_offset < reliable) return error.ReliableDataPending;
+            if (self.reset_error == null) return error.ResetNotReceived;
+            self.state = .reset_read;
+            return self.reset_error.?;
+        }
         if (self.state != .reset_received) return error.ResetNotReceived;
         self.state = .reset_read;
         return self.reset_error.?;
@@ -171,14 +220,17 @@ pub const Receiver = struct {
         if (self.received.count == 0) return 0;
         const first = self.received.items()[0];
         if (first.start != self.read_offset) return 0;
-        return @intCast(@min(first.end - self.read_offset, self.storage.len));
+        const available_end = if (self.reliable_size) |reliable| @min(first.end, reliable) else first.end;
+        if (available_end <= self.read_offset) return 0;
+        return @intCast(@min(available_end - self.read_offset, self.storage.len));
     }
 
     fn refreshState(self: *Receiver) void {
         if (self.state == .reset_received or self.state == .reset_read or self.state == .data_read) return;
         if (self.final_size) |final| {
-            const complete = final == self.read_offset or
-                (self.received.count != 0 and self.received.items()[0].start == self.read_offset and self.received.items()[0].end >= final);
+            const target = self.reliable_size orelse final;
+            const complete = target <= self.read_offset or
+                (self.received.count != 0 and self.received.items()[0].start == self.read_offset and self.received.items()[0].end >= target);
             self.state = if (complete) .data_received else .size_known;
         } else {
             self.state = .recv;
@@ -234,6 +286,60 @@ test "receiver RESET validates and accounts final size" {
     try std.testing.expectEqual(State.reset_received, receiver.state);
     try std.testing.expectEqual(@as(u64, 42), try receiver.readReset());
     try std.testing.expectEqual(State.reset_read, receiver.state);
+}
+
+test "receiver RESET_STREAM_AT waits for and exposes only the reliable prefix" {
+    var bytes: [16]u8 = undefined;
+    var range_storage: [8]ranges.Range = undefined;
+    var receiver = try Receiver.init(&bytes, &range_storage, 16);
+    _ = try receiver.receive(0, "ab", false);
+    _ = try receiver.receiveResetAt(42, 8, 4);
+    try std.testing.expectEqual(State.size_known, receiver.state);
+    try std.testing.expectError(error.ReliableDataPending, receiver.readReset());
+    _ = try receiver.receive(2, "cdef", false);
+    try std.testing.expectEqualStrings("abcd", receiver.readable());
+    try std.testing.expectEqual(State.data_received, receiver.state);
+    try receiver.consume(4);
+    try std.testing.expectEqual(@as(u64, 42), try receiver.readReset());
+    try std.testing.expectEqual(State.reset_read, receiver.state);
+}
+
+test "receiver discards reordered bytes beyond the reliable reset prefix" {
+    var bytes: [4]u8 = undefined;
+    var range_storage: [4]ranges.Range = undefined;
+    var receiver = try Receiver.init(&bytes, &range_storage, 64);
+    _ = try receiver.receiveResetAt(7, 64, 4);
+    _ = try receiver.receive(32, "outside", false);
+    _ = try receiver.receive(2, "cdefgh", false);
+    _ = try receiver.receive(0, "ab", false);
+    try std.testing.expectEqualStrings("abcd", receiver.readable());
+    try std.testing.expectEqual(State.data_received, receiver.state);
+}
+
+test "receiver RESET_STREAM_AT reductions ignore increases and enforce invariant fields" {
+    var bytes: [16]u8 = undefined;
+    var range_storage: [8]ranges.Range = undefined;
+    var receiver = try Receiver.init(&bytes, &range_storage, 16);
+    _ = try receiver.receiveResetAt(7, 8, 6);
+    _ = try receiver.receiveResetAt(7, 8, 3);
+    _ = try receiver.receiveResetAt(7, 8, 5);
+    try std.testing.expectEqual(@as(?u64, 3), receiver.reliable_size);
+    try std.testing.expectError(error.StreamStateError, receiver.receiveResetAt(8, 8, 2));
+    try std.testing.expectError(error.FinalSizeError, receiver.receiveResetAt(7, 9, 2));
+    try std.testing.expectError(error.FrameEncodingError, receiver.receiveResetAt(7, 8, 9));
+    _ = try receiver.receiveReset(7, 8);
+    try std.testing.expectEqual(State.reset_received, receiver.state);
+}
+
+test "receiver ignores RESET_STREAM_AT after RESET_STREAM as a reliable-size increase" {
+    var bytes: [8]u8 = undefined;
+    var range_storage: [4]ranges.Range = undefined;
+    var receiver = try Receiver.init(&bytes, &range_storage, 8);
+    _ = try receiver.receiveReset(7, 8);
+    _ = try receiver.receiveResetAt(7, 8, 4);
+    try std.testing.expectEqual(State.reset_received, receiver.state);
+    try std.testing.expectEqual(@as(?u64, null), receiver.reliable_size);
+    try std.testing.expectError(error.StreamStateError, receiver.receiveResetAt(8, 8, 0));
 }
 
 test "deterministic fuzz-style reordered one-byte frames preserve payload" {

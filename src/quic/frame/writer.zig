@@ -26,6 +26,14 @@ const Writer = struct {
                 try self.integer(reset.application_error);
                 try self.integer(reset.final_size);
             },
+            .reset_stream_at => |reset| {
+                if (reset.reliable_size > reset.final_size) return error.FrameEncodingError;
+                try self.integer(types.reset_stream_at_type);
+                try self.integer(reset.id);
+                try self.integer(reset.application_error);
+                try self.integer(reset.final_size);
+                try self.integer(reset.reliable_size);
+            },
             .stop_sending => |stop| {
                 try self.integer(0x05);
                 try self.integer(stop.id);
@@ -206,6 +214,22 @@ test "frame writer canonicalizes stream and ACK encodings" {
     try std.testing.expectEqualStrings("\x02\x0a\x00\x01\x02\x01\x01", encoded_ack);
 }
 
+test "frame writer emits RESET_STREAM_AT and validates sizes" {
+    var output: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("\x24\x04\x2a\x08\x03", try encode(&output, .{ .reset_stream_at = .{
+        .id = 4,
+        .application_error = 42,
+        .final_size = 8,
+        .reliable_size = 3,
+    } }));
+    try std.testing.expectError(error.FrameEncodingError, encode(&output, .{ .reset_stream_at = .{
+        .id = 4,
+        .application_error = 42,
+        .final_size = 3,
+        .reliable_size = 4,
+    } }));
+}
+
 test "frame writer emits canonical DATAGRAM variants" {
     var output: [128]u8 = undefined;
     try std.testing.expectEqualStrings("\x30payload", try encode(&output, .{ .datagram = "payload" }));
@@ -223,6 +247,7 @@ test "frame writer round trips every frame family" {
         .{ .padding = 3 },
         .ping,
         .{ .reset_stream = .{ .id = 1, .application_error = 2, .final_size = 3 } },
+        .{ .reset_stream_at = .{ .id = 1, .application_error = 2, .final_size = 3, .reliable_size = 2 } },
         .{ .stop_sending = .{ .id = 1, .application_error = 2 } },
         .{ .crypto = .{ .offset = 4, .data = "tls" } },
         .{ .new_token = "token" },

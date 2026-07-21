@@ -147,6 +147,11 @@ fn dispatchFrames(self: anytype, level: types.Level, destination_sequence: u64, 
                 ack_eliciting = true;
                 try self.application.onResetStream(reset);
             },
+            .reset_stream_at => |reset| {
+                try requireApplication(level);
+                ack_eliciting = true;
+                try self.application.onResetStreamAt(reset);
+            },
             .stop_sending => |stop| {
                 try requireApplication(level);
                 ack_eliciting = true;
@@ -299,6 +304,14 @@ fn onAck(self: anytype, level: types.Level, ack: frame.Ack, now: u64) !void {
 fn scaleAckDelay(raw: u64, exponent: u8) u64 {
     const microseconds = raw *| (@as(u64, 1) << @intCast(exponent));
     return microseconds *| 1_000;
+}
+
+test "RESET_STREAM_AT normative failures map to QUIC transport errors" {
+    try std.testing.expectEqual(types.CloseCode.frame_encoding_error, mapError(error.FrameEncodingError));
+    try std.testing.expectEqual(types.CloseCode.flow_control_error, mapError(error.FlowControlError));
+    try std.testing.expectEqual(types.CloseCode.stream_state_error, mapError(error.StreamStateError));
+    try std.testing.expectEqual(types.CloseCode.final_size_error, mapError(error.FinalSizeError));
+    try std.testing.expectEqual(types.CloseCode.protocol_violation, mapError(error.ProtocolViolation));
 }
 
 test "ACK delay scaling converts microseconds to nanoseconds and saturates" {

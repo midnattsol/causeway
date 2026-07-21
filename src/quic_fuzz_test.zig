@@ -22,6 +22,9 @@ const corpus = &.{
     "\x7b\xbd",
     "\x9d\x7f\x3e\x7d",
     "\xc2\x19\x7c\x5e\xff\x14\xe8\x8c",
+    "\x1d\x00", // reset_stream_at transport parameter
+    "\x24\x04\x2a\x08\x03", // valid RESET_STREAM_AT
+    "\x24\x04\x2a\x03\x04", // Reliable Size exceeds Final Size
 };
 
 test "fuzz QUIC wire primitives and bounded server connections" {
@@ -61,6 +64,7 @@ fn fuzzQuic(_: std.Io, smith: *std.testing.Smith) !void {
     fuzzAckTracker(input);
     fuzzLossDetection(input);
     fuzzStreamReceive(input);
+    fuzzReliableResetReceive(input);
     fuzzStreamSend(input);
     fuzzTlsWire(input);
     if (input.len >= 6) {
@@ -209,6 +213,24 @@ fn fuzzStreamReceive(input: []const u8) void {
     }
 }
 
+fn fuzzReliableResetReceive(input: []const u8) void {
+    const payload = input[0..@min(input.len, 128)];
+    const reliable_size: usize = if (payload.len == 0) 0 else input[input.len - 1] % (payload.len + 1);
+    var bytes: [128]u8 = undefined;
+    var range_storage: [128]stream.range_set.Range = undefined;
+    var receiver = stream.Receiver.init(&bytes, &range_storage, payload.len) catch unreachable;
+    _ = receiver.receiveResetAt(7, payload.len, reliable_size) catch @panic("valid reliable reset was rejected");
+
+    var offset = reliable_size;
+    while (offset != 0) {
+        offset -= 1;
+        _ = receiver.receive(offset, payload[offset .. offset + 1], false) catch @panic("reliable prefix byte was rejected");
+    }
+    std.testing.expectEqualSlices(u8, payload[0..reliable_size], receiver.readable()) catch @panic("reliable reset prefix mismatch");
+    receiver.consume(reliable_size) catch @panic("reliable reset prefix could not be consumed");
+    _ = receiver.readReset() catch @panic("completed reliable reset was not readable");
+}
+
 fn fuzzStreamSend(input: []const u8) void {
     const payload = input[0..@min(input.len, 128)];
     var bytes: [128]u8 = undefined;
@@ -216,8 +238,14 @@ fn fuzzStreamSend(input: []const u8) void {
     var lost_storage: [128]stream.range_set.Range = undefined;
     var sender = stream.Sender.init(&bytes, &ack_storage, &lost_storage);
     _ = sender.write(payload) catch @panic("bounded stream payload did not fit");
-    sender.finish() catch @panic("stream could not be finished");
+    if (input.len != 0 and input[0] & 1 != 0) {
+        const reliable_size: u64 = if (payload.len == 0) 0 else input[input.len - 1] % (payload.len + 1);
+        _ = sender.resetAt(7, reliable_size) catch @panic("valid reliable reset was rejected");
+    } else {
+        sender.finish() catch @panic("stream could not be finished");
+    }
 
+    var reset_at_acknowledged = false;
     var iteration: usize = 0;
     while (sender.state != .data_received and iteration < 512) : (iteration += 1) {
         const selector = if (input.len == 0) @as(u8, 0) else input[iteration % input.len];
@@ -230,7 +258,13 @@ fn fuzzStreamSend(input: []const u8) void {
         } else {
             sender.onAcknowledged(transmission.offset, transmission.data.len, transmission.fin) catch @panic("valid ACK range was rejected");
         }
+        if (sender.reliable_reset and !reset_at_acknowledged and iteration > 2) {
+            sender.onResetAtAcknowledged(sender.reliable_size.?) catch @panic("valid RESET_STREAM_AT ACK was rejected");
+            reset_at_acknowledged = true;
+        }
     }
+    if (sender.reliable_reset and !reset_at_acknowledged)
+        sender.onResetAtAcknowledged(sender.reliable_size.?) catch @panic("valid RESET_STREAM_AT ACK was rejected");
     std.testing.expectEqual(stream.send.State.data_received, sender.state) catch @panic("stream send schedule did not terminate");
 }
 

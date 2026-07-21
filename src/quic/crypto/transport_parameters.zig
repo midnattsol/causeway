@@ -32,6 +32,8 @@ pub const Values = struct {
     active_connection_id_limit: u64 = 2,
     initial_source_connection_id: ?[]const u8 = null,
     retry_source_connection_id: ?[]const u8 = null,
+    /// draft-ietf-quic-reliable-stream-reset-09: support for receiving RESET_STREAM_AT.
+    reset_stream_at: bool = false,
     max_datagram_frame_size: u64 = 0,
 };
 
@@ -53,6 +55,7 @@ const Id = enum(u64) {
     active_connection_id_limit = 0x0e,
     initial_source_connection_id = 0x0f,
     retry_source_connection_id = 0x10,
+    reset_stream_at = 0x1d,
     max_datagram_frame_size = 0x20,
     _,
 };
@@ -119,6 +122,10 @@ pub fn parse(bytes: []const u8, sender: Role) !Values {
                 try requireServer(sender);
                 result.retry_source_connection_id = try connectionId(value);
             },
+            .reset_stream_at => {
+                if (value.len != 0) return error.InvalidResetStreamAt;
+                result.reset_stream_at = true;
+            },
             .max_datagram_frame_size => result.max_datagram_frame_size = try integer(value),
             _ => unreachable,
         }
@@ -181,7 +188,8 @@ fn knownBit(id: Id) ?u32 {
         .active_connection_id_limit => 1 << 14,
         .initial_source_connection_id => 1 << 15,
         .retry_source_connection_id => 1 << 16,
-        .max_datagram_frame_size => 1 << 17,
+        .reset_stream_at => 1 << 17,
+        .max_datagram_frame_size => 1 << 18,
         _ => null,
     };
 }
@@ -209,6 +217,7 @@ pub fn encode(buffer: []u8, values: Values, sender: Role) ![]u8 {
     if (values.active_connection_id_limit != 2) try writer.integer(.active_connection_id_limit, values.active_connection_id_limit);
     if (values.initial_source_connection_id) |id| try writer.parameter(.initial_source_connection_id, id);
     if (values.retry_source_connection_id) |id| try writer.parameter(.retry_source_connection_id, id);
+    if (values.reset_stream_at) try writer.parameter(.reset_stream_at, &.{});
     if (values.max_datagram_frame_size != 0) try writer.integer(.max_datagram_frame_size, values.max_datagram_frame_size);
     return buffer[0..writer.cursor];
 }
@@ -334,4 +343,16 @@ test "QUIC transport parameters reject duplicates and role violations" {
     try std.testing.expectError(error.DuplicateTransportParameter, parse("\x04\x01\x01\x04\x01\x02", .client));
     try std.testing.expectError(error.ServerOnlyTransportParameter, parse("\x00\x00", .client));
     try std.testing.expectError(error.InvalidMaxUdpPayloadSize, parse("\x03\x01\x25", .client));
+}
+
+test "reset_stream_at transport parameter is empty and round trips" {
+    const parsed = try parse("\x1d\x00", .client);
+    try std.testing.expect(parsed.reset_stream_at);
+    try std.testing.expectError(error.InvalidResetStreamAt, parse("\x1d\x01\x00", .server));
+    try std.testing.expectError(error.DuplicateTransportParameter, parse("\x1d\x00\x1d\x00", .client));
+
+    var storage: [64]u8 = undefined;
+    const encoded = try encode(&storage, .{ .initial_source_connection_id = "", .reset_stream_at = true }, .client);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\x1d\x00") != null);
+    try std.testing.expect((try parse(encoded, .client)).reset_stream_at);
 }

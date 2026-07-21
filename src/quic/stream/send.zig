@@ -18,6 +18,12 @@ pub const ResetInstruction = struct {
     final_size: u64,
 };
 
+pub const ResetAtInstruction = struct {
+    application_error: u64,
+    final_size: u64,
+    reliable_size: u64,
+};
+
 /// Send storage and ACK/loss ranges are supplied by the caller and never grow.
 pub const Sender = struct {
     storage: []u8,
@@ -32,6 +38,9 @@ pub const Sender = struct {
     fin_lost: bool = false,
     state: State = .ready,
     reset_error: ?u64 = null,
+    reliable_reset: bool = false,
+    reliable_size: ?u64 = null,
+    reset_at_acked: bool = false,
 
     pub fn init(storage: []u8, ack_ranges: []ranges.Range, lost_ranges: []ranges.Range) Sender {
         return .{
@@ -82,7 +91,7 @@ pub const Sender = struct {
             const end = pending.start + amount;
             try self.lost.remove(.{ .start = pending.start, .end = end });
             const start_index: usize = @intCast(pending.start - self.base_offset);
-            const retransmit_fin = self.fin_lost and self.final_size != null and end == self.final_size.?;
+            const retransmit_fin = !self.reliable_reset and self.fin_lost and self.final_size != null and end == self.final_size.?;
             if (retransmit_fin) self.fin_lost = false;
             return .{
                 .offset = pending.start,
@@ -92,22 +101,23 @@ pub const Sender = struct {
             };
         }
 
-        if (self.fin_lost and self.lost.count == 0 and self.final_size != null) {
+        if (!self.reliable_reset and self.fin_lost and self.lost.count == 0 and self.final_size != null) {
             self.fin_lost = false;
             return .{ .offset = self.final_size.?, .data = "", .fin = true, .retransmission = true };
         }
 
-        if (maximum_length != 0 and self.sent_offset < self.write_offset) {
+        const transmission_end = if (self.reliable_reset) self.reliable_size.? else self.write_offset;
+        if (maximum_length != 0 and self.sent_offset < transmission_end) {
             const connection_end = std.math.add(u64, self.sent_offset, connection_allowance) catch id.maximum;
-            const permitted_end = @min(self.write_offset, @min(max_stream_data, connection_end));
+            const permitted_end = @min(transmission_end, @min(max_stream_data, connection_end));
             if (permitted_end > self.sent_offset) {
                 const amount: usize = @intCast(@min(permitted_end - self.sent_offset, maximum_length));
                 const offset = self.sent_offset;
                 const end = offset + amount;
                 self.sent_offset = end;
-                const send_fin = self.final_size != null and end == self.final_size.?;
+                const send_fin = !self.reliable_reset and self.final_size != null and end == self.final_size.?;
                 if (send_fin) self.fin_sent = true;
-                if (send_fin) self.state = .data_sent else self.state = .send;
+                if (send_fin or self.reliable_reset) self.state = .data_sent else self.state = .send;
                 const start_index: usize = @intCast(offset - self.base_offset);
                 return .{
                     .offset = offset,
@@ -118,7 +128,7 @@ pub const Sender = struct {
             }
         }
 
-        if (self.final_size != null and !self.fin_sent and self.sent_offset == self.final_size.? and
+        if (!self.reliable_reset and self.final_size != null and !self.fin_sent and self.sent_offset == self.final_size.? and
             self.sent_offset <= max_stream_data)
         {
             self.fin_sent = true;
@@ -142,20 +152,22 @@ pub const Sender = struct {
             self.fin_lost = false;
         }
         try self.reclaimAcknowledgedPrefix();
-        if (self.final_size != null and self.base_offset == self.final_size.? and self.fin_acked) self.state = .data_received;
+        self.refreshTerminalState();
     }
 
     pub fn onLost(self: *Sender, offset: u64, length: u64, fin: bool) !void {
         const end = std.math.add(u64, offset, length) catch return error.InvalidLossRange;
         if (end > self.sent_offset) return error.InvalidLossRange;
+        if (self.state == .data_received or self.state == .reset_received) return;
+        const retransmit_end = if (self.reliable_reset) @min(end, self.reliable_size.?) else end;
         const retained_start = @max(offset, self.base_offset);
-        if (end > retained_start) {
-            try self.lost.add(.{ .start = retained_start, .end = end });
+        if (retransmit_end > retained_start) {
+            try self.lost.add(.{ .start = retained_start, .end = retransmit_end });
             for (self.acknowledged.items()) |acknowledged| try self.lost.remove(acknowledged);
         }
         if (fin) {
             if (!self.fin_sent or self.final_size == null or end != self.final_size.?) return error.InvalidLossRange;
-            if (!self.fin_acked) self.fin_lost = true;
+            if (!self.reliable_reset and !self.fin_acked) self.fin_lost = true;
         }
     }
 
@@ -163,13 +175,50 @@ pub const Sender = struct {
     pub fn reset(self: *Sender, application_error: u64) !ResetInstruction {
         if (application_error > id.maximum) return error.InvalidApplicationError;
         if (self.state == .data_received or self.state == .reset_received) return error.StreamTerminal;
-        if (self.state == .reset_sent) return .{ .application_error = self.reset_error.?, .final_size = self.final_size.? };
+        if (self.reset_error) |known| {
+            if (known != application_error) return error.StreamStateError;
+            if (!self.reliable_reset) return .{ .application_error = known, .final_size = self.final_size.? };
+        }
         self.reset_error = application_error;
-        self.final_size = self.sent_offset;
-        self.write_offset = self.sent_offset;
+        self.final_size = self.final_size orelse self.sent_offset;
+        self.write_offset = self.final_size.?;
+        self.reliable_reset = false;
+        self.reliable_size = null;
+        self.reset_at_acked = false;
         self.lost.clear();
+        self.fin_lost = false;
         self.state = .reset_sent;
-        return .{ .application_error = application_error, .final_size = self.sent_offset };
+        return .{ .application_error = application_error, .final_size = self.final_size.? };
+    }
+
+    /// Starts or reduces a reliable reset. The final size is the amount accepted
+    /// from the application; only the prefix ending at `reliable_size` remains
+    /// retransmittable.
+    pub fn resetAt(self: *Sender, application_error: u64, reliable_size: u64) !ResetAtInstruction {
+        if (application_error > id.maximum) return error.InvalidApplicationError;
+        if (self.state == .data_received or self.state == .reset_received) return error.StreamTerminal;
+        const final = self.final_size orelse self.write_offset;
+        if (reliable_size > final) return error.ReliableSizeExceedsFinalSize;
+        if (self.reset_error) |known| {
+            if (known != application_error) return error.StreamStateError;
+            if (!self.reliable_reset) return error.ReliableSizeIncrease;
+            if (reliable_size > self.reliable_size.?) return error.ReliableSizeIncrease;
+        } else {
+            self.reset_error = application_error;
+            self.final_size = final;
+            self.write_offset = final;
+            self.reliable_reset = true;
+            self.reliable_size = reliable_size;
+        }
+        if (self.reliable_size.? != reliable_size) {
+            self.reliable_size = reliable_size;
+            self.reset_at_acked = false;
+        }
+        try self.lost.remove(.{ .start = reliable_size, .end = id.maximum + 1 });
+        self.fin_lost = false;
+        self.state = .data_sent;
+        self.refreshTerminalState();
+        return .{ .application_error = application_error, .final_size = final, .reliable_size = reliable_size };
     }
 
     pub fn onStopSending(self: *Sender, application_error: u64) !ResetInstruction {
@@ -179,6 +228,23 @@ pub const Sender = struct {
     pub fn onResetAcknowledged(self: *Sender) !void {
         if (self.state != .reset_sent) return error.ResetNotSent;
         self.state = .reset_received;
+    }
+
+    pub fn onResetAtAcknowledged(self: *Sender, reliable_size: u64) !void {
+        // A later RESET_STREAM can reduce the reliable size to zero while an
+        // older RESET_STREAM_AT remains in flight; its ACK is then stale.
+        if (!self.reliable_reset) return;
+        if (reliable_size != self.reliable_size.?) return;
+        self.reset_at_acked = true;
+        self.refreshTerminalState();
+    }
+
+    fn refreshTerminalState(self: *Sender) void {
+        if (self.reliable_reset) {
+            if (self.reset_at_acked and self.base_offset >= self.reliable_size.?) self.state = .data_received;
+            return;
+        }
+        if (self.final_size != null and self.base_offset == self.final_size.? and self.fin_acked) self.state = .data_received;
     }
 
     fn reclaimAcknowledgedPrefix(self: *Sender) !void {
@@ -255,6 +321,46 @@ test "sender retransmits a lost empty FIN without flow credit" {
     try std.testing.expect(retransmission.fin);
     try std.testing.expect(retransmission.retransmission);
     try sender.onAcknowledged(0, 0, true);
+    try std.testing.expectEqual(State.data_received, sender.state);
+}
+
+test "reliable reset retransmits only its prefix and requires frame ACK" {
+    var bytes: [16]u8 = undefined;
+    var ack_storage: [8]ranges.Range = undefined;
+    var lost_storage: [8]ranges.Range = undefined;
+    var sender = Sender.init(&bytes, &ack_storage, &lost_storage);
+    _ = try sender.write("abcdefgh");
+    const reset = try sender.resetAt(42, 4);
+    try std.testing.expectEqual(ResetAtInstruction{ .application_error = 42, .final_size = 8, .reliable_size = 4 }, reset);
+
+    const first = (try sender.nextTransmission(8, 8, 8)).?;
+    try std.testing.expectEqualStrings("abcd", first.data);
+    try std.testing.expect(!first.fin);
+    try sender.onLost(0, 4, false);
+    const retransmission = (try sender.nextTransmission(8, 8, 0)).?;
+    try std.testing.expectEqualStrings("abcd", retransmission.data);
+    try sender.onAcknowledged(0, 4, false);
+    try std.testing.expectEqual(State.data_sent, sender.state);
+    try sender.onResetAtAcknowledged(4);
+    try std.testing.expectEqual(State.data_received, sender.state);
+}
+
+test "reliable reset reductions ignore stale ACKs and reject increases" {
+    var bytes: [16]u8 = undefined;
+    var ack_storage: [8]ranges.Range = undefined;
+    var lost_storage: [8]ranges.Range = undefined;
+    var sender = Sender.init(&bytes, &ack_storage, &lost_storage);
+    _ = try sender.write("abcdefgh");
+    _ = try sender.resetAt(7, 6);
+    _ = try sender.resetAt(7, 3);
+    try std.testing.expectError(error.ReliableSizeIncrease, sender.resetAt(7, 4));
+    try std.testing.expectError(error.StreamStateError, sender.resetAt(8, 2));
+    try sender.onResetAtAcknowledged(6);
+    try std.testing.expect(!sender.reset_at_acked);
+    const tx = (try sender.nextTransmission(8, 8, 8)).?;
+    try std.testing.expectEqualStrings("abc", tx.data);
+    try sender.onAcknowledged(0, 3, false);
+    try sender.onResetAtAcknowledged(3);
     try std.testing.expectEqual(State.data_received, sender.state);
 }
 

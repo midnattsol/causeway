@@ -13,6 +13,12 @@ pub const AckRangeIterator = types.AckRangeIterator;
 pub const Stream = types.Stream;
 pub const Crypto = types.Crypto;
 pub const ResetStream = types.ResetStream;
+pub const ResetStreamAt = types.ResetStreamAt;
+pub const reset_stream_at_type = types.reset_stream_at_type;
+pub const reset_stream_at_is_ack_eliciting = types.reset_stream_at_is_ack_eliciting;
+pub const reset_stream_at_is_congestion_controlled = types.reset_stream_at_is_congestion_controlled;
+pub const reset_stream_at_is_retransmittable = types.reset_stream_at_is_retransmittable;
+pub const resetStreamAtAllowedIn = types.resetStreamAtAllowedIn;
 pub const StopSending = types.StopSending;
 pub const StreamLimit = types.StreamLimit;
 pub const StreamBlocked = types.StreamBlocked;
@@ -49,6 +55,7 @@ pub fn parseOne(payload: []const u8, cursor: *usize) !Frame {
             .application_error = try varint.decodeAt(payload, cursor),
             .final_size = try varint.decodeAt(payload, cursor),
         } },
+        reset_stream_at_type => parseResetStreamAt(payload, cursor),
         0x05 => .{ .stop_sending = .{
             .id = try varint.decodeAt(payload, cursor),
             .application_error = try varint.decodeAt(payload, cursor),
@@ -85,6 +92,17 @@ pub fn parseOne(payload: []const u8, cursor: *usize) !Frame {
         datagram_len_type => .{ .datagram_len = try readLengthPrefixed(payload, cursor) },
         else => error.UnknownFrameType,
     };
+}
+
+fn parseResetStreamAt(payload: []const u8, cursor: *usize) !Frame {
+    const value: ResetStreamAt = .{
+        .id = try varint.decodeAt(payload, cursor),
+        .application_error = try varint.decodeAt(payload, cursor),
+        .final_size = try varint.decodeAt(payload, cursor),
+        .reliable_size = try varint.decodeAt(payload, cursor),
+    };
+    if (value.reliable_size > value.final_size) return error.FrameEncodingError;
+    return .{ .reset_stream_at = value };
 }
 
 fn parsePadding(payload: []const u8, cursor: *usize) Frame {
@@ -211,6 +229,16 @@ test "QUIC frame iterator parses stream crypto and flow control" {
     try std.testing.expect((try iterator.next()) == null);
 }
 
+test "RESET_STREAM_AT parses codepoint and rejects reliable size above final size" {
+    var cursor: usize = 0;
+    const reset = (try parseOne("\x24\x04\x2a\x08\x03", &cursor)).reset_stream_at;
+    try std.testing.expectEqual(ResetStreamAt{ .id = 4, .application_error = 42, .final_size = 8, .reliable_size = 3 }, reset);
+    try std.testing.expectEqual(@as(usize, 5), cursor);
+
+    cursor = 0;
+    try std.testing.expectError(error.FrameEncodingError, parseOne("\x24\x04\x2a\x03\x04", &cursor));
+}
+
 test "QUIC ACK ranges validate and iterate" {
     var cursor: usize = 0;
     const ack = (try parseOne("\x02\x0a\x00\x01\x02\x01\x01", &cursor)).ack;
@@ -228,6 +256,7 @@ test "canonical frame encoding reparses idempotently" {
         "\x40\x01",
         "\x02\x0a\x00\x01\x02\x01\x01",
         "\x08\x04body",
+        "\x24\x04\x2a\x08\x03",
         "\x1c\x01\x06\x04oops",
         "\x30payload",
         "\x31\x07payload",
@@ -266,6 +295,16 @@ test "QUIC DATAGRAM frames parse borrowed payloads and non-minimal lengths" {
     const non_minimal_type = (try parseOne("\x40\x31\x03two", &cursor)).datagram_len;
     try std.testing.expectEqualStrings("two", non_minimal_type);
     try std.testing.expectEqual(@as(usize, 6), cursor);
+}
+
+test "RESET_STREAM_AT frame metadata follows reliable stream reset draft 09" {
+    try std.testing.expect(!resetStreamAtAllowedIn(.initial));
+    try std.testing.expect(resetStreamAtAllowedIn(.zero_rtt));
+    try std.testing.expect(!resetStreamAtAllowedIn(.handshake));
+    try std.testing.expect(resetStreamAtAllowedIn(.one_rtt));
+    try std.testing.expect(reset_stream_at_is_ack_eliciting);
+    try std.testing.expect(reset_stream_at_is_congestion_controlled);
+    try std.testing.expect(reset_stream_at_is_retransmittable);
 }
 
 test "QUIC DATAGRAM frame metadata follows RFC 9221" {

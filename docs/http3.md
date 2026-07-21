@@ -95,6 +95,12 @@ RFC 9221 DATAGRAM support is configured with `connection.Limits.datagram_receive
 
 DATAGRAM frames are ack-eliciting, congestion-controlled, paced, and never retransmitted. Scheduling alternates with sustained stream output, preserves a queued datagram when packet construction or congestion control blocks, and consumes it only after packet bookkeeping succeeds. The negotiated limit applies to the complete encoded DATAGRAM frame, not only its payload. `Connection.datagramCapabilities` reports each negotiated direction and its complete-frame limit without exposing connection internals.
 
+## Reliable stream reset
+
+Causeway implements `RESET_STREAM_AT` and the empty `reset_stream_at` transport parameter from `draft-ietf-quic-reliable-stream-reset-09`. The extension can guarantee delivery of a caller-selected stream prefix before exposing an abrupt reset. It is negotiated independently in each direction; `Connection.resetStreamAt` is available only when the peer advertised support.
+
+The implementation reserves flow-control credit through Final Size, retransmits only bytes below the smallest Reliable Size, and keeps the smallest reset plus its prefix live until both are acknowledged. Receive state delays the reset event until the reliable prefix is contiguous and consumed. Reordered reductions, ordinary `RESET_STREAM`, FIN, late ACK/loss callbacks, and closed-stream tombstones preserve the draft's immutable application-error and final-size invariants. This extension is a required transport primitive for the server-side WebTransport draft implemented by Causeway.
+
 ## HTTP Datagrams and Capsule Protocol
 
 `http3.Config.enable_datagrams` advertises `SETTINGS_H3_DATAGRAM = 1` and enables bounded request-associated datagram queues. `datagram_queue_capacity`, `datagram_max_payload`, and `max_capsule_length` are compile-time limits. Native HTTP/3 Datagram mode additionally requires negotiated QUIC DATAGRAM support in both directions; the available application payload accounts for the DATAGRAM frame type and the encoded Quarter Stream ID. Otherwise an accepted Capsule Protocol tunnel uses reliable DATAGRAM capsules.
