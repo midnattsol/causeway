@@ -172,6 +172,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             pending_header_end_stream: bool = false,
             received_initial_settings: bool = false,
             awaiting_settings_ack: bool = true,
+            settings_timer: ?Io.Future(anyerror!void) = null,
             draining: bool = false,
             goaway_sent: bool = false,
             final_goaway_sent: bool = false,
@@ -229,6 +230,8 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
 
             fn deinit(self: *Controller) void {
+                if (self.settings_timer) |*timer| _ = timer.cancel(self.io) catch {};
+                self.settings_timer = null;
                 self.tasks.cancel(self.io);
                 var iterator = self.sessions.valueIterator();
                 while (iterator.next()) |session| session.*.deinit();
@@ -249,7 +252,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 try self.writeInitialSettings();
                 try self.output.flush();
                 if (self.owner.options.settings_ack_timeout) |timeout| {
-                    self.tasks.async(self.io, settingsTimer, .{ timeout, &self.messages, &self.wake, self.io });
+                    self.settings_timer = Io.async(self.io, settingsTimer, .{ timeout, &self.messages, &self.wake, self.io });
                 }
                 self.tasks.async(self.io, readFrames, .{ &self.frames, self.input });
                 if (self.control) |control| self.tasks.async(self.io, watchDrain, .{ control, &self.messages, &self.wake, self.io });
@@ -337,7 +340,11 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                             if (!session.output_done) self.streamFailure(stream_id, .cancel, error.ResponseTimeout);
                         }
                     },
-                    .settings_timeout => if (self.awaiting_settings_ack) return self.connectionFailure(.settings_timeout, error.SettingsTimeout),
+                    .settings_timeout => {
+                        if (self.settings_timer) |*timer| try timer.await(self.io);
+                        self.settings_timer = null;
+                        if (self.awaiting_settings_ack) return self.connectionFailure(.settings_timeout, error.SettingsTimeout);
+                    },
                     .drain => try self.beginDrain(),
                 }
             }
@@ -380,6 +387,8 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 if (payload.ack) {
                     if (!self.awaiting_settings_ack) return self.connectionFailure(.protocol_error, error.UnexpectedSettingsAck);
                     self.awaiting_settings_ack = false;
+                    if (self.settings_timer) |*timer| _ = timer.cancel(self.io) catch {};
+                    self.settings_timer = null;
                     return;
                 }
                 const changes = settings.apply(&self.peer_settings, payload.bytes) catch |err| {
@@ -1067,14 +1076,9 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             return .{ .items = fields };
         }
 
-        fn settingsTimer(timeout: Io.Duration, messages: *MessageQueue, wake: *Wake, io: Io) Io.Cancelable!void {
-            Io.sleep(io, timeout, .awake) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-            };
-            messages.putOne(io, .settings_timeout) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                error.Closed => return,
-            };
+        fn settingsTimer(timeout: Io.Duration, messages: *MessageQueue, wake: *Wake, io: Io) anyerror!void {
+            try Io.sleep(io, timeout, .awake);
+            try messages.putOne(io, .settings_timeout);
             wake.signal();
         }
 

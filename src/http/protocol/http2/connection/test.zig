@@ -12,6 +12,29 @@ const ConnectionControl = @import("../../../transport/server.zig").ConnectionCon
 const Io = std.Io;
 const Handler = connection.Handler;
 
+const SlowInput = struct {
+    io: Io,
+    reader: Io.Reader,
+
+    fn init(io: Io, buffer: []u8, buffered: usize) SlowInput {
+        return .{
+            .io = io,
+            .reader = .{
+                .vtable = &.{ .stream = stream },
+                .buffer = buffer,
+                .seek = 0,
+                .end = buffered,
+            },
+        };
+    }
+
+    fn stream(interface: *Io.Reader, _: *Io.Writer, _: Io.Limit) Io.Reader.StreamError!usize {
+        const self: *SlowInput = @fieldParentPtr("reader", interface);
+        Io.sleep(self.io, .fromSeconds(60), .awake) catch return error.ReadFailed;
+        return error.EndOfStream;
+    }
+};
+
 test "HTTP/2 handler serves a prior-knowledge request end to end" {
     const AppState = struct { requests: usize = 0 };
     const Dispatcher = struct {
@@ -406,6 +429,30 @@ test "HTTP/2 graceful drain sends GOAWAY and waits for active dispatch" {
     try std.testing.expect(serverOutputContains(output.written(), .headers, 1));
 }
 
+test "HTTP/2 SETTINGS acknowledgement deadline cancels a blocked socket read" {
+    const AppState = struct {};
+    const Dispatcher = struct {
+        pub fn dispatch(_: anytype) !Response {
+            return .{ .status = .ok };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(3));
+    const bytes = frame.client_preface ++ "\x00\x00\x00\x04\x00\x00\x00\x00\x00";
+    var input_buffer: [128]u8 = undefined;
+    @memcpy(input_buffer[0..bytes.len], bytes);
+    var input = SlowInput.init(threaded.io(), &input_buffer, bytes.len);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: AppState = .{};
+    var handler = Handler(AppState, Dispatcher).init(std.testing.allocator, &state, .{
+        .settings_ack_timeout = .fromMilliseconds(1),
+    });
+    try std.testing.expectError(error.SettingsTimeout, handler.serve(&input.reader, &output.writer, threaded.io()));
+    try std.testing.expect(serverOutputContains(output.written(), .goaway, 0));
+}
+
 fn serverWindowCredit(bytes: []const u8, stream_id: u32) u64 {
     var cursor: usize = 0;
     var total: u64 = 0;
@@ -462,4 +509,3 @@ fn serverOutputContains(bytes: []const u8, frame_type: frame.Type, stream_id: u3
     }
     return false;
 }
-
