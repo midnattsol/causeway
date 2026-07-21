@@ -13,11 +13,16 @@ const packet_keys = @import("../tls/packet_keys.zig");
 const types = @import("types.zig");
 const receive = @import("receive.zig");
 const schedule = @import("schedule.zig");
+const application_streams = @import("application_streams.zig");
+const stream = @import("../stream/root.zig");
 
 pub const State = types.State;
 pub const Level = types.Level;
 pub const TransportError = types.TransportError;
 pub const CloseCode = types.CloseCode;
+pub const StreamEvent = application_streams.Event;
+pub const StreamId = stream.Id;
+pub const StreamDirection = stream.Direction;
 
 pub const Limits = struct {
     crypto_receive_bytes: usize = 4096,
@@ -28,6 +33,11 @@ pub const Limits = struct {
     tls_output_bytes: usize = 8192,
     tls_transcript_bytes: usize = 16 * 1024,
     max_datagram_size: usize = 1200,
+    max_streams: usize = 16,
+    stream_receive_bytes: usize = 4096,
+    stream_send_bytes: usize = 4096,
+    stream_receive_ranges: usize = 16,
+    stream_send_ranges: usize = 16,
 };
 
 pub fn Storage(comptime limits: Limits) type {
@@ -39,6 +49,11 @@ pub fn Storage(comptime limits: Limits) type {
         crypto_lost_ranges: [3][limits.crypto_ranges]crypto_stream.Range = undefined,
         tls_initial_output: [limits.tls_output_bytes]u8 = undefined,
         tls_handshake_output: [limits.tls_output_bytes]u8 = undefined,
+        stream_receive: [limits.max_streams][limits.stream_receive_bytes]u8 = undefined,
+        stream_receive_ranges: [limits.max_streams][limits.stream_receive_ranges]stream.range_set.Range = undefined,
+        stream_send: [limits.max_streams][limits.stream_send_bytes]u8 = undefined,
+        stream_ack_ranges: [limits.max_streams][limits.stream_send_ranges]stream.range_set.Range = undefined,
+        stream_lost_ranges: [limits.max_streams][limits.stream_send_ranges]stream.range_set.Range = undefined,
     };
 }
 
@@ -56,6 +71,13 @@ pub fn Connection(comptime limits: Limits) type {
         const Self = @This();
         pub const Space = packet_space.PacketSpace(limits.ack_ranges);
         pub const Detector = loss.Detector(limits.sent_packets);
+        pub const ApplicationStreams = application_streams.Application(
+            limits.max_streams,
+            limits.stream_receive_bytes,
+            limits.stream_send_bytes,
+            limits.stream_receive_ranges,
+            limits.stream_send_ranges,
+        );
 
         state: State = .handshaking,
         close_info: ?TransportError = null,
@@ -83,6 +105,8 @@ pub fn Connection(comptime limits: Limits) type {
         spaces: [3]Space,
         detectors: [3]Detector,
         sent_crypto: [3][limits.sent_packets]types.CryptoMeta = @splat(@splat(.{})),
+        sent_application: [limits.sent_packets]application_streams.SentMeta = @splat(.{}),
+        application: ApplicationStreams,
         rtt: rtt.Estimator = .{},
         congestion: congestion.NewReno,
         pacer: congestion.Pacer,
@@ -117,6 +141,13 @@ pub fn Connection(comptime limits: Limits) type {
                 ),
                 .spaces = .{ Space.init(.initial), Space.init(.handshake), Space.init(.application) },
                 .detectors = .{ Detector.init(.initial), Detector.init(.handshake), Detector.init(.application) },
+                .application = ApplicationStreams.init(
+                    &storage.stream_receive,
+                    &storage.stream_receive_ranges,
+                    &storage.stream_send,
+                    &storage.stream_ack_ranges,
+                    &storage.stream_lost_ranges,
+                ),
                 .congestion = try congestion.NewReno.init(limits.max_datagram_size),
                 .pacer = congestion.Pacer.init(options.now, limits.max_datagram_size * 10),
             };
@@ -152,6 +183,44 @@ pub fn Connection(comptime limits: Limits) type {
         pub fn validateAddress(self: *Self) void {
             self.address_validated = true;
         }
+
+        pub fn openBidirectionalStream(self: *Self) !StreamId {
+            return self.application.open(.bidirectional);
+        }
+        pub fn openUnidirectionalStream(self: *Self) !StreamId {
+            return self.application.open(.unidirectional);
+        }
+        pub fn acceptStream(self: *Self) ?StreamId {
+            return self.application.accept();
+        }
+        pub fn nextStreamEvent(self: *Self) ?StreamEvent {
+            return self.application.nextEvent();
+        }
+        pub fn streamReadable(self: *Self, id: StreamId) ![]const u8 {
+            return self.application.readable(id);
+        }
+        pub fn consumeStream(self: *Self, id: StreamId, amount: usize) !void {
+            return self.application.consume(id, amount);
+        }
+        pub fn readStreamReset(self: *Self, id: StreamId) !u64 {
+            return self.application.readReset(id);
+        }
+        pub fn streamWritableLen(self: *Self, id: StreamId) !usize {
+            return self.application.writableLen(id);
+        }
+        pub fn writeStream(self: *Self, id: StreamId, bytes: []const u8) !usize {
+            return self.application.write(id, bytes);
+        }
+        pub fn finishStream(self: *Self, id: StreamId) !void {
+            return self.application.finish(id);
+        }
+        pub fn resetStream(self: *Self, id: StreamId, application_error: u64) !void {
+            return self.application.reset(id, application_error);
+        }
+        pub fn stopSending(self: *Self, id: StreamId, application_error: u64) !void {
+            return self.application.stopSending(id, application_error);
+        }
+
         pub fn originalDestinationId(self: *const Self) []const u8 {
             return self.original_destination_id[0..self.original_destination_id_len];
         }
@@ -262,7 +331,7 @@ fn testInit(credentials: *const tls_server.ServerCredentials, transcript: []u8) 
             .credentials = credentials,
             .server_random = @splat(0x53),
             .x25519 = .{ .seed = @splat(0x22) },
-            .transport_parameters = "parameters",
+            .transport_parameters = "\x04\x02\x40\x40", // initial_max_data = 64
             .transcript_scratch = transcript,
         },
         .now = 0,
@@ -421,9 +490,9 @@ fn makeTestClientHello(out: []u8, client_public: [32]u8) []u8 {
     @memcpy(out[cursor..][0..2], "h3");
     cursor += 2;
     putTestU16(out, &cursor, 0x0039);
-    putTestU16(out, &cursor, 2);
-    @memcpy(out[cursor..][0..2], "cp");
-    cursor += 2;
+    putTestU16(out, &cursor, 4);
+    @memcpy(out[cursor..][0..4], "\x04\x02\x40\x40"); // initial_max_data = 64
+    cursor += 4;
     const extensions_length = cursor - extensions_length_offset - 2;
     out[extensions_length_offset] = @truncate(extensions_length >> 8);
     out[extensions_length_offset + 1] = @truncate(extensions_length);
@@ -523,6 +592,9 @@ test "deterministic client Initial through server flight and Finished" {
     });
     try connection.receiveDatagram(first_packet.packet, 2);
     try std.testing.expect(connection.handshake_local != null);
+    try std.testing.expect(connection.application.parameters_applied);
+    try std.testing.expectEqual(@as(u64, 64), connection.application.send_connection.maximum_data);
+    try std.testing.expectEqual(@as(u64, 64), connection.application.receive_connection.maximum_data);
     try std.testing.expect(!connection.initial_discarded);
 
     var server_datagram_storage: [4096]u8 = undefined;
@@ -588,6 +660,91 @@ test "deterministic client Initial through server flight and Finished" {
         else => {},
     };
     try std.testing.expect(saw_handshake_done);
+}
+
+test "application stream frames round trip through protected packets" {
+    const packet_writer = @import("../packet/writer.zig");
+    const packet_header = @import("../packet/header.zig");
+    const frame = @import("../frame/root.zig");
+    const transport_parameters = @import("../crypto/transport_parameters.zig");
+    const limits: Limits = .{
+        .crypto_receive_bytes = 64,
+        .crypto_send_bytes = 64,
+        .tls_output_bytes = 128,
+        .max_streams = 4,
+        .stream_receive_bytes = 64,
+        .stream_send_bytes = 64,
+    };
+    var storage: Storage(limits) = .{};
+    var transcript: [512]u8 = undefined;
+    const credentials = testCredentials();
+    var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+    const keys: protection.Keys = .{ .aes_128_gcm = .{
+        .key = @splat(0x31),
+        .iv = @splat(0x42),
+        .hp = @splat(0x53),
+    } };
+    connection.application_local = keys;
+    connection.application_remote = keys;
+    connection.state = .active;
+    connection.validateAddress();
+    const local: transport_parameters.Values = .{
+        .initial_max_data = 64,
+        .initial_max_stream_data_bidi_remote = 64,
+        .initial_max_streams_bidi = 2,
+    };
+    const peer: transport_parameters.Values = .{
+        .initial_max_data = 64,
+        .initial_max_stream_data_bidi_local = 64,
+        .initial_max_streams_bidi = 2,
+    };
+    try connection.application.applyTransportParameters(local, peer);
+
+    var request_frame_storage: [96]u8 = undefined;
+    const request_body = "request bytes carried by a client stream";
+    const request_frame = try frame.writer.encode(&request_frame_storage, .{ .stream = .{
+        .id = 0,
+        .offset = 0,
+        .data = request_body,
+        .fin = true,
+    } });
+    var request_packet_storage: [160]u8 = undefined;
+    const request_packet = try packet_writer.writeOneRtt(&request_packet_storage, keys, .{
+        .destination_id = "server",
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = request_frame,
+        .key_phase = false,
+    });
+    try connection.receiveDatagram(request_packet.packet, 1);
+    const accepted = connection.acceptStream().?;
+    try std.testing.expectEqual(@as(u64, 0), accepted.value);
+    try std.testing.expectEqualStrings(request_body, try connection.streamReadable(accepted));
+    try connection.consumeStream(accepted, request_body.len);
+
+    const response_body = "server response bytes";
+    try std.testing.expectEqual(response_body.len, try connection.writeStream(accepted, response_body));
+    try connection.finishStream(accepted);
+    var response_datagram_storage: [256]u8 = undefined;
+    var found_response = false;
+    var send_time: u64 = 2 * rtt.millisecond;
+    while (!found_response and send_time < 8 * rtt.millisecond) : (send_time += rtt.millisecond) {
+        const response_datagram = try connection.buildDatagram(&response_datagram_storage, send_time);
+        if (response_datagram.len == 0) continue;
+        const invariant = try packet_header.parse(response_datagram, "client".len);
+        const clear = try keys.unprotect(response_datagram, invariant.packet_number_offset.?, null);
+        var frames: frame.Iterator = .{ .payload = clear.payload };
+        while (try frames.next()) |value| switch (value) {
+            .stream => |value_stream| {
+                try std.testing.expectEqual(@as(u64, 0), value_stream.id);
+                try std.testing.expectEqualStrings(response_body, value_stream.data);
+                try std.testing.expect(value_stream.fin);
+                found_response = true;
+            },
+            else => {},
+        };
+    }
+    try std.testing.expect(found_response);
 }
 
 test "PTO deadline and timeout queue a probe" {

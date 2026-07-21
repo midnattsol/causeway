@@ -32,7 +32,7 @@ pub const SendConnection = struct {
         return self.maximum_data;
     }
 
-    fn markBlocked(self: *SendConnection) void {
+    pub fn markBlocked(self: *SendConnection) void {
         if (self.blocked_reported_at != self.maximum_data) {
             self.blocked_pending = true;
             self.blocked_reported_at = self.maximum_data;
@@ -84,7 +84,7 @@ pub const SendStream = struct {
         return self.maximum_stream_data;
     }
 
-    fn markBlocked(self: *SendStream) void {
+    pub fn markBlocked(self: *SendStream) void {
         if (self.blocked_reported_at != self.maximum_stream_data) {
             self.blocked_pending = true;
             self.blocked_reported_at = self.maximum_stream_data;

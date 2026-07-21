@@ -36,6 +36,7 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
     const index = @intFromEnum(level);
     var ack_included = false;
     var transmission: ?@import("../tls/crypto_stream.zig").Transmission = null;
+    var application_item: @import("application_streams.zig").SentMeta.Item = .none;
 
     if (self.ack_pending[index]) {
         const ack_frame = self.spaces[index].received.ackFrame(0, null, &ack_ranges) catch null;
@@ -54,6 +55,17 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
     if (level == .application and self.handshake_done_pending) {
         const encoded = try frame.writer.encode(payload_storage[payload_length..], .handshake_done);
         payload_length += encoded.len;
+    }
+    if (level == .application and self.application.parameters_applied) {
+        const maximum_stream_data = payload_storage.len - payload_length -| 32;
+        if (try self.application.prepare(maximum_stream_data)) |prepared| {
+            const encoded = frame.writer.encode(payload_storage[payload_length..], prepared.value) catch |err| {
+                try self.application.onLost(prepared.item);
+                return err;
+            };
+            payload_length += encoded.len;
+            application_item = prepared.item;
+        }
     }
 
     const sender = &self.cryptoSpace(level).sender;
@@ -74,14 +86,17 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
     }
 
     const estimated_size = if (level == .initial) @max(@as(usize, 1200), payload_length + 64) else payload_length + 64;
-    const ack_eliciting = transmission != null or self.probe_pending or (level == .application and (self.path_response != null or self.handshake_done_pending));
+    const has_application_item = std.meta.activeTag(application_item) != .none;
+    const ack_eliciting = transmission != null or has_application_item or self.probe_pending or (level == .application and (self.path_response != null or self.handshake_done_pending));
     const congestion_controlled = ack_eliciting;
     if (!self.congestion.canSend(estimated_size, self.probe_pending) or !self.pacer.canSend(estimated_size, congestion_controlled)) {
         if (transmission) |tx| try sender.onLost(tx.offset, tx.data.len);
+        if (has_application_item) try self.application.onLost(application_item);
         return false;
     }
     if (estimated_size > cursor.buffer.len - cursor.offset) {
         if (transmission) |tx| try sender.onLost(tx.offset, tx.data.len);
+        if (has_application_item) try self.application.onLost(application_item);
         return false;
     }
 
@@ -124,6 +139,10 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
     self.congestion.onPacketSent(sent);
     self.pacer.onPacketSent(sent_bytes, congestion_controlled);
     if (transmission) |tx| try rememberCrypto(self, level, packet_number, tx.offset, tx.data.len);
+    if (has_application_item) {
+        try rememberApplication(self, packet_number, application_item);
+        self.application.onPacketSent(application_item);
+    }
     if (ack_included) self.ack_pending[index] = false;
     if (level == .application) {
         if (self.path_response != null) self.path_response = null;
@@ -136,6 +155,15 @@ fn rememberCrypto(self: anytype, level: types.Level, packet_number: u64, offset:
     for (&self.sent_crypto[@intFromEnum(level)]) |*entry| {
         if (entry.valid) continue;
         entry.* = .{ .valid = true, .packet_number = packet_number, .offset = offset, .length = length };
+        return;
+    }
+    return error.SentPacketCapacityExceeded;
+}
+
+fn rememberApplication(self: anytype, packet_number: u64, item: @import("application_streams.zig").SentMeta.Item) !void {
+    for (&self.sent_application) |*entry| {
+        if (entry.valid) continue;
+        entry.* = .{ .valid = true, .packet_number = packet_number, .item = item };
         return;
     }
     return error.SentPacketCapacityExceeded;
@@ -206,14 +234,21 @@ fn markLost(self: anytype, level: types.Level, packet_number: u64) void {
     for (&self.sent_crypto[@intFromEnum(level)]) |*entry| if (entry.valid and entry.packet_number == packet_number) {
         self.cryptoSpace(level).sender.onLost(entry.offset, entry.length) catch {};
         entry.valid = false;
-        return;
+        break;
+    };
+    if (level == .application) for (&self.sent_application) |*entry| {
+        if (!entry.valid or entry.packet_number != packet_number) continue;
+        self.application.onLost(entry.item) catch {};
+        entry.valid = false;
+        break;
     };
 }
 
 fn hasPending(self: anytype) bool {
     if (self.probe_pending or self.path_response != null or self.handshake_done_pending) return true;
     for (self.ack_pending) |pending| if (pending) return true;
-    return self.crypto.initial.sender.sent_offset != self.crypto.initial.sender.write_offset or
+    return self.application.hasPending() or
+        self.crypto.initial.sender.sent_offset != self.crypto.initial.sender.write_offset or
         self.crypto.handshake.sender.sent_offset != self.crypto.handshake.sender.write_offset or
         self.crypto.application.sender.sent_offset != self.crypto.application.sender.write_offset;
 }

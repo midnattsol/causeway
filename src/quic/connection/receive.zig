@@ -2,6 +2,7 @@ const std = @import("std");
 const header = @import("../packet/header.zig");
 const frame = @import("../frame/root.zig");
 const tls_server = @import("../tls/server.zig");
+const transport_parameters = @import("../crypto/transport_parameters.zig");
 const types = @import("types.zig");
 
 pub fn datagram(self: anytype, bytes: []u8, now: u64) !void {
@@ -98,10 +99,61 @@ fn dispatchFrames(self: anytype, level: types.Level, payload: []const u8, now: u
             if (level != .application) return error.IllegalFrame;
             ack_eliciting = true;
         },
-        // Application streams and transport-control frames are intentionally outside this pre-HTTP/3 core.
+        .stream => |value_stream| {
+            try requireApplication(level);
+            ack_eliciting = true;
+            try self.application.onStream(value_stream);
+        },
+        .reset_stream => |reset| {
+            try requireApplication(level);
+            ack_eliciting = true;
+            try self.application.onResetStream(reset);
+        },
+        .stop_sending => |stop| {
+            try requireApplication(level);
+            ack_eliciting = true;
+            try self.application.onStopSending(stop);
+        },
+        .max_data => |maximum| {
+            try requireApplication(level);
+            ack_eliciting = true;
+            try self.application.onMaxData(maximum);
+        },
+        .max_stream_data => |maximum| {
+            try requireApplication(level);
+            ack_eliciting = true;
+            try self.application.onMaxStreamData(maximum);
+        },
+        .max_streams_bidi => |maximum| {
+            try requireApplication(level);
+            ack_eliciting = true;
+            try self.application.onMaxStreams(.bidirectional, maximum);
+        },
+        .max_streams_uni => |maximum| {
+            try requireApplication(level);
+            ack_eliciting = true;
+            try self.application.onMaxStreams(.unidirectional, maximum);
+        },
+        .data_blocked => {
+            try requireApplication(level);
+            ack_eliciting = true;
+        },
+        .stream_data_blocked => |blocked| {
+            try requireApplication(level);
+            ack_eliciting = true;
+            try self.application.onStreamDataBlocked(blocked);
+        },
+        .streams_blocked_bidi, .streams_blocked_uni => {
+            try requireApplication(level);
+            ack_eliciting = true;
+        },
         else => return error.IllegalFrame,
     };
     return ack_eliciting;
+}
+
+fn requireApplication(level: types.Level) !void {
+    if (level != .application) return error.IllegalFrame;
 }
 
 fn driveTls(self: anytype, level: types.Level, now: u64) !void {
@@ -125,6 +177,22 @@ fn driveTls(self: anytype, level: types.Level, now: u64) !void {
         if (outputs.handshake.len != 0) try writeAll(&self.crypto.handshake.sender, outputs.handshake);
         try receiver.consume(message_length);
         self.installTlsKeys();
+        if (!self.application.parameters_applied) {
+            const peer_bytes = self.tls.peerTransportParameters() orelse return error.TransportParameterError;
+            const local = transport_parameters.parse(self.tls.local_transport_parameters, .server) catch {
+                fail(self, types.CloseCode.transport_parameter_error, null, "invalid local transport parameters", now);
+                return error.TransportParameterError;
+            };
+            const peer = transport_parameters.parse(peer_bytes, .client) catch {
+                fail(self, types.CloseCode.transport_parameter_error, null, "invalid peer transport parameters", now);
+                return error.TransportParameterError;
+            };
+            self.application.applyTransportParameters(local, peer) catch {
+                fail(self, types.CloseCode.transport_parameter_error, null, "unsupported transport parameters", now);
+                return error.TransportParameterError;
+            };
+            self.peer_max_ack_delay = peer.max_ack_delay *| @import("../recovery/rtt.zig").millisecond;
+        }
         if (self.tls.state == .connected) {
             self.state = .active;
             self.handshake_done_pending = true;
@@ -144,8 +212,14 @@ fn onAck(self: anytype, level: types.Level, ack: frame.Ack, now: u64) !void {
     self.spaces[index].recordAcknowledgedByPeer(ack.largest) catch |err| return err;
     self.congestion.onPacketsAcknowledged(outcome.acknowledged.slice(), false);
     self.congestion.onPacketsLost(outcome.lost.slice(), outcome.acknowledged.slice(), now, &self.rtt, self.peer_max_ack_delay);
-    for (outcome.acknowledged.slice()) |packet| try markCrypto(self, level, packet.packet_number, true);
-    for (outcome.lost.slice()) |packet| try markCrypto(self, level, packet.packet_number, false);
+    for (outcome.acknowledged.slice()) |packet| {
+        try markCrypto(self, level, packet.packet_number, true);
+        if (level == .application) try markApplication(self, packet.packet_number, true);
+    }
+    for (outcome.lost.slice()) |packet| {
+        try markCrypto(self, level, packet.packet_number, false);
+        if (level == .application) try markApplication(self, packet.packet_number, false);
+    }
     if (outcome.acknowledged.count != 0) self.pto_count = 0;
 }
 
@@ -159,9 +233,24 @@ fn markCrypto(self: anytype, level: types.Level, packet_number: u64, acknowledge
     }
 }
 
+fn markApplication(self: anytype, packet_number: u64, acknowledged: bool) !void {
+    for (&self.sent_application) |*entry| {
+        if (!entry.valid or entry.packet_number != packet_number) continue;
+        if (acknowledged) try self.application.onAcknowledged(entry.item) else try self.application.onLost(entry.item);
+        entry.valid = false;
+        return;
+    }
+}
+
 fn mapError(err: anyerror) u64 {
     return switch (err) {
         error.CryptoBufferExceeded => types.CloseCode.crypto_buffer_exceeded,
+        error.FlowControlError => types.CloseCode.flow_control_error,
+        error.StreamLimitError => types.CloseCode.stream_limit_error,
+        error.StreamStateError => types.CloseCode.stream_state_error,
+        error.FinalSizeError => types.CloseCode.final_size_error,
+        error.ReassemblyLimitExceeded, error.InsufficientRangeCapacity, error.StreamCapacityExceeded => types.CloseCode.internal_error,
+        error.TransportParameterError => types.CloseCode.transport_parameter_error,
         error.UnknownFrameType, error.Truncated, error.InvalidAckRange, error.InvalidAckRanges => types.CloseCode.frame_encoding_error,
         else => types.CloseCode.protocol_violation,
     };
