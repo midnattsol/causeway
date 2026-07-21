@@ -314,6 +314,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             fn handleMessage(self: *Controller, message: Message) !void {
                 switch (message) {
                     .response_ready => |session| self.startResponse(session) catch |err| {
+                        session.suppress_response_body = true;
                         self.streamFailure(session.id, .internal_error, err);
                         session.response_started.set(self.io);
                     },
@@ -618,35 +619,54 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 return progressed;
             }
 
+            const PreparedResponse = struct {
+                suppress_body: bool,
+                expected_length: ?u64,
+                close_after_response: bool,
+                end_stream: bool,
+            };
+
             fn startResponse(self: *Controller, session: *Session) !void {
+                const prepared = try self.prepareResponse(session);
                 const response = &session.response.?;
+                session.suppress_response_body = prepared.suppress_body;
+                session.expected_response_length = prepared.expected_length;
+                session.close_after_response = prepared.close_after_response;
                 if (response.write_deadline) |deadline| {
                     self.tasks.async(self.io, responseTimer, .{ deadline, session.id, &self.messages, &self.wake, self.io });
                 }
-                const response_plan = try response_semantics.plan(
-                    session.request.method,
-                    response.*,
-                    self.peer_settings.max_header_list_size,
-                );
-                session.suppress_response_body = !response_plan.produce_body;
-                session.expected_response_length = response_plan.expected_length;
-                session.close_after_response = response.connection == .close;
-                if (response.body == .stream) try trailer_policy.validateNames(
-                    response.body.stream.trailer_names,
-                    self.owner.options.max_response_trailer_count,
-                    self.owner.options.max_response_trailer_size,
-                );
-                const bytes = response.body.asBytes();
-                const end_stream = session.suppress_response_body or (bytes != null and bytes.?.len == 0 and response.takeover == null);
-                try self.writeResponseHead(session, response.status, response.headers, end_stream);
+                try self.writeResponseHead(session, response.status, response.headers, prepared.end_stream);
                 session.response_started.set(self.io);
-                if (end_stream) {
+                if (prepared.end_stream) {
                     if (self.registry.get(session.id)) |stream| _ = try stream.sendHeaders(true);
                     try self.completeOutput(session);
                 } else if (self.registry.get(session.id)) |stream| {
                     _ = try stream.sendHeaders(false);
                 }
                 session.response_headers_sent = true;
+            }
+
+            fn prepareResponse(self: *Controller, session: *Session) !PreparedResponse {
+                const response = &session.response.?;
+                const plan = try response_semantics.plan(
+                    session.request.method,
+                    response.*,
+                    self.peer_settings.max_header_list_size,
+                );
+                try response_head.validate(response.headers);
+                if (response.body == .stream) try trailer_policy.validateNames(
+                    response.body.stream.trailer_names,
+                    self.owner.options.max_response_trailer_count,
+                    self.owner.options.max_response_trailer_size,
+                );
+                const suppress_body = !plan.produce_body;
+                const bytes = response.body.asBytes();
+                return .{
+                    .suppress_body = suppress_body,
+                    .expected_length = plan.expected_length,
+                    .close_after_response = response.connection == .close,
+                    .end_stream = suppress_body or (bytes != null and bytes.?.len == 0 and response.takeover == null),
+                };
             }
 
             fn writeResponseHead(self: *Controller, session: *Session, status: std.http.Status, headers: Headers, end_stream: bool) !void {

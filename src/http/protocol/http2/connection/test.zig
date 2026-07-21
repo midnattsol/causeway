@@ -112,6 +112,40 @@ test "HTTP/2 invalid application response resets only its stream" {
     try std.testing.expect(serverOutputContains(output.written(), .headers, 3));
 }
 
+test "HTTP/2 invalid response never starts its streaming producer" {
+    const AppState = struct { produced: usize = 0, finalized: usize = 0 };
+    const Producer = struct {
+        state: *AppState,
+        pub fn produce(self: *@This(), _: *Io.Writer) !void {
+            self.state.produced += 1;
+        }
+        pub fn finalize(self: *@This()) void {
+            self.state.finalized += 1;
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            const body = try response_module.Stream.init(context.execution.allocator, Producer{ .state = context.execution.state }, .{});
+            return Response.streaming(.ok, .{ .items = &.{.{ .name = "connection", .value = "close" }} }, body);
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(4));
+    const bytes = frame.client_preface ++
+        "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++
+        "\x00\x00\x03\x01\x05\x00\x00\x00\x01\x82\x87\x84";
+    var input: Io.Reader = .fixed(bytes);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: AppState = .{};
+    var handler = Handler(AppState, Dispatcher).init(std.testing.allocator, &state, .{});
+    try handler.serve(&input, &output.writer, threaded.io());
+    try std.testing.expectEqual(@as(usize, 0), state.produced);
+    try std.testing.expectEqual(@as(usize, 1), state.finalized);
+    try std.testing.expect(serverOutputContains(output.written(), .rst_stream, 1));
+}
+
 test "HTTP/2 keeps valid multiplexed streams alive after a malformed request" {
     const AppState = struct { requests: usize = 0 };
     const Dispatcher = struct {
