@@ -33,6 +33,7 @@ pub fn plan(method: Method, response: Response, peer_header_list_size: u32) !Pla
 
 pub fn enforceHeaderListSize(headers: Headers, maximum: u32) !void {
     var total: u64 = 32 + ":status".len + 3;
+    if (total > maximum) return error.HeaderListTooLarge;
     for (headers.items) |field| {
         total = std.math.add(u64, total, field.name.len) catch return error.HeaderListTooLarge;
         total = std.math.add(u64, total, field.value.len) catch return error.HeaderListTooLarge;
@@ -67,6 +68,10 @@ test "HTTP/2 response plan suppresses semantic bodyless responses" {
     try std.testing.expect(!(try plan(.HEAD, .{ .status = .ok, .body = .{ .bytes = "body" } }, 4096)).produce_body);
     try std.testing.expect(!(try plan(.GET, .{ .status = .no_content }, 4096)).produce_body);
     try std.testing.expectError(error.InvalidFinalStatus, plan(.GET, .{ .status = .early_hints }, 4096));
+}
+
+test "HTTP/2 response plan counts the mandatory status pseudo-header" {
+    try std.testing.expectError(error.HeaderListTooLarge, plan(.GET, .{ .status = .ok }, 0));
 }
 
 test "HTTP/2 response plan validates content length and peer limits" {

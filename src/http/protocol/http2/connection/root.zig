@@ -31,7 +31,7 @@ const Io = std.Io;
 const net = Io.net;
 const options_module = @import("options.zig");
 
-pub const HandlerErrorPolicy = options_module.HandlerErrorPolicy;
+pub const ApplicationErrorPolicy = options_module.ApplicationErrorPolicy;
 pub const Options = options_module.Options;
 
 pub fn Handler(comptime State: type, comptime Dispatcher: type) type {
@@ -627,7 +627,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             };
 
             fn startResponse(self: *Controller, session: *Session) !void {
-                const prepared = try self.prepareResponse(session);
+                const prepared = self.prepareResponse(session) catch |err| return self.recoverApplicationError(session, err);
                 const response = &session.response.?;
                 session.suppress_response_body = prepared.suppress_body;
                 session.expected_response_length = prepared.expected_length;
@@ -667,6 +667,25 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     .close_after_response = response.connection == .close,
                     .end_stream = suppress_body or (bytes != null and bytes.?.len == 0 and response.takeover == null),
                 };
+            }
+
+            fn recoverApplicationError(self: *Controller, session: *Session, err: anyerror) !void {
+                if (self.owner.options.application_error_policy == .reset_stream) return err;
+                session.suppress_response_body = true;
+                session.response.?.complete(.{ .failure = err });
+
+                const fallback = Response{ .status = .internal_server_error };
+                _ = try response_semantics.plan(
+                    session.request.method,
+                    fallback,
+                    self.peer_settings.max_header_list_size,
+                );
+                try self.writeResponseHead(session, fallback.status, fallback.headers, true);
+                const stream = self.registry.get(session.id) orelse return error.StreamClosed;
+                _ = try stream.sendHeaders(true);
+                session.response_headers_sent = true;
+                session.output_done = true;
+                session.response_started.set(self.io);
             }
 
             fn writeResponseHead(self: *Controller, session: *Session, status: std.http.Status, headers: Headers, end_stream: bool) !void {
@@ -1004,7 +1023,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 .exchange = &exchange,
             };
 
-            var response = Dispatcher.dispatch(&context) catch |err| switch (owner.options.handler_error_policy) {
+            var response = Dispatcher.dispatch(&context) catch |err| switch (owner.options.application_error_policy) {
                 .internal_server_error => Response{ .status = .internal_server_error },
                 .reset_stream => return err,
             };

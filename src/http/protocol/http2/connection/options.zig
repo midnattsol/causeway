@@ -4,7 +4,7 @@ const std = @import("std");
 const frame = @import("../frame/root.zig");
 const Io = std.Io;
 
-pub const HandlerErrorPolicy = enum {
+pub const ApplicationErrorPolicy = enum {
     internal_server_error,
     reset_stream,
 };
@@ -35,7 +35,7 @@ pub const Options = struct {
     write_buffer_size: usize = 16 * 1024,
     control_queue_capacity: usize = 256,
     enable_extended_connect: bool = true,
-    handler_error_policy: HandlerErrorPolicy = .internal_server_error,
+    application_error_policy: ApplicationErrorPolicy = .internal_server_error,
 };
 
 pub fn connectionReceiveWindowSize(options: Options) u32 {

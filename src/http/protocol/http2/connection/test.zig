@@ -82,7 +82,7 @@ test "HTTP/2 DATA on an idle stream is a connection protocol error" {
     try std.testing.expect(serverOutputContains(output.written(), .goaway, 0));
 }
 
-test "HTTP/2 invalid application response resets only its stream" {
+test "HTTP/2 invalid application response becomes a 500 on only its stream" {
     const AppState = struct { requests: usize = 0 };
     const Dispatcher = struct {
         pub fn dispatch(context: anytype) !Response {
@@ -108,12 +108,77 @@ test "HTTP/2 invalid application response resets only its stream" {
     var handler = Handler(AppState, Dispatcher).init(std.testing.allocator, &state, .{});
     try handler.serve(&input, &output.writer, threaded.io());
     try std.testing.expectEqual(@as(usize, 2), state.requests);
-    try std.testing.expect(serverOutputContains(output.written(), .rst_stream, 1));
+    try std.testing.expect(!serverOutputContains(output.written(), .rst_stream, 1));
+    try std.testing.expect(serverOutputContains(output.written(), .headers, 1));
+    try std.testing.expect(serverHeadersStartWith(output.written(), 1, "\x8e"));
     try std.testing.expect(serverOutputContains(output.written(), .headers, 3));
 }
 
-test "HTTP/2 invalid response never starts its streaming producer" {
-    const AppState = struct { produced: usize = 0, finalized: usize = 0 };
+test "HTTP/2 strict application error policy resets an invalid response" {
+    const AppState = struct {};
+    const Dispatcher = struct {
+        pub fn dispatch(_: anytype) !Response {
+            return .{
+                .status = .ok,
+                .headers = .{ .items = &.{.{ .name = "connection", .value = "close" }} },
+            };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(3));
+    const bytes = frame.client_preface ++
+        "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++
+        "\x00\x00\x03\x01\x05\x00\x00\x00\x01\x82\x87\x84";
+    var input: Io.Reader = .fixed(bytes);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: AppState = .{};
+    var handler = Handler(AppState, Dispatcher).init(std.testing.allocator, &state, .{
+        .application_error_policy = .reset_stream,
+    });
+    try handler.serve(&input, &output.writer, threaded.io());
+    try std.testing.expect(serverOutputContains(output.written(), .rst_stream, 1));
+    try std.testing.expect(!serverOutputContains(output.written(), .headers, 1));
+}
+
+test "HTTP/2 resets when the peer cannot accept even a minimal 500" {
+    const AppState = struct {};
+    const Dispatcher = struct {
+        pub fn dispatch(_: anytype) !Response {
+            return .{
+                .status = .ok,
+                .headers = .{ .items = &.{.{ .name = "connection", .value = "close" }} },
+            };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(3));
+    const bytes = frame.client_preface ++
+        "\x00\x00\x06\x04\x00\x00\x00\x00\x00\x00\x06\x00\x00\x00\x00" ++
+        "\x00\x00\x03\x01\x05\x00\x00\x00\x01\x82\x87\x84";
+    var input: Io.Reader = .fixed(bytes);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: AppState = .{};
+    var handler = Handler(AppState, Dispatcher).init(std.testing.allocator, &state, .{});
+    try handler.serve(&input, &output.writer, threaded.io());
+    try std.testing.expect(serverOutputContains(output.written(), .rst_stream, 1));
+    try std.testing.expect(!serverOutputContains(output.written(), .headers, 1));
+}
+
+test "HTTP/2 invalid response completes with failure without starting its producer" {
+    const AppState = struct { produced: usize = 0, finalized: usize = 0, completion_error: ?anyerror = null };
+    const Observer = struct {
+        state: *AppState,
+        pub fn complete(self: *@This(), result: response_module.CompletionResult) void {
+            self.state.completion_error = switch (result) {
+                .success => null,
+                .failure => |err| err,
+            };
+        }
+    };
     const Producer = struct {
         state: *AppState,
         pub fn produce(self: *@This(), _: *Io.Writer) !void {
@@ -126,7 +191,13 @@ test "HTTP/2 invalid response never starts its streaming producer" {
     const Dispatcher = struct {
         pub fn dispatch(context: anytype) !Response {
             const body = try response_module.Stream.init(context.execution.allocator, Producer{ .state = context.execution.state }, .{});
-            return Response.streaming(.ok, .{ .items = &.{.{ .name = "connection", .value = "close" }} }, body);
+            var response = Response.streaming(.ok, .{ .items = &.{.{ .name = "connection", .value = "close" }} }, body);
+            response.completion = try response_module.Completion.create(
+                context.execution.allocator,
+                Observer{ .state = context.execution.state },
+                null,
+            );
+            return response;
         }
     };
     var threaded = Io.Threaded.init(std.testing.allocator, .{});
@@ -143,7 +214,9 @@ test "HTTP/2 invalid response never starts its streaming producer" {
     try handler.serve(&input, &output.writer, threaded.io());
     try std.testing.expectEqual(@as(usize, 0), state.produced);
     try std.testing.expectEqual(@as(usize, 1), state.finalized);
-    try std.testing.expect(serverOutputContains(output.written(), .rst_stream, 1));
+    try std.testing.expectEqual(error.ConnectionSpecificHeader, state.completion_error.?);
+    try std.testing.expect(!serverOutputContains(output.written(), .rst_stream, 1));
+    try std.testing.expect(serverHeadersStartWith(output.written(), 1, "\x8e"));
 }
 
 test "HTTP/2 keeps valid multiplexed streams alive after a malformed request" {
@@ -556,6 +629,22 @@ fn serverDataLength(bytes: []const u8, stream_id: u32) usize {
         cursor += header.length;
     }
     return total;
+}
+
+fn serverHeadersStartWith(bytes: []const u8, stream_id: u32, prefix: []const u8) bool {
+    var cursor: usize = 0;
+    while (bytes.len - cursor >= frame.header_size) {
+        const header_bytes: *const [frame.header_size]u8 = @ptrCast(bytes[cursor..][0..frame.header_size]);
+        const header = frame.Header.parse(header_bytes);
+        cursor += frame.header_size;
+        if (header.length > bytes.len - cursor) return false;
+        const payload = bytes[cursor..][0..header.length];
+        if (header.frame_type == .headers and header.stream_id == stream_id) {
+            return std.mem.startsWith(u8, payload, prefix);
+        }
+        cursor += header.length;
+    }
+    return false;
 }
 
 fn serverOutputContains(bytes: []const u8, frame_type: frame.Type, stream_id: u32) bool {
