@@ -91,6 +91,17 @@ pub fn build(b: *std.Build) void {
     });
     const run_http2_fuzz_tests = b.addRunArtifact(http2_fuzz_tests);
 
+    const http3_fuzz_tests = b.addTest(.{
+        .name = "HTTP3 fuzz tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/http3_fuzz_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .use_llvm = true,
+    });
+    const run_http3_fuzz_tests = b.addRunArtifact(http3_fuzz_tests);
+
     const quic_fuzz_tests = b.addTest(.{
         .name = "QUIC fuzz tests",
         .root_module = b.createModule(.{
@@ -156,6 +167,9 @@ pub fn build(b: *std.Build) void {
 
     const http2_fuzz_step = b.step("http2-fuzz", "Fuzz HTTP/2 frames and connection state");
     http2_fuzz_step.dependOn(&run_http2_fuzz_tests.step);
+
+    const http3_fuzz_step = b.step("http3-fuzz", "Fuzz HTTP/3 and QPACK wire state");
+    http3_fuzz_step.dependOn(&run_http3_fuzz_tests.step);
 
     const quic_fuzz_step = b.step("quic-fuzz", "Fuzz QUIC wire and connection state");
     quic_fuzz_step.dependOn(&run_quic_fuzz_tests.step);
