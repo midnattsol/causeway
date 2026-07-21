@@ -267,6 +267,8 @@ fn deterministicEntropy(_: ?*anyopaque, bytes: []u8) void {
 fn installTestConnection(server: *TestServer, generation: u64, server_id: []const u8) !void {
     const slot = &server.endpoint.slots[0];
     slot.storage = .{};
+    slot.paths = @TypeOf(slot.paths).init(.{ .ip4 = .loopback(4433) }, .{});
+    slot.paths.validateInitial();
     slot.connection = try TestServer.QuicEndpoint.Connection.init(&slot.storage, .{
         .original_destination_id = "original",
         .client_source_id = "client",

@@ -20,7 +20,7 @@ pub fn datagram(self: anytype, bytes: []u8, now: u64) !void {
             continue;
         };
         if (!validDestination(self, invariant.destination_id, level) or
-            (invariant.isLong() and invariant.source_id.len != 0 and !std.mem.eql(u8, invariant.source_id, self.clientConnectionId())))
+            (invariant.isLong() and invariant.source_id.len != 0 and !std.mem.eql(u8, invariant.source_id, self.initialClientConnectionId())))
         {
             cursor = packet_end;
             continue;
@@ -40,6 +40,10 @@ pub fn datagram(self: anytype, bytes: []u8, now: u64) !void {
                 else
                     keys.unprotect(packet, pn_offset, largest),
             } catch {
+                if (invariant.packet_type == .short and self.recognizesStatelessReset(packet)) {
+                    self.onStatelessReset(now);
+                    return;
+                }
                 cursor = packet_end;
                 continue;
             };
@@ -50,7 +54,8 @@ pub fn datagram(self: anytype, bytes: []u8, now: u64) !void {
             const recorded = try self.space(level).recordReceived(clear.packet_number);
             if (recorded == .inserted) {
                 if (level == .handshake) self.address_validated = true;
-                const ack_eliciting = dispatchFrames(self, level, clear.payload, now) catch |err| {
+                const destination_sequence = self.localConnectionIdSequence(invariant.destination_id) orelse 0;
+                const ack_eliciting = dispatchFrames(self, level, destination_sequence, clear.payload, now) catch |err| {
                     if (self.state != .closing) fail(self, mapError(err), null, "invalid frame", now);
                     return err;
                 };
@@ -72,11 +77,11 @@ fn packetLevel(packet_type: header.Type) ?types.Level {
 }
 
 fn validDestination(self: anytype, id: []const u8, level: types.Level) bool {
-    if (std.mem.eql(u8, id, self.serverConnectionId())) return true;
+    if (self.acceptsLocalConnectionId(id)) return true;
     return level == .initial and std.mem.eql(u8, id, self.originalDestinationId());
 }
 
-fn dispatchFrames(self: anytype, level: types.Level, payload: []const u8, now: u64) !bool {
+fn dispatchFrames(self: anytype, level: types.Level, destination_sequence: u64, payload: []const u8, now: u64) !bool {
     var iterator: frame.Iterator = .{ .payload = payload };
     var ack_eliciting = false;
     while (try iterator.next()) |value| switch (value) {
@@ -96,14 +101,25 @@ fn dispatchFrames(self: anytype, level: types.Level, payload: []const u8, now: u
             self.peerClose(close.error_code, close.frame_type, close.reason, now);
             return false;
         },
-        .path_challenge => |challenge| {
-            if (level != .application) return error.IllegalFrame;
+        .new_connection_id => |connection_id| {
+            try requireApplication(level);
             ack_eliciting = true;
-            self.path_response = challenge;
+            try self.cids.onNew(connection_id);
         },
-        .path_response => {
-            if (level != .application) return error.IllegalFrame;
+        .retire_connection_id => |sequence| {
+            try requireApplication(level);
             ack_eliciting = true;
+            try self.cids.onRetire(sequence, destination_sequence);
+        },
+        .path_challenge => |challenge| {
+            try requireApplication(level);
+            ack_eliciting = true;
+            try self.received_path_frames.push(.{ .kind = .challenge, .data = challenge });
+        },
+        .path_response => |response| {
+            try requireApplication(level);
+            ack_eliciting = true;
+            try self.received_path_frames.push(.{ .kind = .response, .data = response });
         },
         .stream => |value_stream| {
             try requireApplication(level);
@@ -197,6 +213,10 @@ fn driveTls(self: anytype, level: types.Level, now: u64) !void {
                 fail(self, types.CloseCode.transport_parameter_error, null, "unsupported transport parameters", now);
                 return error.TransportParameterError;
             };
+            self.cids.applyLimits(local.active_connection_id_limit, peer.active_connection_id_limit) catch {
+                fail(self, types.CloseCode.transport_parameter_error, null, "connection ID limit exceeds capacity", now);
+                return error.TransportParameterError;
+            };
             self.peer_max_ack_delay = peer.max_ack_delay *| @import("../recovery/rtt.zig").millisecond;
         }
         if (self.tls.state == .connected) {
@@ -220,11 +240,19 @@ fn onAck(self: anytype, level: types.Level, ack: frame.Ack, now: u64) !void {
     self.congestion.onPacketsLost(outcome.lost.slice(), outcome.acknowledged.slice(), now, &self.rtt, self.peer_max_ack_delay);
     for (outcome.acknowledged.slice()) |packet| {
         try markCrypto(self, level, packet.packet_number, true);
-        if (level == .application) try markApplication(self, packet.packet_number, true);
+        if (level == .application) {
+            try markApplication(self, packet.packet_number, true);
+            markConnectionId(self, packet.packet_number, true);
+            markPathControl(self, packet.packet_number, true);
+        }
     }
     for (outcome.lost.slice()) |packet| {
         try markCrypto(self, level, packet.packet_number, false);
-        if (level == .application) try markApplication(self, packet.packet_number, false);
+        if (level == .application) {
+            try markApplication(self, packet.packet_number, false);
+            markConnectionId(self, packet.packet_number, false);
+            markPathControl(self, packet.packet_number, false);
+        }
     }
     if (outcome.acknowledged.count != 0) self.pto_count = 0;
 }
@@ -251,6 +279,26 @@ fn markApplication(self: anytype, packet_number: u64, acknowledged: bool) !void 
     }
 }
 
+fn markConnectionId(self: anytype, packet_number: u64, acknowledged: bool) void {
+    for (&self.sent_connection_ids) |*entry| {
+        if (!entry.valid or entry.packet_number != packet_number) continue;
+        if (!acknowledged) self.cids.requeue(switch (entry.kind) {
+            .new => .new,
+            .retire => .retire,
+        }, entry.sequence);
+        entry.valid = false;
+        return;
+    }
+}
+
+fn markPathControl(self: anytype, packet_number: u64, acknowledged: bool) void {
+    for (&self.sent_path_controls) |*entry| {
+        if (!entry.valid or entry.packet_number != packet_number) continue;
+        if (acknowledged) entry.* = .{} else entry.lost = true;
+        return;
+    }
+}
+
 fn mapError(err: anyerror) u64 {
     return switch (err) {
         error.CryptoBufferExceeded => types.CloseCode.crypto_buffer_exceeded,
@@ -260,6 +308,7 @@ fn mapError(err: anyerror) u64 {
         error.FinalSizeError => types.CloseCode.final_size_error,
         error.ReassemblyLimitExceeded, error.InsufficientRangeCapacity, error.StreamCapacityExceeded => types.CloseCode.internal_error,
         error.TransportParameterError => types.CloseCode.transport_parameter_error,
+        error.ConnectionIdLimitExceeded => types.CloseCode.connection_id_limit_error,
         error.UnknownFrameType, error.Truncated, error.InvalidAckRange, error.InvalidAckRanges => types.CloseCode.frame_encoding_error,
         else => types.CloseCode.protocol_violation,
     };

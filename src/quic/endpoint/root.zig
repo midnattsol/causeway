@@ -26,6 +26,14 @@ pub const Policy = struct {
     connection_id_length: u8 = 16,
     /// Optional deterministic entropy source for tests. Production defaults to `io.random`.
     entropy: ?Entropy = null,
+    /// NAT rebinding (same IP, new port) remains permitted when active migration is disabled.
+    allow_nat_rebinding: bool = true,
+    /// Unsafe by default: normally even rebinding is validated before becoming active.
+    allow_unvalidated_nat_rebinding: bool = false,
+    /// Overrides the connection PTO for path validation retries when set.
+    path_validation_interval: ?u64 = null,
+    /// Total probe transmissions, including the initial PATH_CHALLENGE.
+    path_validation_attempts: u8 = 3,
 };
 
 pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity: usize, comptime batch_size: usize) type {
@@ -36,6 +44,7 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
         const Self = @This();
         pub const Connection = connection.Connection(connection_limits);
         const Storage = connection.Storage(connection_limits);
+        const PathManager = connection.path.Manager(connection_limits.paths);
         pub const capacity_value = capacity;
         pub const transcript_bytes = connection_limits.tls_transcript_bytes;
 
@@ -44,7 +53,7 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
             transcript: [transcript_bytes]u8 = undefined,
             encoded_transport_parameters: [512]u8 = undefined,
             connection: Connection = undefined,
-            peer: net.IpAddress = undefined,
+            paths: PathManager = undefined,
             occupied: bool = false,
             /// Changes on every admission so external per-connection state cannot
             /// be confused with a later connection reusing this fixed slot.
@@ -64,6 +73,10 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
         pub fn init(self: *Self, socket: net.Socket, policy: Policy) !void {
             if (policy.connection_id_length == 0 or policy.connection_id_length > header.maximum_connection_id_length)
                 return error.InvalidConnectionIdLength;
+            if (policy.transport_parameters.active_connection_id_limit > connection_limits.active_connection_ids)
+                return error.ActiveConnectionIdLimitExceedsCapacity;
+            if (policy.path_validation_attempts == 0 or policy.path_validation_interval == 0)
+                return error.InvalidPathValidationPolicy;
             self.* = .{ .socket = socket, .policy = policy };
         }
 
@@ -116,14 +129,25 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
                 if (message.flags.trunc or message.data.len == 0) continue;
                 const invariant = header.parse(message.data, self.policy.connection_id_length) catch continue;
                 if (self.find(invariant.destination_id)) |slot| {
-                    if (!net.IpAddress.eql(&slot.peer, &message.from)) continue;
+                    var challenge: [8]u8 = undefined;
+                    self.fillEntropy(io, &challenge);
+                    const path_index = slot.paths.observe(message.from, message.data.len, challenge) catch continue;
                     slot.connection.receiveDatagram(message.data, now) catch {};
+                    if (slot.connection.address_validated) slot.paths.validateInitial();
+                    self.routePathFrames(slot, path_index);
+                    self.replenishConnectionIds(io, slot);
                     continue;
+                }
+                if (invariant.packet_type == .short) {
+                    if (self.findStatelessReset(message.data)) |slot| {
+                        slot.connection.onStatelessReset(now);
+                        continue;
+                    }
                 }
                 if (self.shutting_down or message.data.len < 1200 or invariant.packet_type != .initial or
                     invariant.version != header.version_1 or invariant.destination_id.len < 8) continue;
                 const slot = self.freeSlot() orelse continue;
-                var entropy_bytes: [84]u8 = undefined;
+                var entropy_bytes: [100]u8 = undefined;
                 const cid_len: usize = self.policy.connection_id_length;
                 var unique_cid = false;
                 for (0..4) |_| {
@@ -135,11 +159,19 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
                 }
                 if (!unique_cid) continue;
                 slot.storage = .{};
-                slot.peer = message.from;
+                slot.paths = PathManager.init(message.from, .{
+                    .disable_active_migration = self.policy.transport_parameters.disable_active_migration,
+                    .allow_nat_rebinding = self.policy.allow_nat_rebinding,
+                    .allow_unvalidated_nat_rebinding = self.policy.allow_unvalidated_nat_rebinding,
+                    .max_validation_attempts = self.policy.path_validation_attempts,
+                });
+                _ = slot.paths.observe(message.from, message.data.len, @splat(0)) catch unreachable;
                 var parameter_values = self.policy.transport_parameters;
                 parameter_values.original_destination_connection_id = invariant.destination_id;
                 parameter_values.initial_source_connection_id = entropy_bytes[0..cid_len];
                 parameter_values.retry_source_connection_id = null;
+                const reset_token: *const [16]u8 = @ptrCast(entropy_bytes[84..100]);
+                parameter_values.stateless_reset_token = reset_token;
                 const encoded_parameters = transport_parameters.encode(
                     &slot.encoded_transport_parameters,
                     parameter_values,
@@ -149,6 +181,7 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
                     .original_destination_id = invariant.destination_id,
                     .client_source_id = invariant.source_id,
                     .server_connection_id = entropy_bytes[0..cid_len],
+                    .server_reset_token = reset_token.*,
                     .tls = .{
                         .credentials = self.policy.credentials,
                         .server_random = entropy_bytes[20..52].*,
@@ -171,6 +204,9 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
             for (&self.slots) |*slot| {
                 if (!slot.occupied) continue;
                 if (slot.connection.nextDeadline(now)) |deadline| if (now >= deadline) slot.connection.onTimeout(now);
+                self.routeLostPathControls(slot);
+                const interval = self.pathValidationInterval(slot);
+                if (slot.paths.nextDeadline(interval)) |deadline| if (now >= deadline) slot.paths.onTimeout(now, interval);
             }
             const sent = try self.flush(io, now);
             self.reap();
@@ -182,6 +218,8 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
             for (&self.slots) |*slot| {
                 if (!slot.occupied) continue;
                 if (slot.connection.nextDeadline(now)) |deadline|
+                    result = if (result) |current| @min(current, deadline) else deadline;
+                if (slot.paths.nextDeadline(self.pathValidationInterval(slot))) |deadline|
                     result = if (result) |current| @min(current, deadline) else deadline;
             }
             return result;
@@ -211,9 +249,49 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
 
         fn find(self: *Self, destination_id: []const u8) ?*Slot {
             for (&self.slots) |*slot| {
-                if (slot.occupied and std.mem.eql(u8, slot.connection.serverConnectionId(), destination_id)) return slot;
+                if (slot.occupied and slot.connection.acceptsLocalConnectionId(destination_id)) return slot;
             }
             return null;
+        }
+
+        fn findStatelessReset(self: *Self, packet: []const u8) ?*Slot {
+            for (&self.slots) |*slot| {
+                if (slot.occupied and slot.connection.recognizesStatelessReset(packet)) return slot;
+            }
+            return null;
+        }
+
+        fn routePathFrames(self: *Self, slot: *Slot, path_index: usize) void {
+            while (slot.connection.nextPathFrame()) |event| switch (event.kind) {
+                .challenge => slot.paths.onChallenge(path_index, event.data),
+                .response => _ = slot.paths.onResponse(path_index, event.data),
+            };
+            self.routeLostPathControls(slot);
+        }
+
+        fn routeLostPathControls(_: *Self, slot: *Slot) void {
+            while (slot.connection.nextLostPathControl()) |key| _ = slot.paths.onControlLost(key);
+        }
+
+        fn pathValidationInterval(self: *const Self, slot: *const Slot) u64 {
+            return self.policy.path_validation_interval orelse slot.connection.pathValidationInterval();
+        }
+
+        fn replenishConnectionIds(self: *Self, io: Io, slot: *Slot) void {
+            while (slot.connection.needsLocalConnectionId()) {
+                var entropy_bytes: [36]u8 = undefined;
+                var issued = false;
+                for (0..4) |_| {
+                    self.fillEntropy(io, &entropy_bytes);
+                    const id = entropy_bytes[0..self.policy.connection_id_length];
+                    if (self.find(id) != null) continue;
+                    const token: [16]u8 = entropy_bytes[20..36].*;
+                    _ = slot.connection.issueLocalConnectionId(id, token) catch continue;
+                    issued = true;
+                    break;
+                }
+                if (!issued) return;
+            }
         }
 
         fn freeSlot(self: *Self) ?*Slot {
@@ -225,13 +303,38 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
             var count: usize = 0;
             for (&self.slots) |*slot| {
                 if (!slot.occupied or count == batch_size) continue;
-                const output = slot.connection.buildDatagram(&self.send_storage[count], now) catch continue;
+                self.replenishConnectionIds(io, slot);
+
+                self.routeLostPathControls(slot);
+                if (slot.paths.prepareControl()) |control| {
+                    const allowance: usize = @intCast(@min(slot.paths.allowance(control.path_index), std.math.maxInt(usize)));
+                    const capacity_for_path = @min(self.send_storage[count].len, allowance);
+                    if (capacity_for_path != 0) {
+                        const output = slot.connection.buildPathDatagram(self.send_storage[count][0..capacity_for_path], control.value, control.key, now) catch continue;
+                        if (output.len != 0) {
+                            self.send_messages[count] = .{
+                                .address = slot.paths.address(control.path_index),
+                                .data_ptr = output.ptr,
+                                .data_len = output.len,
+                            };
+                            slot.paths.recordSent(control.path_index, output.len);
+                            slot.paths.markControlSent(control, now);
+                            count += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                const active_index = slot.paths.active_index;
+                const allowance: usize = @intCast(@min(slot.paths.allowance(active_index), std.math.maxInt(usize)));
+                const output = slot.connection.buildDatagram(self.send_storage[count][0..@min(self.send_storage[count].len, allowance)], now) catch continue;
                 if (output.len == 0) continue;
                 self.send_messages[count] = .{
-                    .address = &slot.peer,
+                    .address = slot.paths.activeAddress(),
                     .data_ptr = output.ptr,
                     .data_len = output.len,
                 };
+                slot.paths.recordSent(active_index, output.len);
                 count += 1;
             }
             if (count != 0) try self.socket.sendMany(io, self.send_messages[0..count], .{});
@@ -254,6 +357,18 @@ fn testCredentials() tls_server.ServerCredentials {
 fn deterministicEntropy(_: ?*anyopaque, bytes: []u8) void {
     for (bytes, 0..) |*byte, index| byte.* = @truncate(index + 1);
 }
+
+const CountingEntropy = struct {
+    next: u8 = 1,
+
+    fn fill(context: ?*anyopaque, bytes: []u8) void {
+        const self: *CountingEntropy = @ptrCast(@alignCast(context.?));
+        for (bytes) |*byte| {
+            byte.* = self.next;
+            self.next +%= 1;
+        }
+    }
+};
 
 fn incoming(from: net.IpAddress, data: []u8) net.IncomingMessage {
     return .{
@@ -314,6 +429,142 @@ test "endpoint bounds its pool, demuxes by server CID, enforces peer, and reaps"
     endpoint.slots[0].connection.state = .closed;
     endpoint.reap();
     try std.testing.expectEqual(@as(usize, 0), endpoint.activeCount());
+}
+
+test "endpoint demuxes all active local CIDs and entropy replaces retired IDs" {
+    const limits: connection.Limits = .{
+        .crypto_receive_bytes = 64,
+        .crypto_send_bytes = 64,
+        .tls_output_bytes = 128,
+        .active_connection_ids = 3,
+    };
+    const E = Endpoint(limits, 1, 2);
+    const credentials = testCredentials();
+    var entropy_state: CountingEntropy = .{};
+    var endpoint: E = undefined;
+    try endpoint.init(undefined, .{
+        .credentials = &credentials,
+        .connection_id_length = 8,
+        .entropy = .{ .context = &entropy_state, .fillFn = CountingEntropy.fill },
+    });
+    const slot = &endpoint.slots[0];
+    slot.storage = .{};
+    slot.paths = @TypeOf(slot.paths).init(.{ .ip4 = .loopback(4433) }, .{});
+    slot.connection = try E.Connection.init(&slot.storage, .{
+        .original_destination_id = "original",
+        .client_source_id = "client",
+        .server_connection_id = "server00",
+        .server_reset_token = @splat(0x11),
+        .tls = .{
+            .credentials = &credentials,
+            .server_random = @splat(0x53),
+            .x25519 = .{ .seed = @splat(0x22) },
+            .transport_parameters = "",
+            .transcript_scratch = &slot.transcript,
+        },
+        .now = 0,
+    });
+    try slot.connection.cids.applyLimits(3, 3);
+    slot.occupied = true;
+
+    endpoint.replenishConnectionIds(std.testing.io, slot);
+    try std.testing.expectEqual(@as(u64, 3), slot.connection.cids.localActiveCount());
+    const first_replacement = slot.connection.cids.local[1].connectionId();
+    try std.testing.expect(endpoint.find(first_replacement) == slot);
+    try slot.connection.cids.onRetire(1, 0);
+    try std.testing.expect(endpoint.find(first_replacement) == null);
+
+    endpoint.replenishConnectionIds(std.testing.io, slot);
+    try std.testing.expectEqual(@as(u64, 3), slot.connection.cids.localActiveCount());
+    try std.testing.expectEqual(@as(u64, 3), slot.connection.cids.local[1].sequence);
+    try std.testing.expect(endpoint.find(slot.connection.cids.local[1].connectionId()) == slot);
+}
+
+test "endpoint path deadline drives bounded retry and eviction" {
+    const limits: connection.Limits = .{
+        .crypto_receive_bytes = 64,
+        .crypto_send_bytes = 64,
+        .tls_output_bytes = 128,
+        .paths = 2,
+    };
+    const E = Endpoint(limits, 1, 1);
+    const credentials = testCredentials();
+    var endpoint: E = undefined;
+    try endpoint.init(undefined, .{
+        .credentials = &credentials,
+        .path_validation_interval = 10,
+        .path_validation_attempts = 2,
+    });
+    const slot = &endpoint.slots[0];
+    slot.storage = .{};
+    slot.paths = @TypeOf(slot.paths).init(.{ .ip4 = .loopback(4433) }, .{ .max_validation_attempts = 2 });
+    slot.paths.validateInitial();
+    slot.connection = try E.Connection.init(&slot.storage, .{
+        .original_destination_id = "original",
+        .client_source_id = "client",
+        .server_connection_id = "server",
+        .tls = .{
+            .credentials = &credentials,
+            .server_random = @splat(0x53),
+            .x25519 = .{ .seed = @splat(0x22) },
+            .transport_parameters = "",
+            .transcript_scratch = &slot.transcript,
+        },
+        .now = 0,
+    });
+    slot.occupied = true;
+    const candidate: net.IpAddress = .{ .ip4 = .loopback(4434) };
+    const path_index = try slot.paths.observe(candidate, 100, "12345678".*);
+    var control = slot.paths.prepareControl().?;
+    slot.paths.markControlSent(control, 10);
+    try std.testing.expectEqual(@as(?u64, 20), endpoint.nextDeadline(10));
+
+    try std.testing.expectEqual(@as(usize, 0), try endpoint.drive(std.testing.io, 20));
+    try std.testing.expect(slot.paths.entries[path_index].challenge_pending);
+    control = slot.paths.prepareControl().?;
+    slot.paths.markControlSent(control, 20);
+    try std.testing.expectEqual(@as(usize, 0), try endpoint.drive(std.testing.io, 30));
+    try std.testing.expect(!slot.paths.entries[path_index].occupied);
+    try std.testing.expectEqual(@as(usize, 0), slot.paths.active_index);
+}
+
+test "endpoint promptly requeues lost path control metadata" {
+    const limits: connection.Limits = .{
+        .crypto_receive_bytes = 64,
+        .crypto_send_bytes = 64,
+        .tls_output_bytes = 128,
+        .paths = 2,
+    };
+    const E = Endpoint(limits, 1, 1);
+    const credentials = testCredentials();
+    var endpoint: E = undefined;
+    try endpoint.init(undefined, .{ .credentials = &credentials, .path_validation_interval = 100 });
+    const slot = &endpoint.slots[0];
+    slot.storage = .{};
+    slot.paths = @TypeOf(slot.paths).init(.{ .ip4 = .loopback(4433) }, .{});
+    slot.connection = try E.Connection.init(&slot.storage, .{
+        .original_destination_id = "original",
+        .client_source_id = "client",
+        .server_connection_id = "server",
+        .tls = .{
+            .credentials = &credentials,
+            .server_random = @splat(0x53),
+            .x25519 = .{ .seed = @splat(0x22) },
+            .transport_parameters = "",
+            .transcript_scratch = &slot.transcript,
+        },
+        .now = 0,
+    });
+    slot.occupied = true;
+    const path_index = try slot.paths.observe(.{ .ip4 = .loopback(4434) }, 100, @splat(7));
+    const control = slot.paths.prepareControl().?;
+    slot.paths.markControlSent(control, 10);
+    slot.connection.sent_path_controls[0] = .{ .valid = true, .lost = true, .control_key = control.key };
+
+    try std.testing.expectEqual(@as(usize, 0), try endpoint.drive(std.testing.io, 11));
+    try std.testing.expect(slot.paths.entries[path_index].challenge_pending);
+    try std.testing.expect(!slot.paths.entries[path_index].challenge_in_flight);
+    try std.testing.expect(slot.paths.prepareControl().?.key != control.key);
 }
 
 test "endpoint loopback UDP poll receives an Initial" {

@@ -29,6 +29,52 @@ pub fn build(self: anytype, output: []u8, now: u64) ![]u8 {
     return bytes;
 }
 
+/// Builds one address-specific 1-RTT path validation packet. The endpoint
+/// supplies an output slice already capped by that path's amplification budget.
+pub fn buildPath(self: anytype, output: []u8, value: frame.Frame, control_key: u64, now: u64) ![]u8 {
+    if (self.state == .closed or self.state == .draining or self.sendKeys(.application) == null) return output[0..0];
+    self.pacer.update(now, self.congestion.congestion_window, self.rtt.smoothed);
+    switch (value) {
+        .path_challenge, .path_response => {},
+        else => return error.IllegalPathFrame,
+    }
+    var payload_storage: [32]u8 = undefined;
+    const encoded = try frame.writer.encode(&payload_storage, value);
+    var payload_length = encoded.len;
+    if (payload_length < 4) {
+        @memset(payload_storage[payload_length..4], 0);
+        payload_length = 4;
+    }
+    const estimated_size = payload_length + 64;
+    if (estimated_size > output.len or !self.congestion.canSend(estimated_size, false) or
+        !self.pacer.canSend(estimated_size, true)) return output[0..0];
+
+    const level: types.Level = .application;
+    const packet_number = try self.space(level).allocatePacketNumber();
+    var cursor = packet_writer.Cursor.init(output);
+    _ = try cursor.oneRtt(self.sendKeys(level).?, .{
+        .destination_id = self.clientConnectionId(),
+        .packet_number = packet_number,
+        .packet_number_length = 2,
+        .payload = payload_storage[0..payload_length],
+        .key_phase = if (self.application_send_keys) |keys| keys.phase() else false,
+    });
+    const sent: loss.SentPacket = .{
+        .packet_number = packet_number,
+        .time_sent = now,
+        .sent_bytes = cursor.offset,
+        .ack_eliciting = true,
+        .in_flight = true,
+    };
+    try self.detector(level).onPacketSent(sent);
+    self.congestion.onPacketSent(sent);
+    self.pacer.onPacketSent(cursor.offset, true);
+    try rememberApplication(self, packet_number, self.application_send_generation, .none);
+    try rememberPathControl(self, packet_number, control_key);
+    self.bytes_sent +|= cursor.offset;
+    return cursor.bytes();
+}
+
 fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level, now: u64) !bool {
     var payload_storage: [1200]u8 = undefined;
     var payload_length: usize = 0;
@@ -37,6 +83,7 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
     var ack_included = false;
     var transmission: ?@import("../tls/crypto_stream.zig").Transmission = null;
     var application_item: @import("application_streams.zig").SentMeta.Item = .none;
+    var connection_id_frame: ?frame.Frame = null;
 
     if (self.ack_pending[index]) {
         const ack_frame = self.spaces[index].received.ackFrame(0, null, &ack_ranges) catch null;
@@ -47,9 +94,10 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
         }
     }
     if (level == .application) {
-        if (self.path_response) |response| {
-            const encoded = try frame.writer.encode(payload_storage[payload_length..], .{ .path_response = response });
+        if (self.cids.pendingFrame()) |pending| {
+            const encoded = try frame.writer.encode(payload_storage[payload_length..], pending);
             payload_length += encoded.len;
+            connection_id_frame = pending;
         }
     }
     if (level == .application and self.handshake_done_pending) {
@@ -87,7 +135,7 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
 
     const estimated_size = if (level == .initial) @max(@as(usize, 1200), payload_length + 64) else payload_length + 64;
     const has_application_item = std.meta.activeTag(application_item) != .none;
-    const ack_eliciting = transmission != null or has_application_item or self.probe_pending or (level == .application and (self.path_response != null or self.handshake_done_pending));
+    const ack_eliciting = transmission != null or has_application_item or self.probe_pending or (level == .application and (connection_id_frame != null or self.handshake_done_pending));
     const congestion_controlled = ack_eliciting;
     if (!self.congestion.canSend(estimated_size, self.probe_pending) or !self.pacer.canSend(estimated_size, congestion_controlled)) {
         if (transmission) |tx| try sender.onLost(tx.offset, tx.data.len);
@@ -105,7 +153,7 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
     const keys = self.sendKeys(level).?;
     switch (level) {
         .initial => _ = try cursor.initial(keys, .{
-            .destination_id = self.clientConnectionId(),
+            .destination_id = self.initialClientConnectionId(),
             .source_id = self.serverConnectionId(),
             .packet_number = packet_number,
             .packet_number_length = 2,
@@ -113,7 +161,7 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
             .minimum_datagram_size = 1200,
         }),
         .handshake => _ = try cursor.handshake(keys, .{
-            .destination_id = self.clientConnectionId(),
+            .destination_id = self.initialClientConnectionId(),
             .source_id = self.serverConnectionId(),
             .packet_number = packet_number,
             .packet_number_length = 2,
@@ -139,11 +187,14 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
     self.congestion.onPacketSent(sent);
     self.pacer.onPacketSent(sent_bytes, congestion_controlled);
     if (transmission) |tx| try rememberCrypto(self, level, packet_number, tx.offset, tx.data.len);
-    if (level == .application) try rememberApplication(self, packet_number, self.application_send_generation, application_item);
+    if (level == .application) {
+        try rememberApplication(self, packet_number, self.application_send_generation, application_item);
+        if (connection_id_frame) |sent_frame| try rememberConnectionId(self, packet_number, sent_frame);
+    }
     if (has_application_item) self.application.onPacketSent(application_item);
     if (ack_included) self.ack_pending[index] = false;
     if (level == .application) {
-        if (self.path_response != null) self.path_response = null;
+        if (connection_id_frame) |sent_frame| self.cids.markPendingFrameSent(sent_frame);
         if (self.handshake_done_pending) self.handshake_done_pending = false;
     }
     return true;
@@ -172,6 +223,35 @@ fn rememberApplication(self: anytype, packet_number: u64, key_generation: u64, i
     return error.SentPacketCapacityExceeded;
 }
 
+fn rememberConnectionId(self: anytype, packet_number: u64, sent: frame.Frame) !void {
+    const kind: @TypeOf(self.sent_connection_ids[0].kind), const sequence: u64 = switch (sent) {
+        .new_connection_id => |value| .{ .new, value.sequence },
+        .retire_connection_id => |value| .{ .retire, value },
+        else => return,
+    };
+    for (&self.sent_connection_ids) |*entry| {
+        if (entry.valid and !applicationPacketTracked(self, entry.packet_number)) entry.valid = false;
+    }
+    for (&self.sent_connection_ids) |*entry| {
+        if (entry.valid) continue;
+        entry.* = .{ .valid = true, .packet_number = packet_number, .kind = kind, .sequence = sequence };
+        return;
+    }
+    return error.SentPacketCapacityExceeded;
+}
+
+fn rememberPathControl(self: anytype, packet_number: u64, control_key: u64) !void {
+    for (&self.sent_path_controls) |*entry| {
+        if (entry.valid and !applicationPacketTracked(self, entry.packet_number)) entry.* = .{};
+    }
+    for (&self.sent_path_controls) |*entry| {
+        if (entry.valid) continue;
+        entry.* = .{ .valid = true, .packet_number = packet_number, .control_key = control_key };
+        return;
+    }
+    return error.SentPacketCapacityExceeded;
+}
+
 fn applicationPacketTracked(self: anytype, packet_number: u64) bool {
     const detector = &self.detectors[@intFromEnum(types.Level.application)];
     for (detector.packets[0..detector.packet_count]) |packet| {
@@ -191,8 +271,8 @@ fn buildClose(self: anytype, output: []u8, now: u64) ![]u8 {
     const pn = try self.space(level).allocatePacketNumber();
     const keys = self.sendKeys(level).?;
     switch (level) {
-        .initial => _ = try cursor.initial(keys, .{ .destination_id = self.clientConnectionId(), .source_id = self.serverConnectionId(), .packet_number = pn, .packet_number_length = 2, .payload = encoded, .minimum_datagram_size = 1200 }),
-        .handshake => _ = try cursor.handshake(keys, .{ .destination_id = self.clientConnectionId(), .source_id = self.serverConnectionId(), .packet_number = pn, .packet_number_length = 2, .payload = encoded }),
+        .initial => _ = try cursor.initial(keys, .{ .destination_id = self.initialClientConnectionId(), .source_id = self.serverConnectionId(), .packet_number = pn, .packet_number_length = 2, .payload = encoded, .minimum_datagram_size = 1200 }),
+        .handshake => _ = try cursor.handshake(keys, .{ .destination_id = self.initialClientConnectionId(), .source_id = self.serverConnectionId(), .packet_number = pn, .packet_number_length = 2, .payload = encoded }),
         .application => _ = try cursor.oneRtt(keys, .{ .destination_id = self.clientConnectionId(), .packet_number = pn, .packet_number_length = 2, .payload = encoded, .key_phase = if (self.application_send_keys) |application_keys| application_keys.phase() else false }),
     }
     self.bytes_sent +|= cursor.offset;
@@ -247,16 +327,32 @@ fn markLost(self: anytype, level: types.Level, packet_number: u64) void {
         entry.valid = false;
         break;
     };
-    if (level == .application) for (&self.sent_application) |*entry| {
-        if (!entry.valid or entry.packet_number != packet_number) continue;
-        self.application.onLost(entry.item) catch {};
-        entry.valid = false;
-        break;
-    };
+    if (level == .application) {
+        for (&self.sent_application) |*entry| {
+            if (!entry.valid or entry.packet_number != packet_number) continue;
+            self.application.onLost(entry.item) catch {};
+            entry.valid = false;
+            break;
+        }
+        for (&self.sent_connection_ids) |*entry| {
+            if (!entry.valid or entry.packet_number != packet_number) continue;
+            self.cids.requeue(switch (entry.kind) {
+                .new => .new,
+                .retire => .retire,
+            }, entry.sequence);
+            entry.valid = false;
+            break;
+        }
+        for (&self.sent_path_controls) |*entry| {
+            if (!entry.valid or entry.packet_number != packet_number) continue;
+            entry.lost = true;
+            break;
+        }
+    }
 }
 
 fn hasPending(self: anytype) bool {
-    if (self.probe_pending or self.path_response != null or self.handshake_done_pending) return true;
+    if (self.probe_pending or self.cids.pendingFrame() != null or self.handshake_done_pending) return true;
     for (self.ack_pending) |pending| if (pending) return true;
     return self.application.hasPending() or
         self.crypto.initial.sender.sent_offset != self.crypto.initial.sender.write_offset or

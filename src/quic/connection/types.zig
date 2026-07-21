@@ -19,6 +19,7 @@ pub const CloseCode = struct {
     pub const final_size_error: u64 = 0x06;
     pub const frame_encoding_error: u64 = 0x07;
     pub const transport_parameter_error: u64 = 0x08;
+    pub const connection_id_limit_error: u64 = 0x09;
     pub const protocol_violation: u64 = 0x0a;
     pub const crypto_buffer_exceeded: u64 = 0x0d;
     pub const crypto_error_base: u64 = 0x100;
@@ -29,6 +30,20 @@ pub const CryptoMeta = struct {
     packet_number: u64 = 0,
     offset: u64 = 0,
     length: u64 = 0,
+};
+
+pub const ConnectionIdMeta = struct {
+    valid: bool = false,
+    packet_number: u64 = 0,
+    sequence: u64 = 0,
+    kind: enum { new, retire } = .new,
+};
+
+pub const PathControlMeta = struct {
+    valid: bool = false,
+    lost: bool = false,
+    packet_number: u64 = 0,
+    control_key: u64 = 0,
 };
 
 pub fn levelId(level: Level) packet_space.Id {

@@ -14,7 +14,12 @@ const types = @import("types.zig");
 const receive = @import("receive.zig");
 const schedule = @import("schedule.zig");
 const application_streams = @import("application_streams.zig");
+const connection_id = @import("connection_id.zig");
+const path_frames = @import("path_frames.zig");
 const stream = @import("../stream/root.zig");
+
+pub const connection_ids = connection_id;
+pub const path = @import("path.zig");
 
 pub const State = types.State;
 pub const Level = types.Level;
@@ -38,6 +43,12 @@ pub const Limits = struct {
     stream_send_bytes: usize = 4096,
     stream_receive_ranges: usize = 16,
     stream_send_ranges: usize = 16,
+    /// Active local and peer CID slots, including sequence zero.
+    active_connection_ids: usize = 4,
+    /// Authenticated path frame events awaiting endpoint address association.
+    path_events: usize = 4,
+    /// Endpoint-owned peer-address paths per connection.
+    paths: usize = 4,
 };
 
 pub fn Storage(comptime limits: Limits) type {
@@ -61,12 +72,15 @@ pub const Init = struct {
     original_destination_id: []const u8,
     client_source_id: []const u8,
     server_connection_id: []const u8,
+    server_reset_token: [16]u8 = @splat(0),
     tls: tls_server.Config,
     now: u64,
 };
 
 pub fn Connection(comptime limits: Limits) type {
     if (limits.max_datagram_size < 1200) @compileError("QUIC max_datagram_size must be at least 1200");
+    if (limits.active_connection_ids < 2) @compileError("QUIC active_connection_ids must be at least two");
+    if (limits.path_events == 0 or limits.paths == 0) @compileError("QUIC path capacities must be nonzero");
     return struct {
         const Self = @This();
         pub const StreamId = stream.Id;
@@ -79,6 +93,8 @@ pub fn Connection(comptime limits: Limits) type {
             limits.stream_receive_ranges,
             limits.stream_send_ranges,
         );
+        pub const ConnectionIds = connection_id.Lifecycle(limits.active_connection_ids);
+        pub const PathEvents = path_frames.Queue(limits.path_events);
 
         state: State = .handshaking,
         close_info: ?TransportError = null,
@@ -90,6 +106,8 @@ pub fn Connection(comptime limits: Limits) type {
         client_id_len: u8,
         server_id: [20]u8 = undefined,
         server_id_len: u8,
+        cids: ConnectionIds,
+        received_path_frames: PathEvents = .{},
         bytes_received: u64 = 0,
         bytes_sent: u64 = 0,
         address_validated: bool = false,
@@ -111,6 +129,8 @@ pub fn Connection(comptime limits: Limits) type {
         detectors: [3]Detector,
         sent_crypto: [3][limits.sent_packets]types.CryptoMeta = @splat(@splat(.{})),
         sent_application: [limits.sent_packets]application_streams.SentMeta = @splat(.{}),
+        sent_connection_ids: [limits.sent_packets]types.ConnectionIdMeta = @splat(.{}),
+        sent_path_controls: [limits.sent_packets]types.PathControlMeta = @splat(.{}),
         application: ApplicationStreams,
         rtt: rtt.Estimator = .{},
         congestion: congestion.NewReno,
@@ -119,7 +139,6 @@ pub fn Connection(comptime limits: Limits) type {
         pto_count: u8 = 0,
         probe_pending: bool = false,
         ack_pending: [3]bool = @splat(false),
-        path_response: ?[8]u8 = null,
         handshake_done_pending: bool = false,
         initial_discarded: bool = false,
         handshake_discarded: bool = false,
@@ -134,6 +153,7 @@ pub fn Connection(comptime limits: Limits) type {
                 .original_destination_id_len = @intCast(options.original_destination_id.len),
                 .client_id_len = @intCast(options.client_source_id.len),
                 .server_id_len = @intCast(options.server_connection_id.len),
+                .cids = try ConnectionIds.init(options.server_connection_id, options.server_reset_token, options.client_source_id),
                 .initial_local = .{ .aes_128_gcm = secrets.server.keys },
                 .initial_remote = .{ .aes_128_gcm = secrets.client.keys },
                 .tls = tls_server.Server.init(options.tls),
@@ -175,6 +195,24 @@ pub fn Connection(comptime limits: Limits) type {
 
         pub fn buildDatagram(self: *Self, output: []u8, now: u64) ![]u8 {
             return schedule.build(self, output, now);
+        }
+
+        pub fn buildPathDatagram(self: *Self, output: []u8, value: @import("../frame/root.zig").Frame, control_key: u64, now: u64) ![]u8 {
+            return schedule.buildPath(self, output, value, control_key, now);
+        }
+
+        pub fn nextLostPathControl(self: *Self) ?u64 {
+            for (&self.sent_path_controls) |*entry| {
+                if (!entry.valid or !entry.lost) continue;
+                const key = entry.control_key;
+                entry.* = .{};
+                return key;
+            }
+            return null;
+        }
+
+        pub fn pathValidationInterval(self: *const Self) u64 {
+            return self.rtt.pto(self.peer_max_ack_delay, self.state == .active, 0);
         }
 
         pub fn nextDeadline(self: *const Self, now: u64) ?u64 {
@@ -229,11 +267,37 @@ pub fn Connection(comptime limits: Limits) type {
         pub fn originalDestinationId(self: *const Self) []const u8 {
             return self.original_destination_id[0..self.original_destination_id_len];
         }
-        pub fn clientConnectionId(self: *const Self) []const u8 {
+        pub fn initialClientConnectionId(self: *const Self) []const u8 {
             return self.client_id[0..self.client_id_len];
+        }
+        pub fn clientConnectionId(self: *const Self) []const u8 {
+            return self.cids.peerDestinationId();
         }
         pub fn serverConnectionId(self: *const Self) []const u8 {
             return self.server_id[0..self.server_id_len];
+        }
+        pub fn acceptsLocalConnectionId(self: *const Self, id: []const u8) bool {
+            return self.cids.localMatches(id);
+        }
+        pub fn localConnectionIdSequence(self: *const Self, id: []const u8) ?u64 {
+            return self.cids.localSequence(id);
+        }
+        pub fn needsLocalConnectionId(self: *const Self) bool {
+            return self.cids.needsLocalId();
+        }
+        pub fn issueLocalConnectionId(self: *Self, id: []const u8, token: [16]u8) !u64 {
+            return self.cids.issueLocal(id, token);
+        }
+        pub fn nextPathFrame(self: *Self) ?path_frames.Event {
+            return self.received_path_frames.pop();
+        }
+        pub fn recognizesStatelessReset(self: *const Self, packet: []const u8) bool {
+            return self.cids.recognizesStatelessReset(packet);
+        }
+        pub fn onStatelessReset(self: *Self, now: u64) void {
+            if (self.state == .closed or self.state == .draining) return;
+            self.state = .draining;
+            self.close_started = now;
         }
         pub fn amplificationAllowance(self: *const Self) u64 {
             if (self.address_validated) return std.math.maxInt(u64);
@@ -454,6 +518,34 @@ test "unauthenticated malformed CID mismatch and tampering are silently discarde
     try connection.receiveDatagram(tampered.packet, 3);
     try std.testing.expectEqual(State.handshaking, connection.state);
     try std.testing.expect(connection.close_info == null);
+}
+
+test "undecryptable short packet ending in peer reset token enters draining" {
+    const limits: Limits = .{ .crypto_receive_bytes = 64, .crypto_send_bytes = 64, .tls_output_bytes = 128 };
+    var storage: Storage(limits) = .{};
+    var transcript: [512]u8 = undefined;
+    const credentials = testCredentials();
+    var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+    const keys: protection.Keys = .{ .aes_128_gcm = .{
+        .key = @splat(0x31),
+        .iv = @splat(0x42),
+        .hp = @splat(0x53),
+    } };
+    connection.application_remote = keys;
+    connection.state = .active;
+    try connection.cids.applyLimits(4, 2);
+    const reset_token = "0123456789abcdef".*;
+    try connection.cids.onNew(.{
+        .sequence = 1,
+        .retire_prior_to = 0,
+        .id = "peer-1",
+        .reset_token = &reset_token,
+    });
+
+    var packet = ("\x40serverrandom-prefix0123456789abcdef").*;
+    try connection.receiveDatagram(&packet, 7);
+    try std.testing.expectEqual(State.draining, connection.state);
+    try std.testing.expectEqual(@as(?u64, 7), connection.close_started);
 }
 
 test "close reason is bounded owned storage" {
