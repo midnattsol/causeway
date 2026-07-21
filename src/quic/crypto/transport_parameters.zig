@@ -5,6 +5,15 @@ const varint = @import("../varint.zig");
 
 pub const Role = enum { client, server };
 
+pub const PreferredAddress = struct {
+    ipv4: [4]u8,
+    ipv4_port: u16,
+    ipv6: [16]u8,
+    ipv6_port: u16,
+    connection_id: []const u8,
+    stateless_reset_token: *const [16]u8,
+};
+
 pub const Values = struct {
     original_destination_connection_id: ?[]const u8 = null,
     max_idle_timeout: u64 = 0,
@@ -19,6 +28,7 @@ pub const Values = struct {
     ack_delay_exponent: u8 = 3,
     max_ack_delay: u64 = 25,
     disable_active_migration: bool = false,
+    preferred_address: ?PreferredAddress = null,
     active_connection_id_limit: u64 = 2,
     initial_source_connection_id: ?[]const u8 = null,
     retry_source_connection_id: ?[]const u8 = null,
@@ -98,7 +108,7 @@ pub fn parse(bytes: []const u8, sender: Role) !Values {
             },
             .preferred_address => {
                 try requireServer(sender);
-                try validatePreferredAddress(value);
+                result.preferred_address = try parsePreferredAddress(value);
             },
             .active_connection_id_limit => {
                 result.active_connection_id_limit = try integer(value);
@@ -137,11 +147,19 @@ fn requireServer(sender: Role) !void {
     if (sender != .server) return error.ServerOnlyTransportParameter;
 }
 
-fn validatePreferredAddress(bytes: []const u8) !void {
+fn parsePreferredAddress(bytes: []const u8) !PreferredAddress {
     if (bytes.len < 4 + 2 + 16 + 2 + 1 + 16) return error.InvalidPreferredAddress;
     const cid_length = bytes[24];
-    if (cid_length > 20) return error.InvalidConnectionIdLength;
+    if (cid_length == 0 or cid_length > 20) return error.InvalidConnectionIdLength;
     if (bytes.len != 25 + cid_length + 16) return error.InvalidPreferredAddress;
+    return .{
+        .ipv4 = bytes[0..4].*,
+        .ipv4_port = std.mem.readInt(u16, bytes[4..6], .big),
+        .ipv6 = bytes[6..22].*,
+        .ipv6_port = std.mem.readInt(u16, bytes[22..24], .big),
+        .connection_id = bytes[25..][0..cid_length],
+        .stateless_reset_token = @ptrCast(bytes[25 + cid_length ..][0..16]),
+    };
 }
 
 fn knownBit(id: Id) ?u32 {
@@ -168,6 +186,95 @@ fn knownBit(id: Id) ?u32 {
     };
 }
 
+/// Encodes transport parameters canonically, omitting values equal to their
+/// protocol defaults while retaining explicitly present connection IDs.
+pub fn encode(buffer: []u8, values: Values, sender: Role) ![]u8 {
+    try validateForEncoding(values, sender);
+    var writer = ParameterWriter{ .buffer = buffer };
+
+    if (values.original_destination_connection_id) |id| try writer.parameter(.original_destination_connection_id, id);
+    if (values.max_idle_timeout != 0) try writer.integer(.max_idle_timeout, values.max_idle_timeout);
+    if (values.stateless_reset_token) |token| try writer.parameter(.stateless_reset_token, token);
+    if (values.max_udp_payload_size != 65_527) try writer.integer(.max_udp_payload_size, values.max_udp_payload_size);
+    if (values.initial_max_data != 0) try writer.integer(.initial_max_data, values.initial_max_data);
+    if (values.initial_max_stream_data_bidi_local != 0) try writer.integer(.initial_max_stream_data_bidi_local, values.initial_max_stream_data_bidi_local);
+    if (values.initial_max_stream_data_bidi_remote != 0) try writer.integer(.initial_max_stream_data_bidi_remote, values.initial_max_stream_data_bidi_remote);
+    if (values.initial_max_stream_data_uni != 0) try writer.integer(.initial_max_stream_data_uni, values.initial_max_stream_data_uni);
+    if (values.initial_max_streams_bidi != 0) try writer.integer(.initial_max_streams_bidi, values.initial_max_streams_bidi);
+    if (values.initial_max_streams_uni != 0) try writer.integer(.initial_max_streams_uni, values.initial_max_streams_uni);
+    if (values.ack_delay_exponent != 3) try writer.integer(.ack_delay_exponent, values.ack_delay_exponent);
+    if (values.max_ack_delay != 25) try writer.integer(.max_ack_delay, values.max_ack_delay);
+    if (values.disable_active_migration) try writer.parameter(.disable_active_migration, &.{});
+    if (values.preferred_address) |preferred| try writer.preferredAddress(preferred);
+    if (values.active_connection_id_limit != 2) try writer.integer(.active_connection_id_limit, values.active_connection_id_limit);
+    if (values.initial_source_connection_id) |id| try writer.parameter(.initial_source_connection_id, id);
+    if (values.retry_source_connection_id) |id| try writer.parameter(.retry_source_connection_id, id);
+    if (values.max_datagram_frame_size != 0) try writer.integer(.max_datagram_frame_size, values.max_datagram_frame_size);
+    return buffer[0..writer.cursor];
+}
+
+fn validateForEncoding(values: Values, sender: Role) !void {
+    if (values.initial_source_connection_id == null) return error.MissingInitialSourceConnectionId;
+    if (sender == .server and values.original_destination_connection_id == null) return error.MissingOriginalDestinationConnectionId;
+    if (sender == .client and (values.original_destination_connection_id != null or
+        values.stateless_reset_token != null or values.preferred_address != null or
+        values.retry_source_connection_id != null)) return error.ServerOnlyTransportParameter;
+    if (values.max_udp_payload_size < 1200 or values.max_udp_payload_size > varint.maximum) return error.InvalidMaxUdpPayloadSize;
+    if (values.initial_max_streams_bidi > 1 << 60 or values.initial_max_streams_uni > 1 << 60) return error.StreamLimitError;
+    if (values.ack_delay_exponent > 20) return error.InvalidAckDelayExponent;
+    if (values.max_ack_delay >= 1 << 14) return error.InvalidMaxAckDelay;
+    if (values.active_connection_id_limit < 2) return error.InvalidActiveConnectionIdLimit;
+    inline for (.{
+        values.original_destination_connection_id,
+        values.initial_source_connection_id,
+        values.retry_source_connection_id,
+    }) |optional_id| if (optional_id) |id| {
+        if (id.len > 20) return error.InvalidConnectionIdLength;
+    };
+    if (values.preferred_address) |preferred| {
+        if (preferred.connection_id.len == 0 or preferred.connection_id.len > 20) return error.InvalidConnectionIdLength;
+    }
+}
+
+const ParameterWriter = struct {
+    buffer: []u8,
+    cursor: usize = 0,
+
+    fn integer(self: *ParameterWriter, id: Id, value: u64) !void {
+        var encoded: [8]u8 = undefined;
+        try self.parameter(id, try varint.encode(&encoded, value));
+    }
+
+    fn preferredAddress(self: *ParameterWriter, value: PreferredAddress) !void {
+        var encoded: [61]u8 = undefined;
+        encoded[0..4].* = value.ipv4;
+        std.mem.writeInt(u16, encoded[4..6], value.ipv4_port, .big);
+        encoded[6..22].* = value.ipv6;
+        std.mem.writeInt(u16, encoded[22..24], value.ipv6_port, .big);
+        encoded[24] = @intCast(value.connection_id.len);
+        @memcpy(encoded[25..][0..value.connection_id.len], value.connection_id);
+        @memcpy(encoded[25 + value.connection_id.len ..][0..16], value.stateless_reset_token);
+        try self.parameter(.preferred_address, encoded[0 .. 25 + value.connection_id.len + 16]);
+    }
+
+    fn parameter(self: *ParameterWriter, id: Id, value: []const u8) !void {
+        try self.writeInteger(@intFromEnum(id));
+        try self.writeInteger(std.math.cast(u64, value.len) orelse return error.TransportParameterTooLarge);
+        try self.write(value);
+    }
+
+    fn writeInteger(self: *ParameterWriter, value: u64) !void {
+        var encoded: [8]u8 = undefined;
+        try self.write(try varint.encode(&encoded, value));
+    }
+
+    fn write(self: *ParameterWriter, bytes: []const u8) !void {
+        if (bytes.len > self.buffer.len - self.cursor) return error.InsufficientCapacity;
+        @memcpy(self.buffer[self.cursor..][0..bytes.len], bytes);
+        self.cursor += bytes.len;
+    }
+};
+
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -183,6 +290,44 @@ test "QUIC transport parameters apply defaults extensions and bounds" {
     try std.testing.expectEqual(@as(u64, 100), values.initial_max_data);
     try std.testing.expectEqual(@as(u8, 20), values.ack_delay_exponent);
     try std.testing.expect(values.disable_active_migration);
+}
+
+test "transport parameter encoding is canonical and preserves explicit zero-length IDs" {
+    const values: Values = .{
+        .initial_source_connection_id = "",
+        .initial_max_data = 100,
+        .max_udp_payload_size = 1200,
+        .disable_active_migration = true,
+    };
+    var first: [128]u8 = undefined;
+    const encoded = try encode(&first, values, .client);
+    const parsed = try parse(encoded, .client);
+    try std.testing.expect(parsed.initial_source_connection_id != null);
+    try std.testing.expectEqual(@as(usize, 0), parsed.initial_source_connection_id.?.len);
+    var second: [128]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, encoded, try encode(&second, parsed, .client));
+}
+
+test "server preferred address round trips without ownership transfer" {
+    const reset_token = "0123456789abcdef".*;
+    const preferred_token = "fedcba9876543210".*;
+    const values: Values = .{
+        .original_destination_connection_id = "original",
+        .stateless_reset_token = &reset_token,
+        .preferred_address = .{
+            .ipv4 = .{ 127, 0, 0, 1 },
+            .ipv4_port = 443,
+            .ipv6 = @splat(0),
+            .ipv6_port = 0,
+            .connection_id = "preferred",
+            .stateless_reset_token = &preferred_token,
+        },
+        .initial_source_connection_id = "server",
+    };
+    var storage: [256]u8 = undefined;
+    const parsed = try parse(try encode(&storage, values, .server), .server);
+    try std.testing.expectEqualStrings("preferred", parsed.preferred_address.?.connection_id);
+    try std.testing.expectEqual(@as(u16, 443), parsed.preferred_address.?.ipv4_port);
 }
 
 test "QUIC transport parameters reject duplicates and role violations" {

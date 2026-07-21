@@ -32,7 +32,7 @@ fn fuzzQuic(_: std.Io, smith: *std.testing.Smith) !void {
         try std.testing.expectEqual(decoded.value, (try varint.decode(canonical)).value);
     } else |_| {}
 
-    _ = transport_parameters.parse(input, if (input.len != 0 and input[0] & 1 != 0) .server else .client) catch {};
+    fuzzTransportParameters(input, if (input.len != 0 and input[0] & 1 != 0) .server else .client) catch {};
 
     var frames: frame.Iterator = .{ .payload = input };
     while (frames.next() catch null) |parsed| {
@@ -58,6 +58,19 @@ fn fuzzQuic(_: std.Io, smith: *std.testing.Smith) !void {
         var encoded: [4]u8 = undefined;
         _ = try packet_number.encode(&encoded, full, encoded_length);
     }
+}
+
+fn fuzzTransportParameters(input: []const u8, role: transport_parameters.Role) !void {
+    var values = try transport_parameters.parse(input, role);
+    if (values.initial_source_connection_id == null) values.initial_source_connection_id = &.{};
+    if (role == .server and values.original_destination_connection_id == null) {
+        values.original_destination_connection_id = &.{};
+    }
+    var first: [4096]u8 = undefined;
+    const canonical = try transport_parameters.encode(&first, values, role);
+    const reparsed = try transport_parameters.parse(canonical, role);
+    var second: [4096]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, canonical, try transport_parameters.encode(&second, reparsed, role));
 }
 
 fn fuzzInitialProtection(input: []const u8) void {
