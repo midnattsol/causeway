@@ -6,6 +6,7 @@
 const std = @import("std");
 
 pub const core = @import("core/root.zig");
+pub const quic = @import("quic/root.zig");
 pub const http = @import("http/root.zig");
 pub const rest = @import("rest/root.zig");
 pub const graphql = @import("graphql/root.zig");
