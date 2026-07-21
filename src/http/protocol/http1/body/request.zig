@@ -4,7 +4,7 @@ const std = @import("std");
 const headers_module = @import("../../../message/headers.zig");
 const request_body = @import("../../../message/request_body.zig");
 const body_reader = @import("reader.zig");
-const head_module = @import("../head.zig");
+const head_module = @import("../request/head.zig");
 const trailer_policy = @import("trailers.zig");
 
 const Headers = headers_module.Headers;

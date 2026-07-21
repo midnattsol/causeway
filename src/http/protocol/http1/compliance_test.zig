@@ -1,6 +1,6 @@
 const std = @import("std");
-const head_module = @import("head.zig");
-const validation = @import("validation.zig");
+const head_module = @import("request/head.zig");
+const validation = @import("request/validation.zig");
 
 const limits: validation.Limits = .{
     .request_line_size = 8 * 1024,

@@ -4,8 +4,8 @@ const std = @import("std");
 
 pub const connection = @import("connection.zig");
 pub const syntax = @import("syntax.zig");
-pub const authority = @import("authority.zig");
-pub const head = @import("head.zig");
+pub const authority = @import("request/authority.zig");
+pub const head = @import("request/head.zig");
 pub const chunked = @import("body/chunked.zig");
 pub const body_reader = @import("body/reader.zig");
 pub const body_writer = @import("body/writer.zig");

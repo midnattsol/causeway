@@ -1,7 +1,7 @@
 //! HTTP authority parsing for Host, absolute-form, and CONNECT targets.
 
 const std = @import("std");
-const syntax = @import("syntax.zig");
+const syntax = @import("../syntax.zig");
 
 pub const Authority = struct {
     raw: []const u8,

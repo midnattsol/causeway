@@ -1,7 +1,7 @@
 //! Strict lexical and structural validation for HTTP/1 request heads.
 
 const std = @import("std");
-const syntax = @import("syntax.zig");
+const syntax = @import("../syntax.zig");
 const authority = @import("authority.zig");
 
 pub const Limits = struct {

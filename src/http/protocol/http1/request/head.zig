@@ -1,16 +1,16 @@
 //! Owned HTTP/1 request-head parsing and semantic framing metadata.
 
 const std = @import("std");
-const Header = @import("../../message/headers.zig").Header;
-const Headers = @import("../../message/headers.zig").Headers;
-const request = @import("../../message/request.zig");
+const Header = @import("../../../message/headers.zig").Header;
+const Headers = @import("../../../message/headers.zig").Headers;
+const request = @import("../../../message/request.zig");
 const Method = request.Method;
 const Version = request.Version;
 const Target = request.Target;
-const syntax = @import("syntax.zig");
+const syntax = @import("../syntax.zig");
 const authority = @import("authority.zig");
 const validation = @import("validation.zig");
-const trailer_policy = @import("body/trailers.zig");
+const trailer_policy = @import("../body/trailers.zig");
 
 pub const Framing = union(enum) {
     none,
