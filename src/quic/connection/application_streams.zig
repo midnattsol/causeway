@@ -27,6 +27,7 @@ pub const Control = union(enum) {
 pub const SentMeta = struct {
     valid: bool = false,
     packet_number: u64 = 0,
+    key_generation: u64 = 0,
     item: Item = .none,
 
     pub const Item = union(enum) {

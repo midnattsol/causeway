@@ -58,6 +58,14 @@ pub const KeyPair = struct {
     remote: packet_keys.PacketKeys,
 };
 
+/// One-shot handoff of application traffic secrets to the QUIC connection.
+/// These are intentionally not exposed as derived keys through the TLS API.
+pub const ApplicationTrafficSecrets = struct {
+    server: packet_keys.Secret,
+    client: packet_keys.Secret,
+    cipher_suite: tls.CipherSuite,
+};
+
 pub const Server = struct {
     state: State = .expect_client_hello,
     credentials: *const ServerCredentials,
@@ -71,7 +79,7 @@ pub const Server = struct {
     selected_alpn: ?[]const u8 = null,
     peer_parameters: ?[]const u8 = null,
     handshake_keys_value: ?KeyPair = null,
-    application_keys_value: ?KeyPair = null,
+    application_secrets_value: ?ApplicationTrafficSecrets = null,
     client_finished_key: [32]u8 = @splat(0),
 
     pub fn init(config: Config) Server {
@@ -106,8 +114,14 @@ pub const Server = struct {
     pub fn handshakeKeys(self: *const Server) ?KeyPair {
         return self.handshake_keys_value;
     }
-    pub fn applicationKeys(self: *const Server) ?KeyPair {
-        return self.application_keys_value;
+    /// Transfers ownership of application traffic secrets to the connection.
+    /// A second call returns null, avoiding long-lived duplicate secret state.
+    pub fn takeApplicationTrafficSecrets(self: *Server) ?ApplicationTrafficSecrets {
+        const result = self.application_secrets_value orelse return null;
+        @memset(&self.application_secrets_value.?.server, 0);
+        @memset(&self.application_secrets_value.?.client, 0);
+        self.application_secrets_value = null;
+        return result;
     }
     pub fn initialKeysDiscardReady(self: *const Server) bool {
         return self.state != .expect_client_hello;
@@ -161,9 +175,10 @@ pub const Server = struct {
         self.selected_alpn = "h3";
         self.peer_parameters = self.transcript[peer_parameters_offset..][0..negotiated.transport_parameters.len];
         self.handshake_keys_value = keys;
-        self.application_keys_value = .{
-            .local = try packet_keys.derive(app.server_application_traffic_secret_0, negotiated.cipher_suite),
-            .remote = try packet_keys.derive(app.client_application_traffic_secret_0, negotiated.cipher_suite),
+        self.application_secrets_value = .{
+            .server = app.server_application_traffic_secret_0,
+            .client = app.client_application_traffic_secret_0,
+            .cipher_suite = negotiated.cipher_suite,
         };
         self.client_finished_key = hs.client_finished_key;
         self.state = .expect_client_finished;
@@ -336,7 +351,10 @@ test "deterministic complete QUIC TLS server handshake" {
     try std.testing.expectEqualStrings("cp", server.peerTransportParameters().?);
     @memset(&client_hello_buffer, 0);
     try std.testing.expectEqualStrings("cp", server.peerTransportParameters().?);
-    try std.testing.expect(server.handshakeKeys() != null and server.applicationKeys() != null);
+    try std.testing.expect(server.handshakeKeys() != null);
+    const application_secrets = server.takeApplicationTrafficSecrets().?;
+    try std.testing.expectEqual(tls.CipherSuite.AES_128_GCM_SHA256, application_secrets.cipher_suite);
+    try std.testing.expect(server.takeApplicationTrafficSecrets() == null);
     try std.testing.expect(server.initialKeysDiscardReady());
 
     var verify_data: [32]u8 = undefined;

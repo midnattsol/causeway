@@ -33,7 +33,13 @@ pub fn datagram(self: anytype, bytes: []u8, now: u64) !void {
                 continue;
             };
             const largest = self.space(level).received.largest();
-            const clear = keys.unprotect(packet, pn_offset, largest) catch {
+            const clear = switch (level) {
+                .initial, .handshake => keys.unprotect(packet, pn_offset, largest),
+                .application => if (self.application_receive_keys) |*application_keys|
+                    application_keys.unprotect(packet, pn_offset, largest)
+                else
+                    keys.unprotect(packet, pn_offset, largest),
+            } catch {
                 cursor = packet_end;
                 continue;
             };
@@ -176,7 +182,7 @@ fn driveTls(self: anytype, level: types.Level, now: u64) !void {
         if (outputs.initial.len != 0) try writeAll(&self.crypto.initial.sender, outputs.initial);
         if (outputs.handshake.len != 0) try writeAll(&self.crypto.handshake.sender, outputs.handshake);
         try receiver.consume(message_length);
-        self.installTlsKeys();
+        try self.installTlsKeys();
         if (!self.application.parameters_applied) {
             const peer_bytes = self.tls.peerTransportParameters() orelse return error.TransportParameterError;
             const local = transport_parameters.parse(self.tls.local_transport_parameters, .server) catch {
@@ -236,7 +242,10 @@ fn markCrypto(self: anytype, level: types.Level, packet_number: u64, acknowledge
 fn markApplication(self: anytype, packet_number: u64, acknowledged: bool) !void {
     for (&self.sent_application) |*entry| {
         if (!entry.valid or entry.packet_number != packet_number) continue;
-        if (acknowledged) try self.application.onAcknowledged(entry.item) else try self.application.onLost(entry.item);
+        if (acknowledged) {
+            if (entry.key_generation == self.application_send_generation) self.application_send_phase_acked = true;
+            try self.application.onAcknowledged(entry.item);
+        } else try self.application.onLost(entry.item);
         entry.valid = false;
         return;
     }

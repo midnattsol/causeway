@@ -124,7 +124,7 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
             .packet_number = packet_number,
             .packet_number_length = 2,
             .payload = payload_storage[0..payload_length],
-            .key_phase = false,
+            .key_phase = if (self.application_send_keys) |application_keys| application_keys.phase() else false,
         }),
     }
     const sent_bytes = cursor.offset - before;
@@ -139,10 +139,8 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
     self.congestion.onPacketSent(sent);
     self.pacer.onPacketSent(sent_bytes, congestion_controlled);
     if (transmission) |tx| try rememberCrypto(self, level, packet_number, tx.offset, tx.data.len);
-    if (has_application_item) {
-        try rememberApplication(self, packet_number, application_item);
-        self.application.onPacketSent(application_item);
-    }
+    if (level == .application) try rememberApplication(self, packet_number, self.application_send_generation, application_item);
+    if (has_application_item) self.application.onPacketSent(application_item);
     if (ack_included) self.ack_pending[index] = false;
     if (level == .application) {
         if (self.path_response != null) self.path_response = null;
@@ -160,13 +158,26 @@ fn rememberCrypto(self: anytype, level: types.Level, packet_number: u64, offset:
     return error.SentPacketCapacityExceeded;
 }
 
-fn rememberApplication(self: anytype, packet_number: u64, item: @import("application_streams.zig").SentMeta.Item) !void {
+fn rememberApplication(self: anytype, packet_number: u64, key_generation: u64, item: @import("application_streams.zig").SentMeta.Item) !void {
+    // ACK-only packets can leave recovery without a loss callback. Reclaim their
+    // metadata before reserving a slot, while retaining every still-tracked packet.
+    for (&self.sent_application) |*entry| {
+        if (entry.valid and !applicationPacketTracked(self, entry.packet_number)) entry.valid = false;
+    }
     for (&self.sent_application) |*entry| {
         if (entry.valid) continue;
-        entry.* = .{ .valid = true, .packet_number = packet_number, .item = item };
+        entry.* = .{ .valid = true, .packet_number = packet_number, .key_generation = key_generation, .item = item };
         return;
     }
     return error.SentPacketCapacityExceeded;
+}
+
+fn applicationPacketTracked(self: anytype, packet_number: u64) bool {
+    const detector = &self.detectors[@intFromEnum(types.Level.application)];
+    for (detector.packets[0..detector.packet_count]) |packet| {
+        if (packet.packet_number == packet_number) return true;
+    }
+    return false;
 }
 
 fn buildClose(self: anytype, output: []u8, now: u64) ![]u8 {
@@ -182,7 +193,7 @@ fn buildClose(self: anytype, output: []u8, now: u64) ![]u8 {
     switch (level) {
         .initial => _ = try cursor.initial(keys, .{ .destination_id = self.clientConnectionId(), .source_id = self.serverConnectionId(), .packet_number = pn, .packet_number_length = 2, .payload = encoded, .minimum_datagram_size = 1200 }),
         .handshake => _ = try cursor.handshake(keys, .{ .destination_id = self.clientConnectionId(), .source_id = self.serverConnectionId(), .packet_number = pn, .packet_number_length = 2, .payload = encoded }),
-        .application => _ = try cursor.oneRtt(keys, .{ .destination_id = self.clientConnectionId(), .packet_number = pn, .packet_number_length = 2, .payload = encoded, .key_phase = false }),
+        .application => _ = try cursor.oneRtt(keys, .{ .destination_id = self.clientConnectionId(), .packet_number = pn, .packet_number_length = 2, .payload = encoded, .key_phase = if (self.application_send_keys) |application_keys| application_keys.phase() else false }),
     }
     self.bytes_sent +|= cursor.offset;
     if (level == .handshake) self.discardInitial();

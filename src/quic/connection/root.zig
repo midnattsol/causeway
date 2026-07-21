@@ -99,6 +99,10 @@ pub fn Connection(comptime limits: Limits) type {
         handshake_remote: ?protection.Keys = null,
         application_local: ?protection.Keys = null,
         application_remote: ?protection.Keys = null,
+        application_send_keys: ?packet_keys.ApplicationKeys = null,
+        application_receive_keys: ?packet_keys.ApplicationKeys = null,
+        application_send_generation: u64 = 0,
+        application_send_phase_acked: bool = false,
         tls: tls_server.Server,
         tls_initial_output: []u8,
         tls_handshake_output: []u8,
@@ -279,25 +283,43 @@ pub fn Connection(comptime limits: Limits) type {
             return switch (level) {
                 .initial => self.initial_remote,
                 .handshake => self.handshake_remote,
-                .application => self.application_remote,
+                .application => if (self.application_receive_keys) |keys| keys.current else self.application_remote,
             };
         }
         pub fn sendKeys(self: *Self, level: Level) ?protection.Keys {
             return switch (level) {
                 .initial => self.initial_local,
                 .handshake => self.handshake_local,
-                .application => self.application_local,
+                .application => if (self.application_send_keys) |keys| keys.current else self.application_local,
             };
         }
-        pub fn installTlsKeys(self: *Self) void {
+        pub fn installTlsKeys(self: *Self) !void {
             if (self.tls.handshakeKeys()) |keys| {
                 self.handshake_local = keys.local;
                 self.handshake_remote = keys.remote;
             }
-            if (self.tls.applicationKeys()) |keys| {
-                self.application_local = keys.local;
-                self.application_remote = keys.remote;
+            if (self.tls.takeApplicationTrafficSecrets()) |transferred| {
+                var secrets = transferred;
+                defer {
+                    @memset(&secrets.server, 0);
+                    @memset(&secrets.client, 0);
+                }
+                self.application_send_keys = try packet_keys.ApplicationKeys.init(secrets.server, secrets.cipher_suite);
+                self.application_receive_keys = try packet_keys.ApplicationKeys.init(secrets.client, secrets.cipher_suite);
+                self.application_local = self.application_send_keys.?.current;
+                self.application_remote = self.application_receive_keys.?.current;
             }
+        }
+
+        /// Initiates a local RFC 9001 key update after handshake confirmation and
+        /// acknowledgment of a packet sent in the current key generation.
+        pub fn requestApplicationKeyUpdate(self: *Self) !void {
+            if (self.state != .active) return error.HandshakeNotConfirmed;
+            if (!self.application_send_phase_acked) return error.KeyUpdateNotAcknowledged;
+            const keys = if (self.application_send_keys) |*value| value else return error.ApplicationKeysUnavailable;
+            try keys.update();
+            self.application_send_generation += 1;
+            self.application_send_phase_acked = false;
         }
         pub fn discardInitial(self: *Self) void {
             if (self.initial_discarded) return;
@@ -593,6 +615,8 @@ test "deterministic client Initial through server flight and Finished" {
     });
     try connection.receiveDatagram(first_packet.packet, 2);
     try std.testing.expect(connection.handshake_local != null);
+    try std.testing.expect(connection.application_send_keys != null);
+    try std.testing.expect(connection.application_receive_keys != null);
     try std.testing.expect(connection.application.parameters_applied);
     try std.testing.expectEqual(@as(u64, 64), connection.application.send_connection.maximum_data);
     try std.testing.expectEqual(@as(u64, 64), connection.application.receive_connection.maximum_data);
@@ -746,6 +770,132 @@ test "application stream frames round trip through protected packets" {
         };
     }
     try std.testing.expect(found_response);
+}
+
+test "application receive promotes only valid peer phase and accepts reordered previous phase" {
+    const packet_writer = @import("../packet/writer.zig");
+    const limits: Limits = .{ .crypto_receive_bytes = 64, .crypto_send_bytes = 64, .tls_output_bytes = 128 };
+    var storage: Storage(limits) = .{};
+    var transcript: [512]u8 = undefined;
+    const credentials = testCredentials();
+    var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+    const secret: packet_keys.Secret = @splat(0x61);
+    var peer = try packet_keys.ApplicationKeys.init(secret, .AES_128_GCM_SHA256);
+    connection.application_receive_keys = try packet_keys.ApplicationKeys.init(secret, .AES_128_GCM_SHA256);
+    connection.application_remote = connection.application_receive_keys.?.current;
+    connection.state = .active;
+    connection.validateAddress();
+
+    const payload = [_]u8{ 0x01, 0x00, 0x00, 0x00 };
+    var current_storage: [64]u8 = undefined;
+    const current = try packet_writer.writeOneRtt(&current_storage, peer.current, .{
+        .destination_id = "server",
+        .packet_number = 1,
+        .packet_number_length = 2,
+        .payload = &payload,
+        .key_phase = peer.phase(),
+    });
+    try connection.receiveDatagram(current.packet, 1);
+    try std.testing.expect(!connection.application_receive_keys.?.phase());
+
+    var reordered_storage: [64]u8 = undefined;
+    const reordered = try packet_writer.writeOneRtt(&reordered_storage, peer.current, .{
+        .destination_id = "server",
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = &payload,
+        .key_phase = peer.phase(),
+    });
+
+    try peer.update();
+    var forged_storage: [64]u8 = undefined;
+    const forged = try packet_writer.writeOneRtt(&forged_storage, peer.current, .{
+        .destination_id = "server",
+        .packet_number = 2,
+        .packet_number_length = 2,
+        .payload = &payload,
+        .key_phase = peer.phase(),
+    });
+    forged.packet[forged.packet.len - 1] ^= 1;
+    try connection.receiveDatagram(forged.packet, 2);
+    try std.testing.expect(!connection.application_receive_keys.?.phase());
+
+    var updated_storage: [64]u8 = undefined;
+    const updated = try packet_writer.writeOneRtt(&updated_storage, peer.current, .{
+        .destination_id = "server",
+        .packet_number = 2,
+        .packet_number_length = 2,
+        .payload = &payload,
+        .key_phase = peer.phase(),
+    });
+    try connection.receiveDatagram(updated.packet, 3);
+    try std.testing.expect(connection.application_receive_keys.?.phase());
+
+    try connection.receiveDatagram(reordered.packet, 4);
+    try std.testing.expect(connection.application_receive_keys.?.phase());
+    try std.testing.expectEqual(@as(?u64, 2), connection.space(.application).received.largest());
+}
+
+test "local application key update requires current generation ACK" {
+    const packet_writer = @import("../packet/writer.zig");
+    const packet_header = @import("../packet/header.zig");
+    const frame = @import("../frame/root.zig");
+    const limits: Limits = .{ .crypto_receive_bytes = 64, .crypto_send_bytes = 64, .tls_output_bytes = 128 };
+    var storage: Storage(limits) = .{};
+    var transcript: [512]u8 = undefined;
+    const credentials = testCredentials();
+    var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+    const server_secret: packet_keys.Secret = @splat(0x72);
+    const client_secret: packet_keys.Secret = @splat(0x83);
+    var peer_receive = try packet_keys.ApplicationKeys.init(server_secret, .AES_128_GCM_SHA256);
+    var peer_send = try packet_keys.ApplicationKeys.init(client_secret, .AES_128_GCM_SHA256);
+    connection.application_send_keys = try packet_keys.ApplicationKeys.init(server_secret, .AES_128_GCM_SHA256);
+    connection.application_receive_keys = try packet_keys.ApplicationKeys.init(client_secret, .AES_128_GCM_SHA256);
+    connection.application_local = connection.application_send_keys.?.current;
+    connection.application_remote = connection.application_receive_keys.?.current;
+    connection.validateAddress();
+
+    try std.testing.expectError(error.HandshakeNotConfirmed, connection.requestApplicationKeyUpdate());
+    connection.state = .active;
+    try std.testing.expectError(error.KeyUpdateNotAcknowledged, connection.requestApplicationKeyUpdate());
+
+    connection.handshake_done_pending = true;
+    var first_storage: [256]u8 = undefined;
+    const first = try connection.buildDatagram(&first_storage, 1);
+    const first_header = try packet_header.parse(first, "client".len);
+    const first_clear = try peer_receive.unprotect(first, first_header.packet_number_offset.?, null);
+    try std.testing.expect(!peer_receive.phase());
+    try std.testing.expect(first_clear.header[0] & 0x04 == 0);
+
+    var ack_frame_storage: [32]u8 = undefined;
+    const ack_frame = try frame.writer.encode(&ack_frame_storage, .{ .ack = .{
+        .largest = first_clear.packet_number,
+        .delay = 0,
+        .range_count = 0,
+        .first_range = 0,
+        .ranges = &.{},
+        .ecn = null,
+    } });
+    var ack_packet_storage: [64]u8 = undefined;
+    const ack_packet = try packet_writer.writeOneRtt(&ack_packet_storage, peer_send.current, .{
+        .destination_id = "server",
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = ack_frame,
+        .key_phase = peer_send.phase(),
+    });
+    try connection.receiveDatagram(ack_packet.packet, 2);
+    try connection.requestApplicationKeyUpdate();
+    try std.testing.expect(connection.application_send_keys.?.phase());
+    try std.testing.expectError(error.KeyUpdateNotAcknowledged, connection.requestApplicationKeyUpdate());
+
+    connection.probe_pending = true;
+    var updated_storage: [256]u8 = undefined;
+    const updated = try connection.buildDatagram(&updated_storage, 100 * rtt.millisecond);
+    const updated_header = try packet_header.parse(updated, "client".len);
+    const updated_clear = try peer_receive.unprotect(updated, updated_header.packet_number_offset.?, first_clear.packet_number);
+    try std.testing.expect(peer_receive.phase());
+    try std.testing.expect(updated_clear.header[0] & 0x04 != 0);
 }
 
 test "PTO deadline and timeout queue a probe" {
