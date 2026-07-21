@@ -2,7 +2,9 @@
 
 const std = @import("std");
 
+pub const loss = @import("loss.zig");
 pub const packet_space = @import("packet_space.zig");
+pub const rtt = @import("rtt.zig");
 
 // -----------------------------------------------------------------------------
 // Tests

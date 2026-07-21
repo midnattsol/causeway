@@ -8,7 +8,9 @@ const packet_number = @import("quic/packet/number.zig");
 const packet_protection = @import("quic/packet/protection.zig");
 const retry = @import("quic/packet/retry.zig");
 const version_negotiation = @import("quic/packet/version_negotiation.zig");
+const loss = @import("quic/recovery/loss.zig");
 const packet_space = @import("quic/recovery/packet_space.zig");
+const rtt = @import("quic/recovery/rtt.zig");
 
 const corpus = &.{
     "\x00",
@@ -52,6 +54,7 @@ fn fuzzQuic(_: std.Io, smith: *std.testing.Smith) !void {
     _ = version_negotiation.validate(input, &.{}, &.{}, 1, false) catch {};
     fuzzInitialProtection(input);
     fuzzAckTracker(input);
+    fuzzLossDetection(input);
     if (input.len >= 6) {
         const encoded_length: u3 = @intCast(input[0] % 4 + 1);
         const truncated = try packet_number.decodeTruncated(input[1 .. 1 + encoded_length]);
@@ -75,6 +78,32 @@ fn fuzzAckTracker(input: []const u8) void {
     const bytes = frame.writer.encode(&encoded, ack) catch @panic("ACK tracker emitted an invalid frame");
     var frame_cursor: usize = 0;
     _ = frame.parseOne(bytes, &frame_cursor) catch @panic("ACK tracker emitted an unparsable frame");
+}
+
+fn fuzzLossDetection(input: []const u8) void {
+    var detector = loss.Detector(32).init(.application);
+    const packet_count = @min(input.len, 32);
+    for (0..packet_count) |index| detector.onPacketSent(.{
+        .packet_number = index,
+        .time_sent = index * rtt.millisecond,
+        .sent_bytes = 1200,
+        .ack_eliciting = input[index] & 1 != 0,
+        .in_flight = input[index] & 2 != 0,
+    }) catch @panic("bounded loss fixture overflowed");
+    if (packet_count == 0) return;
+
+    const largest: u64 = input[0] % @as(u8, @intCast(packet_count));
+    const ack: frame.Ack = .{
+        .largest = largest,
+        .delay = if (input.len > 1) input[1] * rtt.millisecond else 0,
+        .first_range = 0,
+        .ranges = &.{},
+        .range_count = 0,
+        .ecn = null,
+    };
+    var estimator: rtt.Estimator = .{};
+    _ = detector.onAck(ack, 500 * rtt.millisecond, &estimator, 25 * rtt.millisecond, true) catch return;
+    _ = detector.timer(estimator, 25 * rtt.millisecond, true, if (input.len > 2) input[2] % 8 else 0);
 }
 
 fn fuzzTransportParameters(input: []const u8, role: transport_parameters.Role) !void {
