@@ -49,7 +49,7 @@ pub fn parseRequest(fields: []const Header, extended_connect_enabled: bool) !Req
     const content_length = try parseContentLength(regular);
     if (authority) |pseudo_authority| {
         if (regular.get("host")) |host| {
-            if (!std.mem.eql(u8, pseudo_authority, host)) return error.AuthorityMismatch;
+            if (!std.ascii.eqlIgnoreCase(pseudo_authority, host)) return error.AuthorityMismatch;
         }
     }
 
@@ -166,6 +166,8 @@ fn validateName(name: []const u8) !void {
 }
 
 fn validateValue(value: []const u8) !void {
+    if (value.len != 0 and (value[0] == ' ' or value[0] == '\t' or
+        value[value.len - 1] == ' ' or value[value.len - 1] == '\t')) return error.InvalidHeaderValue;
     for (value) |byte| {
         if ((byte < ' ' and byte != '\t') or byte == 0x7f) return error.InvalidHeaderValue;
     }

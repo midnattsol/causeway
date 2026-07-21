@@ -77,6 +77,8 @@ fn isToken(name: []const u8) bool {
 }
 
 fn isValue(value: []const u8) bool {
+    if (value.len != 0 and (value[0] == ' ' or value[0] == '\t' or
+        value[value.len - 1] == ' ' or value[value.len - 1] == '\t')) return false;
     for (value) |byte| if ((byte < ' ' and byte != '\t') or byte == 0x7f) return false;
     return true;
 }

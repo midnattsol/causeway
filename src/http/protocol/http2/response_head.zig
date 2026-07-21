@@ -30,6 +30,8 @@ pub fn encode(
 pub fn validate(headers: Headers) !void {
     for (headers.items) |field| {
         if (field.name.len == 0 or field.name[0] == ':' or !isToken(field.name)) return error.InvalidResponseHeader;
+        if (field.value.len != 0 and (field.value[0] == ' ' or field.value[0] == '\t' or
+            field.value[field.value.len - 1] == ' ' or field.value[field.value.len - 1] == '\t')) return error.InvalidResponseHeader;
         for (field.value) |byte| {
             if ((byte < ' ' and byte != '\t') or byte == 0x7f) return error.InvalidResponseHeader;
         }

@@ -388,7 +388,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     .window_update => |increment| try self.handleWindowUpdate(received.header.stream_id, increment),
                     .headers => |payload| try self.handleHeaders(received.header.stream_id, payload),
                     .continuation => |payload| try self.handleContinuation(received.header.stream_id, payload),
-                    .data => |payload| try self.handleData(received.header.stream_id, payload),
+                    .data => |payload| try self.handleData(received.header.stream_id, received.header.length, payload),
                     .rst_stream => try self.handleReset(received.header.stream_id),
                     .priority => {},
                     .push_promise => return self.connectionFailure(.protocol_error, error.ClientPushPromise),
@@ -562,14 +562,14 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 return session;
             }
 
-            fn handleData(self: *Controller, stream_id: u32, payload: frame.Data) !void {
+            fn handleData(self: *Controller, stream_id: u32, flow_length: u32, payload: frame.Data) !void {
                 const stream = self.registry.get(stream_id) orelse {
                     if (stream_id > self.registry.highest_opened) return self.connectionFailure(.protocol_error, error.DataOnIdleStream);
                     return self.streamFailure(stream_id, .stream_closed, error.StreamClosed);
                 };
                 const session = self.sessions.get(stream_id) orelse return self.streamFailure(stream_id, .stream_closed, error.StreamClosed);
-                self.connection_receive_window.consume(payload.bytes.len) catch |err| return self.connectionFailure(.flow_control_error, err);
-                stream.receiveData(payload.bytes.len, payload.end_stream) catch |err| return self.streamFailure(
+                self.connection_receive_window.consume(flow_length) catch |err| return self.connectionFailure(.flow_control_error, err);
+                stream.receiveData(flow_length, payload.end_stream) catch |err| return self.streamFailure(
                     stream_id,
                     if (err == error.FlowControlError) .flow_control_error else .protocol_error,
                     err,
@@ -578,6 +578,8 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 if (!session.tunnel and session.received_body > self.owner.options.max_body_size) return self.streamFailure(stream_id, .cancel, error.BodyTooLarge);
                 if (!session.tunnel) if (session.content_length) |expected| if (session.received_body > expected) return self.streamFailure(stream_id, .protocol_error, error.ContentLengthMismatch);
                 session.input.push(payload.bytes) catch |err| return self.streamFailure(stream_id, .flow_control_error, err);
+                const discarded_padding = flow_length - @as(u32, @intCast(payload.bytes.len));
+                if (discarded_padding != 0) try self.returnCredit(stream_id, discarded_padding);
                 if (payload.end_stream) {
                     self.verifyBodyEnd(session) catch |err| return self.streamFailure(stream_id, .protocol_error, err);
                     session.input.finish();
@@ -591,6 +593,13 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 }
             }
 
+            fn returnCredit(self: *Controller, stream_id: u32, increment: u32) !void {
+                if (self.registry.get(stream_id)) |stream| try stream.receive_window.increase(increment);
+                try self.connection_receive_window.increase(increment);
+                try self.writer.writeWindowUpdate(stream_id, increment);
+                try self.writer.writeWindowUpdate(0, increment);
+            }
+
             fn returnCredits(self: *Controller) !bool {
                 var progressed = false;
                 var iterator = self.sessions.valueIterator();
@@ -600,10 +609,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     if (amount == 0) continue;
                     progressed = true;
                     const increment: u32 = @intCast(amount);
-                    if (self.registry.get(session.id)) |stream| try stream.receive_window.increase(increment);
-                    try self.connection_receive_window.increase(increment);
-                    try self.writer.writeWindowUpdate(session.id, increment);
-                    try self.writer.writeWindowUpdate(0, increment);
+                    try self.returnCredit(session.id, increment);
                 }
                 return progressed;
             }
@@ -1383,6 +1389,32 @@ test "HTTP/2 response stream backpressures only its producer" {
     try std.testing.expectEqual(@as(usize, 26), serverDataLength(output.written(), 1));
 }
 
+test "HTTP/2 flow control counts and returns discarded DATA padding" {
+    const AppState = struct { body: u8 = 0 };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            const body = (try context.request.body.readAll()).?;
+            context.execution.state.body = body[0];
+            return .{ .status = .ok };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(4));
+    const bytes = frame.client_preface ++
+        "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++
+        "\x00\x00\x03\x01\x04\x00\x00\x00\x01\x83\x87\x84" ++
+        "\x00\x00\x04\x00\x09\x00\x00\x00\x01\x02x\x00\x00";
+    var input: Io.Reader = .fixed(bytes);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: AppState = .{};
+    var handler = Handler(AppState, Dispatcher).init(std.testing.allocator, &state, .{});
+    try handler.serve(&input, &output.writer, threaded.io());
+    try std.testing.expectEqual(@as(u8, 'x'), state.body);
+    try std.testing.expectEqual(@as(u64, 4), serverWindowCredit(output.written(), 1));
+}
+
 test "HTTP/2 dispatch reads a DATA-backed request body concurrently" {
     const AppState = struct { body: [4]u8 = undefined };
     const Dispatcher = struct {
@@ -1448,6 +1480,22 @@ test "HTTP/2 graceful drain sends GOAWAY and waits for active dispatch" {
     try trigger.await(io);
     try std.testing.expect(serverOutputContains(output.written(), .goaway, 0));
     try std.testing.expect(serverOutputContains(output.written(), .headers, 1));
+}
+
+fn serverWindowCredit(bytes: []const u8, stream_id: u32) u64 {
+    var cursor: usize = 0;
+    var total: u64 = 0;
+    while (bytes.len - cursor >= frame.header_size) {
+        const header_bytes: *const [frame.header_size]u8 = @ptrCast(bytes[cursor..][0..frame.header_size]);
+        const header = frame.Header.parse(header_bytes);
+        cursor += frame.header_size;
+        if (header.length > bytes.len - cursor) return total;
+        if (header.frame_type == .window_update and header.stream_id == stream_id and header.length == 4) {
+            total += frame.readU32(bytes[cursor..][0..4]) & 0x7fff_ffff;
+        }
+        cursor += header.length;
+    }
+    return total;
 }
 
 fn serverFrameCount(bytes: []const u8, frame_type: frame.Type, stream_id: u32) usize {
