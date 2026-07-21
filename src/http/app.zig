@@ -197,3 +197,19 @@ test "AppWithProtocol composes an explicit protocol driver" {
     try std.testing.expect(app.state == &state);
     try std.testing.expectEqual(server.ServerState.configured, app.server.serverState());
 }
+
+test "AppWithProtocol composes the HTTP/2 engine without changing dispatch" {
+    const http2 = @import("protocol/http2/root.zig");
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var state: TestState = .{};
+    var app = AppWithProtocol(TestState, http2, TestAppDispatcher, http2.Options{}).init(
+        std.testing.allocator,
+        threaded.io(),
+        &state,
+        .{},
+    );
+    defer app.deinit();
+    try std.testing.expect(app.state == &state);
+    try std.testing.expectEqual(server.ServerState.configured, app.server.serverState());
+}

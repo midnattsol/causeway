@@ -2,13 +2,13 @@
 
 Causeway is a typed, modular HTTP API library for Zig. Its protocol-independent
 request pipeline is separated from wire-protocol engines and network transport.
-The current HTTP/1.x engine owns request parsing, message framing, response
-serialization, and connection reuse while using Zig's `std.Io` transport and
-compression primitives.
+The HTTP/1.x and HTTP/2 engines own parsing, framing, compression, response
+serialization, multiplexing, and connection lifecycle while using Zig's
+`std.Io` transport primitives.
 
 ## Status
 
-The HTTP/1.1 core is implemented: lifecycle-managed servers and hot listeners,
+The HTTP/1.1 and server-side HTTP/2 cores are implemented: lifecycle-managed servers and hot listeners,
 typed compile-time routing, extractors and middleware, buffered and streaming
 request/response bodies, keep-alive, limits, deadlines, graceful shutdown,
 cookies, sessions, CSRF, compression, ETags, request content decoding,
@@ -35,7 +35,10 @@ zig build integration-test
 zig build smoke-test
 zig build http1-fuzz
 zig build --fuzz=100K http1-fuzz
-zig build --fuzz http1-fuzz
+zig build http2-compliance
+zig build http2-fuzz
+zig build --fuzz=100K http2-fuzz
+zig build http2-bench -Doptimize=ReleaseFast
 zig build test
 ```
 
@@ -45,6 +48,10 @@ framing, response planning and headers, and in-memory connection sequences.
 It uses LLVM only for the fuzz artifact because the default backend in Zig
 `0.17.0-dev.1413+addc3c3b8` does not emit the required coverage points. Use an
 iteration limit for CI and omit it for an interactive, continuous campaign.
+
+`zig build http2-compliance` runs the self-contained HTTP/2 RFC matrix.
+`http2-fuzz` mutates frames, HPACK and complete multiplexed connection
+sequences, while `http2-bench` reports frame-header and HPACK hot-path costs.
 
 The project uses the active ZVM master toolchain (`0.17.0-dev`).
 
@@ -61,12 +68,13 @@ The HTTP package is split by responsibility:
 
 - `src/http/message/`: logical requests, responses, headers, status, and bodies;
 - `src/http/semantics/`: caching, conditionals, cookies, and ranges;
-- `src/http/protocol/`: wire engines; currently HTTP/1.0 and HTTP/1.1;
+- `src/http/protocol/`: HTTP/1.0, HTTP/1.1, HTTP/2, and ALPN selection;
 - `src/http/transport/`: listeners, accepted connections, and lifecycle;
 - `src/http/routing/`, `handlers/`, `extractors/`, and `middleware/`: the shared application pipeline.
 
 See [`IDEA.md`](IDEA.md) for architecture and ownership,
 [`docs/http-streaming.md`](docs/http-streaming.md) for request/response body
-streaming, [`docs/http-files.md`](docs/http-files.md) for file transfer and cache
-semantics, and [`docs/http-protocol.md`](docs/http-protocol.md) for HTTP/1.x wire
-behavior.
+[`docs/http-files.md`](docs/http-files.md) for file transfer and cache
+semantics, [`docs/http-protocol.md`](docs/http-protocol.md) for HTTP/1.x wire
+behavior, and [`docs/http2.md`](docs/http2.md) for HTTP/2 architecture, options,
+and validation.

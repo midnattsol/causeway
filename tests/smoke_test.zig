@@ -54,6 +54,11 @@ test "public HTTP API exposes protocol-independent messages and protocol layers"
     _ = causeway.http.message;
     _ = causeway.http.semantics;
     _ = causeway.http.protocol.http1;
+    _ = causeway.http.protocol.http2;
+    _ = causeway.http.http2.Handler;
+    _ = causeway.http.http2.HandlerWithLocals;
+    _ = causeway.http.http2.Options;
+    _ = causeway.http.protocol_negotiation.selectAlpn;
     _ = causeway.http.transport;
     _ = causeway.http.message.request.Version.http_2;
     _ = causeway.http.message.request_body.Source;

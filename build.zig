@@ -62,6 +62,19 @@ pub fn build(b: *std.Build) void {
     });
     const run_http2_compliance_tests = b.addRunArtifact(http2_compliance_tests);
 
+    const http2_benchmark = b.addExecutable(.{
+        .name = "http2-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/http2.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "causeway", .module = causeway },
+            },
+        }),
+    });
+    const run_http2_benchmark = b.addRunArtifact(http2_benchmark);
+
     const integration_tests = b.addTest(.{
         .name = "integration tests",
         .root_module = b.createModule(.{
@@ -87,6 +100,9 @@ pub fn build(b: *std.Build) void {
 
     const http2_compliance_step = b.step("http2-compliance", "Run the HTTP/2 RFC compliance matrix");
     http2_compliance_step.dependOn(&run_http2_compliance_tests.step);
+
+    const http2_benchmark_step = b.step("http2-bench", "Benchmark HTTP/2 frame and HPACK hot paths");
+    http2_benchmark_step.dependOn(&run_http2_benchmark.step);
 
     const integration_test_step = b.step("integration-test", "Run HTTP integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);

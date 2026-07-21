@@ -15,8 +15,9 @@ HTTP/1 wire details and the shared layers:
 
 `http.app.App` uses HTTP/1 by default. `AppWithProtocol` and
 `AppWithLocalsAndProtocol` compose the same application pipeline with another
-stream-oriented protocol engine. HTTP/2 can use this boundary over a stream;
-HTTP/3 will additionally require a QUIC/UDP transport compositor.
+stream-oriented protocol engine. The built-in HTTP/2 engine uses this boundary;
+HTTP/3 will additionally require a QUIC/UDP transport compositor. See
+[`http2.md`](http2.md).
 
 ## Request targets and versions
 
