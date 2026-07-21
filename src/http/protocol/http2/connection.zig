@@ -185,6 +185,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             pending_header_stream: ?u32 = null,
             pending_header_end_stream: bool = false,
             received_initial_settings: bool = false,
+            awaiting_settings_ack: bool = true,
             draining: bool = false,
             goaway_sent: bool = false,
             peer_goaway: bool = false,
@@ -270,7 +271,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     progressed = try self.scheduleOutput() or progressed;
                     progressed = self.collectSessions() or progressed;
 
-                    if (self.frames.failure()) |err| return self.connectionFailure(.protocol_error, err);
+                    if (self.frames.failure()) |err| return self.connectionFailure(connectionErrorCode(err), err);
                     if ((self.frames.ended() or self.peer_goaway) and self.sessions.count() == 0) return;
                     if (self.draining and self.sessions.count() == 0) return;
                     if (progressed) continue;
@@ -311,7 +312,10 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
             fn handleMessage(self: *Controller, message: Message) !void {
                 switch (message) {
-                    .response_ready => |session| try self.startResponse(session),
+                    .response_ready => |session| self.startResponse(session) catch |err| {
+                        self.streamFailure(session.id, .internal_error, err);
+                        session.response_started.set(self.io);
+                    },
                     .task_done => |done| {
                         done.session.task_done = true;
                         if (done.err) |err| {
@@ -359,7 +363,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     .headers => |payload| try self.handleHeaders(received.header.stream_id, payload),
                     .continuation => |payload| try self.handleContinuation(received.header.stream_id, payload),
                     .data => |payload| try self.handleData(received.header.stream_id, payload),
-                    .rst_stream => self.resetStream(received.header.stream_id, error.PeerReset),
+                    .rst_stream => try self.handleReset(received.header.stream_id),
                     .priority => {},
                     .push_promise => return self.connectionFailure(.protocol_error, error.ClientPushPromise),
                     .unknown => {},
@@ -369,7 +373,11 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             fn handleSettings(self: *Controller, payload: frame.Settings) !void {
                 if (!self.received_initial_settings and payload.ack) return self.connectionFailure(.protocol_error, error.InvalidInitialSettingsAck);
                 self.received_initial_settings = true;
-                if (payload.ack) return;
+                if (payload.ack) {
+                    if (!self.awaiting_settings_ack) return self.connectionFailure(.protocol_error, error.UnexpectedSettingsAck);
+                    self.awaiting_settings_ack = false;
+                    return;
+                }
                 const changes = settings.apply(&self.peer_settings, payload.bytes) catch |err| {
                     return self.connectionFailure(if (err == error.FlowControlError) .flow_control_error else .protocol_error, err);
                 };
@@ -384,7 +392,10 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
             fn handleWindowUpdate(self: *Controller, stream_id: u32, increment: u32) !void {
                 if (stream_id == 0) return self.connection_send_window.increase(increment) catch |err| self.connectionFailure(.flow_control_error, err);
-                const stream = self.registry.get(stream_id) orelse return;
+                const stream = self.registry.get(stream_id) orelse {
+                    if (stream_id > self.registry.highest_opened) return self.connectionFailure(.protocol_error, error.WindowUpdateOnIdleStream);
+                    return;
+                };
                 stream.send_window.increase(increment) catch |err| {
                     self.streamFailure(stream_id, .flow_control_error, err);
                     return;
@@ -399,6 +410,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 if (self.registry.get(stream_id)) |stream| {
                     _ = stream.receiveHeaders(payload.end_stream) catch |err| return self.streamFailure(stream_id, .protocol_error, err);
                 } else {
+                    if (stream_id <= self.registry.highest_opened) return self.streamFailure(stream_id, .stream_closed, error.StreamClosed);
                     const stream = self.registry.open(
                         stream_id,
                         @intCast(self.owner.options.request_body_buffer_size),
@@ -411,14 +423,20 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 }
                 self.pending_header_stream = stream_id;
                 self.pending_header_end_stream = payload.end_stream;
-                if (try self.assembler.begin(stream_id, payload.fragment, payload.end_headers)) |block| {
+                if (self.assembler.begin(stream_id, payload.fragment, payload.end_headers) catch |err| return self.connectionFailure(
+                    if (err == error.HeaderBlockTooLarge) .enhance_your_calm else .protocol_error,
+                    err,
+                )) |block| {
                     defer self.clearPendingHeader();
                     try self.finishHeaderBlock(stream_id, block, payload.end_stream);
                 }
             }
 
             fn handleContinuation(self: *Controller, stream_id: u32, payload: frame.Continuation) !void {
-                if (try self.assembler.continuation(stream_id, payload.fragment, payload.end_headers)) |block| {
+                if (self.assembler.continuation(stream_id, payload.fragment, payload.end_headers) catch |err| return self.connectionFailure(
+                    if (err == error.HeaderBlockTooLarge) .enhance_your_calm else .protocol_error,
+                    err,
+                )) |block| {
                     const end_stream = self.pending_header_end_stream;
                     defer self.clearPendingHeader();
                     try self.finishHeaderBlock(stream_id, block, end_stream);
@@ -509,10 +527,17 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
 
             fn handleData(self: *Controller, stream_id: u32, payload: frame.Data) !void {
-                const stream = self.registry.get(stream_id) orelse return self.streamFailure(stream_id, .stream_closed, error.StreamClosed);
+                const stream = self.registry.get(stream_id) orelse {
+                    if (stream_id > self.registry.highest_opened) return self.connectionFailure(.protocol_error, error.DataOnIdleStream);
+                    return self.streamFailure(stream_id, .stream_closed, error.StreamClosed);
+                };
                 const session = self.sessions.get(stream_id) orelse return self.streamFailure(stream_id, .stream_closed, error.StreamClosed);
                 self.connection_receive_window.consume(payload.bytes.len) catch |err| return self.connectionFailure(.flow_control_error, err);
-                stream.receiveData(payload.bytes.len, payload.end_stream) catch |err| return self.streamFailure(stream_id, .protocol_error, err);
+                stream.receiveData(payload.bytes.len, payload.end_stream) catch |err| return self.streamFailure(
+                    stream_id,
+                    if (err == error.FlowControlError) .flow_control_error else .protocol_error,
+                    err,
+                );
                 session.received_body = std.math.add(u64, session.received_body, payload.bytes.len) catch return self.streamFailure(stream_id, .cancel, error.BodyTooLarge);
                 if (!session.tunnel and session.received_body > self.owner.options.max_body_size) return self.streamFailure(stream_id, .cancel, error.BodyTooLarge);
                 if (!session.tunnel) if (session.content_length) |expected| if (session.received_body > expected) return self.streamFailure(stream_id, .protocol_error, error.ContentLengthMismatch);
@@ -735,12 +760,22 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 }
             }
 
+            fn handleReset(self: *Controller, stream_id: u32) !void {
+                if (self.registry.get(stream_id) == null and stream_id > self.registry.highest_opened) {
+                    return self.connectionFailure(.protocol_error, error.ResetIdleStream);
+                }
+                self.resetStream(stream_id, error.PeerReset);
+            }
+
             fn resetStream(self: *Controller, stream_id: u32, err: anyerror) void {
                 if (self.registry.get(stream_id)) |stream| stream.reset();
                 if (self.sessions.get(stream_id)) |session| {
                     session.input.fail(err);
                     if (session.output) |output| output.abort(err);
-                    session.output_done = true;
+                    if (!session.output_done) {
+                        session.output_done = true;
+                        if (session.response) |*response| response.complete(.{ .failure = err });
+                    }
                 }
             }
 
@@ -940,6 +975,58 @@ test "HTTP/2 handler serves a prior-knowledge request end to end" {
     try handler.serve(&input, &output.writer, threaded.io());
     try std.testing.expectEqual(@as(usize, 1), state.requests);
     try std.testing.expect(output.written().len > 9);
+}
+
+test "HTTP/2 DATA on an idle stream is a connection protocol error" {
+    const AppState = struct {};
+    const Dispatcher = struct {
+        pub fn dispatch(_: anytype) !Response {
+            return .{ .status = .ok };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(3));
+    const bytes = frame.client_preface ++
+        "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++
+        "\x00\x00\x01\x00\x01\x00\x00\x00\x03x";
+    var input: Io.Reader = .fixed(bytes);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: AppState = .{};
+    var handler = Handler(AppState, Dispatcher).init(std.testing.allocator, &state, .{});
+    try std.testing.expectError(error.DataOnIdleStream, handler.serve(&input, &output.writer, threaded.io()));
+    try std.testing.expect(serverOutputContains(output.written(), .goaway, 0));
+}
+
+test "HTTP/2 invalid application response resets only its stream" {
+    const AppState = struct { requests: usize = 0 };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            context.execution.state.requests += 1;
+            if (std.mem.eql(u8, context.request.path, "/")) return .{
+                .status = .ok,
+                .headers = .{ .items = &.{.{ .name = "connection", .value = "close" }} },
+            };
+            return .{ .status = .ok };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(4));
+    const bytes = frame.client_preface ++
+        "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++
+        "\x00\x00\x03\x01\x05\x00\x00\x00\x01\x82\x87\x84" ++
+        "\x00\x00\x03\x01\x05\x00\x00\x00\x03\x82\x87\x85";
+    var input: Io.Reader = .fixed(bytes);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: AppState = .{};
+    var handler = Handler(AppState, Dispatcher).init(std.testing.allocator, &state, .{});
+    try handler.serve(&input, &output.writer, threaded.io());
+    try std.testing.expectEqual(@as(usize, 2), state.requests);
+    try std.testing.expect(serverOutputContains(output.written(), .rst_stream, 1));
+    try std.testing.expect(serverOutputContains(output.written(), .headers, 3));
 }
 
 test "HTTP/2 keeps valid multiplexed streams alive after a malformed request" {
@@ -1176,6 +1263,15 @@ fn serverOutputContains(bytes: []const u8, frame_type: frame.Type, stream_id: u3
         cursor += header.length;
     }
     return false;
+}
+
+fn connectionErrorCode(err: anyerror) errors.Code {
+    return switch (err) {
+        error.FrameSizeError => .frame_size_error,
+        error.FlowControlError => .flow_control_error,
+        error.HeaderBlockTooLarge => .enhance_your_calm,
+        else => .protocol_error,
+    };
 }
 
 fn validateOptions(options: Options) !void {
