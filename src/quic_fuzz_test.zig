@@ -35,7 +35,15 @@ fn fuzzQuic(_: std.Io, smith: *std.testing.Smith) !void {
     _ = transport_parameters.parse(input, if (input.len != 0 and input[0] & 1 != 0) .server else .client) catch {};
 
     var frames: frame.Iterator = .{ .payload = input };
-    while (frames.next() catch null) |_| {}
+    while (frames.next() catch null) |parsed| {
+        var first: [4096]u8 = undefined;
+        const canonical = frame.writer.encode(&first, parsed) catch continue;
+        var cursor: usize = 0;
+        const reparsed = frame.parseOne(canonical, &cursor) catch @panic("canonical frame did not parse");
+        var second: [4096]u8 = undefined;
+        const canonical_again = frame.writer.encode(&second, reparsed) catch @panic("canonical frame did not re-encode");
+        try std.testing.expectEqualSlices(u8, canonical, canonical_again);
+    }
 
     _ = packet_header.parse(input, if (input.len == 0) 0 else input[0] % 21) catch {};
     var retry_scratch: [2069]u8 = undefined;
