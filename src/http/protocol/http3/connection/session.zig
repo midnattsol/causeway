@@ -73,7 +73,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             owner: *Self = undefined,
             occupied: bool = false,
             id: StreamId = undefined,
-            state: validation.RequestState = .{ .sender = .client, .allow_push = false },
+            state: validation.RequestState = .{},
 
             frame_storage: [frame_buffer_size]u8 = undefined,
             frame_len: usize = 0,
@@ -470,9 +470,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         fn parseWireHeader(bytes: []const u8) !?WireHeader {
             const type_value = varint.decode(bytes) catch return null;
-            if (type_value.length != try varint.encodedLength(type_value.value)) return error.NonCanonicalVarint;
             const length_value = varint.decode(bytes[type_value.length..]) catch return null;
-            if (length_value.length != try varint.encodedLength(length_value.value)) return error.NonCanonicalVarint;
             return .{
                 .frame_type = @enumFromInt(type_value.value),
                 .length = std.math.cast(usize, length_value.value) orelse return error.FrameTooLarge,
@@ -894,10 +892,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         fn processUni(self: *Self, slot: *UniSlot, now: u64) !void {
             if (slot.stream_type == null) {
-                const prefix = stream.parsePrefix(slot.input[0..slot.input_len]) catch |err| switch (err) {
-                    error.Truncated => return,
-                    else => return err,
-                };
+                const prefix = stream.parsePrefix(slot.input[0..slot.input_len]) catch return;
                 try self.peer_streams.observe(prefix.stream_type, .client, false);
                 slot.stream_type = prefix.stream_type;
                 removePrefix(&slot.input, &slot.input_len, prefix.consumed);

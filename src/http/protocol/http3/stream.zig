@@ -29,8 +29,8 @@ pub const Prefix = struct {
 
 pub fn parsePrefix(bytes: []const u8) !Prefix {
     var cursor: usize = 0;
-    const stream_type: Type = @enumFromInt(try decodeCanonicalAt(bytes, &cursor));
-    const push_id = if (stream_type == .push) try decodeCanonicalAt(bytes, &cursor) else null;
+    const stream_type: Type = @enumFromInt(try decodeAt(bytes, &cursor));
+    const push_id = if (stream_type == .push) try decodeAt(bytes, &cursor) else null;
     return .{ .stream_type = stream_type, .push_id = push_id, .consumed = cursor };
 }
 
@@ -76,11 +76,8 @@ pub const Registry = struct {
     }
 };
 
-fn decodeCanonicalAt(bytes: []const u8, cursor: *usize) !u64 {
-    const decoded = try varint.decode(bytes[cursor.*..]);
-    if (decoded.length != try varint.encodedLength(decoded.value)) return error.NonCanonicalVarint;
-    cursor.* += decoded.length;
-    return decoded.value;
+fn decodeAt(bytes: []const u8, cursor: *usize) !u64 {
+    return varint.decodeAt(bytes, cursor);
 }
 
 fn append(destination: []u8, cursor: *usize, value: u64) !void {
@@ -94,14 +91,16 @@ fn append(destination: []u8, cursor: *usize, value: u64) !void {
 // Tests
 // -----------------------------------------------------------------------------
 
-test "unidirectional prefixes parse push and grease types canonically" {
+test "unidirectional prefixes accept valid non-minimal varints" {
     const push = try parsePrefix("\x01\x40\x40rest");
     try std.testing.expectEqual(Type.push, push.stream_type);
     try std.testing.expectEqual(@as(?u64, 64), push.push_id);
     try std.testing.expectEqual(@as(usize, 3), push.consumed);
     const grease = try parsePrefix("\x21payload");
     try std.testing.expectEqual(@as(u64, 0x21), @intFromEnum(grease.stream_type));
-    try std.testing.expectError(error.NonCanonicalVarint, parsePrefix("\x40\x00"));
+    const non_minimal = try parsePrefix("\x40\x00rest");
+    try std.testing.expectEqual(Type.control, non_minimal.stream_type);
+    try std.testing.expectEqual(@as(usize, 2), non_minimal.consumed);
 }
 
 test "critical streams are unique and cannot close" {

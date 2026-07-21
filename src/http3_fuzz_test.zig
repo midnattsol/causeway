@@ -8,6 +8,9 @@ const corpus = &.{
     "\x01\x03abc",
     "\x00\x05hello",
     "\x00\x04\x01\x00\x07\x00",
+    "\x40\x00\x40\x04\x40\x00",
+    "\x04\x04\x40\x01\x40\x00",
+    "\x07\x02\x40\x05",
     "\x3f\xbd\x01",
     "\x00\x00\xd1\xd7",
     // Script seeds: open/feed a control stream, request stream, poll, and shutdown.

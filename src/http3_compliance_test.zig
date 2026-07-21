@@ -101,16 +101,27 @@ test "compliance: frame placement and forbidden HTTP/2 frame types are connectio
 }
 
 test "compliance: malformed frame encodings are H3_FRAME_ERROR" {
-    const request_cases = [_][]const u8{
-        "\x40\x00\x00", // Non-canonical frame type.
-        "\x21\x03ab", // Truncated extension-frame payload.
-    };
-    for (request_cases) |bytes| try expectConnectionError(code(.frame_error), &.{.{ .id = 0, .bytes = bytes, .finish = true }});
+    try expectConnectionError(code(.frame_error), &.{.{ .id = 0, .bytes = "\x21\x03ab", .finish = true }});
     try expectConnectionError(code(.frame_error), &.{.{ .id = 2, .bytes = "\x00\x04\x00\x07\x02\x00\x00" }});
 }
 
-test "compliance: GOAWAY and MAX_PUSH_ID enforce identifier monotonicity" {
-    try expectConnectionError(code(.id_error), &.{.{ .id = 2, .bytes = "\x00\x04\x00\x07\x01\x00" }});
+test "compliance: valid non-minimal QUIC varints are accepted throughout HTTP/3" {
+    const cases = [_][]const u8{
+        "\x40\x00\x40\x04\x40\x00", // Stream type, SETTINGS type, and frame length.
+        "\x00\x04\x04\x40\x01\x40\x00", // SETTINGS identifier and value.
+        "\x00\x04\x00\x07\x02\x40\x05", // Structured GOAWAY Push ID.
+    };
+    for (cases) |bytes| {
+        const result = try run(&.{.{ .id = 2, .bytes = bytes }});
+        try std.testing.expect(result.err == null);
+        try std.testing.expect(result.transport.close_code == null);
+    }
+}
+
+test "compliance: client GOAWAY uses a decreasing Push ID and MAX_PUSH_ID increases" {
+    const accepted = try run(&.{.{ .id = 2, .bytes = "\x00\x04\x00\x07\x01\x05\x07\x01\x04" }});
+    try std.testing.expect(accepted.err == null);
+    try std.testing.expect(accepted.transport.close_code == null);
     try expectConnectionError(code(.id_error), &.{.{ .id = 2, .bytes = "\x00\x04\x00\x07\x01\x05\x07\x01\x09" }});
     try expectConnectionError(code(.id_error), &.{.{ .id = 2, .bytes = "\x00\x04\x00\x0d\x01\x09\x0d\x01\x05" }});
 }

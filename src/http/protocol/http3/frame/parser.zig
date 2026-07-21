@@ -24,11 +24,11 @@ pub const Parser = struct {
 /// Parses one frame and borrows its payload from `bytes`.
 pub fn parse(bytes: []const u8) !types.Parsed {
     var cursor: usize = 0;
-    const raw_type = try decodeCanonicalAt(bytes, &cursor);
+    const raw_type = try decodeAt(bytes, &cursor);
     const frame_type: types.Type = @enumFromInt(raw_type);
     if (frame_type.isForbiddenHttp2()) return error.ForbiddenHttp2Frame;
 
-    const raw_length = try decodeCanonicalAt(bytes, &cursor);
+    const raw_length = try decodeAt(bytes, &cursor);
     const length = std.math.cast(usize, raw_length) orelse return error.FrameTooLarge;
     if (length > bytes.len - cursor) return error.Truncated;
     const payload = bytes[cursor .. cursor + length];
@@ -53,7 +53,7 @@ fn parsePayload(frame_type: types.Type, payload: []const u8) !types.Payload {
         },
         .push_promise => blk: {
             var cursor: usize = 0;
-            const push_id = try decodeCanonicalAt(payload, &cursor);
+            const push_id = try decodeAt(payload, &cursor);
             break :blk .{ .push_promise = .{
                 .push_id = push_id,
                 .field_section = payload[cursor..],
@@ -67,16 +67,13 @@ fn parsePayload(frame_type: types.Type, payload: []const u8) !types.Payload {
 
 fn parseSingleInteger(payload: []const u8) !u64 {
     var cursor: usize = 0;
-    const value = try decodeCanonicalAt(payload, &cursor);
+    const value = try decodeAt(payload, &cursor);
     if (cursor != payload.len) return error.InvalidFramePayload;
     return value;
 }
 
-fn decodeCanonicalAt(bytes: []const u8, cursor: *usize) !u64 {
-    const decoded = try varint.decode(bytes[cursor.*..]);
-    if (decoded.length != try varint.encodedLength(decoded.value)) return error.NonCanonicalVarint;
-    cursor.* += decoded.length;
-    return decoded.value;
+fn decodeAt(bytes: []const u8, cursor: *usize) !u64 {
+    return varint.decodeAt(bytes, cursor);
 }
 
 // -----------------------------------------------------------------------------
@@ -107,9 +104,12 @@ test "parser handles all structured integer frames" {
     try std.testing.expectEqualSlices(u8, "hz", promise.field_section);
 }
 
-test "parser rejects malformed, noncanonical, and forbidden HTTP/2 frames" {
+test "parser accepts valid non-minimal varints and rejects malformed frames" {
     try std.testing.expectError(error.Truncated, parse("\x00\x03ab"));
-    try std.testing.expectError(error.NonCanonicalVarint, parse("\x40\x00\x00"));
+    const non_minimal = try parse("\x40\x00\x40\x00");
+    try std.testing.expectEqual(types.Type.data, non_minimal.frame.frame_type);
+    try std.testing.expectEqual(@as(usize, 4), non_minimal.consumed);
+    try std.testing.expectEqual(@as(u64, 0), (try parse("\x07\x02\x40\x00")).frame.payload.goaway);
     try std.testing.expectError(error.InvalidFramePayload, parse("\x07\x02\x00\x00"));
     for ([_]u8{ 0x2, 0x6, 0x8, 0x9 }) |forbidden| {
         try std.testing.expectError(error.ForbiddenHttp2Frame, parse(&.{ forbidden, 0 }));

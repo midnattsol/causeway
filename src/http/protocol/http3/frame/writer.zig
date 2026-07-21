@@ -102,6 +102,17 @@ test "writer produces canonical frames round-tripped by parser" {
     }
 }
 
+test "writer emits minimal structured integers and preserves valid raw SETTINGS" {
+    var buffer: [32]u8 = undefined;
+    const length = try encode(&buffer, .{ .frame_type = .goaway, .payload = .{ .goaway = 0 } });
+    try std.testing.expectEqualSlices(u8, "\x07\x01\x00", buffer[0..length]);
+    const settings_length = try encode(&buffer, .{
+        .frame_type = .settings,
+        .payload = .{ .settings = "\x40\x01\x40\x00" },
+    });
+    try std.testing.expectEqualSlices(u8, "\x04\x04\x40\x01\x40\x00", buffer[0..settings_length]);
+}
+
 test "writer checks caller capacity and payload tag" {
     var small: [2]u8 = undefined;
     const data: types.Frame = .{ .frame_type = .data, .payload = .{ .data = "x" } };

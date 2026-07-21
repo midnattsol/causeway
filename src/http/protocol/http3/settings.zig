@@ -27,8 +27,8 @@ pub const Iterator = struct {
 
     pub fn next(self: *Iterator) !?Entry {
         if (self.cursor == self.bytes.len) return null;
-        const id = try decodeCanonicalAt(self.bytes, &self.cursor);
-        const value = try decodeCanonicalAt(self.bytes, &self.cursor);
+        const id = try decodeAt(self.bytes, &self.cursor);
+        const value = try decodeAt(self.bytes, &self.cursor);
         return .{ .id = @enumFromInt(id), .value = value };
     }
 };
@@ -37,8 +37,8 @@ pub fn iterator(bytes: []const u8) Iterator {
     return .{ .bytes = bytes };
 }
 
-/// Validates canonical encodings, forbidden HTTP/2 identifiers, and duplicate IDs.
-/// Unknown and GREASE settings are retained and exposed by `iterator`.
+/// Validates forbidden HTTP/2 identifiers and duplicate IDs. Any valid QUIC
+/// varint representation is accepted; unknown and GREASE settings are retained.
 pub fn validate(bytes: []const u8) !void {
     var outer = iterator(bytes);
     while (outer.cursor < bytes.len) {
@@ -72,11 +72,8 @@ pub fn encodeEntry(destination: []u8, entry: Entry) !usize {
     return needed;
 }
 
-pub fn decodeCanonicalAt(bytes: []const u8, cursor: *usize) !u64 {
-    const decoded = try varint.decode(bytes[cursor.*..]);
-    if (decoded.length != try varint.encodedLength(decoded.value)) return error.NonCanonicalVarint;
-    cursor.* += decoded.length;
-    return decoded.value;
+fn decodeAt(bytes: []const u8, cursor: *usize) !u64 {
+    return varint.decodeAt(bytes, cursor);
 }
 
 // -----------------------------------------------------------------------------
@@ -97,9 +94,9 @@ test "SETTINGS iterates known, unknown, and GREASE values" {
     try std.testing.expect((try entries.next()) == null);
 }
 
-test "SETTINGS rejects duplicates, HTTP/2 IDs, malformed and noncanonical values" {
+test "SETTINGS accepts non-minimal varints and rejects semantic or malformed values" {
     try std.testing.expectError(error.DuplicateSetting, validate("\x06\x01\x06\x02"));
     try std.testing.expectError(error.ReservedHttp2Setting, validate("\x02\x00"));
     try std.testing.expectError(error.Truncated, validate("\x01"));
-    try std.testing.expectError(error.NonCanonicalVarint, validate("\x40\x01\x00"));
+    try validate("\x40\x01\x40\x00");
 }

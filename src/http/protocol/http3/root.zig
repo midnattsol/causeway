@@ -20,6 +20,7 @@ pub const ErrorCode = errors.Code;
 pub const Role = stream.Role;
 pub const ControlState = validation.ControlState;
 pub const RequestState = validation.RequestState;
+pub const ResponseState = validation.ResponseState;
 
 comptime {
     _ = connection;
