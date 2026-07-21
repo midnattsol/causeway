@@ -10,6 +10,32 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const http1_example = b.addExecutable(.{
+        .name = "causeway-http1-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/http1.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "causeway", .module = causeway },
+            },
+        }),
+    });
+    const run_http1_example = b.addRunArtifact(http1_example);
+
+    const http2_example = b.addExecutable(.{
+        .name = "causeway-http2-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/http2.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "causeway", .module = causeway },
+            },
+        }),
+    });
+    const run_http2_example = b.addRunArtifact(http2_example);
+
     const unit_tests = b.addTest(.{
         .name = "unit tests",
         .root_module = causeway,
@@ -89,6 +115,12 @@ pub fn build(b: *std.Build) void {
     const run_integration_tests = b.addRunArtifact(integration_tests);
     const run_smoke_tests = b.addRunArtifact(smoke_tests);
 
+    const http1_example_step = b.step("example-http1", "Run the HTTP/1 example server");
+    http1_example_step.dependOn(&run_http1_example.step);
+
+    const http2_example_step = b.step("example-http2", "Run the HTTP/2 prior-knowledge example server");
+    http2_example_step.dependOn(&run_http2_example.step);
+
     const unit_test_step = b.step("unit-test", "Run unit tests");
     unit_test_step.dependOn(&run_unit_tests.step);
 
@@ -111,6 +143,8 @@ pub fn build(b: *std.Build) void {
     smoke_test_step.dependOn(&run_smoke_tests.step);
 
     const test_step = b.step("test", "Run all Causeway tests");
+    test_step.dependOn(&http1_example.step);
+    test_step.dependOn(&http2_example.step);
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_http2_compliance_tests.step);
     test_step.dependOn(&run_integration_tests.step);

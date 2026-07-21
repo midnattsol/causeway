@@ -32,6 +32,8 @@ engines use only APIs verified against that toolchain.
 zig fmt .
 zig build unit-test
 zig build integration-test
+zig build example-http1
+zig build example-http2
 zig build smoke-test
 zig build http1-fuzz
 zig build --fuzz=100K http1-fuzz
@@ -54,6 +56,26 @@ iteration limit for CI and omit it for an interactive, continuous campaign.
 sequences, while `http2-bench` reports frame-header and HPACK hot-path costs.
 
 The project uses the active ZVM master toolchain (`0.17.0-dev`).
+
+## Examples
+
+Run the HTTP/1 example on port `8080`:
+
+```sh
+zig build example-http1
+curl http://127.0.0.1:8080/
+```
+
+Run the h2c prior-knowledge HTTP/2 example on port `8081`:
+
+```sh
+zig build example-http2
+curl --http2-prior-knowledge http://127.0.0.1:8081/
+```
+
+Both examples use the same compile-time router and handler from
+`examples/common.zig`; only the selected wire protocol changes. `zig build test`
+compiles both executables without starting their servers.
 
 ## Layers
 
