@@ -5,7 +5,7 @@ const Method = @import("../../message/request.zig").Method;
 const response_module = @import("../../message/response.zig");
 const Response = response_module.Response;
 const ResponseBody = response_module.ResponseBody;
-const trailers = @import("trailers.zig");
+const trailers = @import("body/trailers.zig");
 
 pub const BodyMode = union(enum) {
     none,

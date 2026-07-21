@@ -1,9 +1,9 @@
 //! Strict RFC 9112 chunked transfer decoding.
 
 const std = @import("std");
-const Header = @import("../../message/headers.zig").Header;
-const Headers = @import("../../message/headers.zig").Headers;
-const syntax = @import("syntax.zig");
+const Header = @import("../../../message/headers.zig").Header;
+const Headers = @import("../../../message/headers.zig").Headers;
+const syntax = @import("../syntax.zig");
 const trailer_policy = @import("trailers.zig");
 
 pub const Limits = struct {

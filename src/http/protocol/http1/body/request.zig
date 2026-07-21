@@ -1,10 +1,10 @@
 //! HTTP/1.x request-body source for the protocol-independent body lifecycle.
 
 const std = @import("std");
-const headers_module = @import("../../message/headers.zig");
-const request_body = @import("../../message/request_body.zig");
-const body_reader = @import("body_reader.zig");
-const head_module = @import("head.zig");
+const headers_module = @import("../../../message/headers.zig");
+const request_body = @import("../../../message/request_body.zig");
+const body_reader = @import("reader.zig");
+const head_module = @import("../head.zig");
 const trailer_policy = @import("trailers.zig");
 
 const Headers = headers_module.Headers;

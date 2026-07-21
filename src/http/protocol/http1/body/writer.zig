@@ -1,7 +1,7 @@
 //! HTTP/1 fixed-length and chunked response-body writers.
 
 const std = @import("std");
-const Headers = @import("../../message/headers.zig").Headers;
+const Headers = @import("../../../message/headers.zig").Headers;
 const trailers = @import("trailers.zig");
 const Io = std.Io;
 

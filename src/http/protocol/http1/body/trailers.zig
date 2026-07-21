@@ -1,8 +1,8 @@
 //! Shared HTTP/1 trailer policy and wire validation.
 
 const std = @import("std");
-const Headers = @import("../../message/headers.zig").Headers;
-const syntax = @import("syntax.zig");
+const Headers = @import("../../../message/headers.zig").Headers;
+const syntax = @import("../syntax.zig");
 
 /// Returns whether a field is unsafe in trailers because it affects framing,
 /// routing, authentication, response control, or content processing.

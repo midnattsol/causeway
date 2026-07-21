@@ -10,7 +10,7 @@ const Target = request.Target;
 const syntax = @import("syntax.zig");
 const authority = @import("authority.zig");
 const validation = @import("validation.zig");
-const trailer_policy = @import("trailers.zig");
+const trailer_policy = @import("body/trailers.zig");
 
 pub const Framing = union(enum) {
     none,

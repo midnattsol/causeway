@@ -1,9 +1,9 @@
 //! Streaming HTTP/1 request-body framing owned by Causeway.
 
 const std = @import("std");
-const Header = @import("../../message/headers.zig").Header;
-const Headers = @import("../../message/headers.zig").Headers;
-const syntax = @import("syntax.zig");
+const Header = @import("../../../message/headers.zig").Header;
+const Headers = @import("../../../message/headers.zig").Headers;
+const syntax = @import("../syntax.zig");
 const trailer_policy = @import("trailers.zig");
 const Io = std.Io;
 
