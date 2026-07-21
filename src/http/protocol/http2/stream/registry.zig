@@ -1,7 +1,7 @@
 //! Controller-owned HTTP/2 stream registry.
 
 const std = @import("std");
-const stream_module = @import("stream.zig");
+const stream_module = @import("root.zig");
 const Stream = stream_module.Stream;
 
 /// Tracks active client-initiated streams. It is intentionally unsynchronized:

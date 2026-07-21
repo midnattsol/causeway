@@ -1,7 +1,7 @@
 //! Bounded SPSC request-body pipe for HTTP/2 DATA frames.
 
 const std = @import("std");
-const Headers = @import("../../message/headers.zig").Headers;
+const Headers = @import("../../../message/headers.zig").Headers;
 const Io = std.Io;
 
 pub const CreditSink = struct {
