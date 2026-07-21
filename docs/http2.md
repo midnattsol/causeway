@@ -37,6 +37,10 @@ Request and response DATA use bounded SPSC byte rings:
 - connection and stream flow-control windows are both enforced;
 - no mutex or allocation occurs per DATA frame.
 
+The advertised stream receive window equals `request_body_buffer_size`. The connection receive window is derived as `max_concurrent_streams * request_body_buffer_size`, saturated at HTTP/2's `2^31 - 1` maximum. The server sends the corresponding connection `WINDOW_UPDATE` immediately after its initial SETTINGS, so concurrent uploads can use the aggregate capacity already configured for their rings.
+
+`frame_queue_slots` controls inbound reader backpressure. `output_batch_size` independently limits how many output scheduling operations the controller performs before checking messages, inbound frames, returned credits, and lifecycle state again. An output operation can emit DATA or a header-block sequence, so it is deliberately not described as a frame count.
+
 Low-volume lifecycle operations use the controller mailbox. This keeps synchronization out of the socket and DATA hot paths without forcing control-plane code into a more complex lock-free design.
 
 ## Limits and deadlines
@@ -45,13 +49,17 @@ Low-volume lifecycle operations use the controller mailbox. This keeps synchroni
 
 `request_body_timeout` applies to lazy request-body reads. `response_write_timeout` supplies a default deadline; `Response.write_deadline` overrides it. A timed-out producer is canceled and finalized before its request arena is released, and only its stream is reset.
 
+`settings_ack_timeout` bounds the whole initial client handshake observed after the server sends its preface: client connection preface, initial SETTINGS, and acknowledgement of the server SETTINGS. Its dedicated future is canceled as soon as the ACK arrives. Setting the option to `null` disables this entire initial handshake deadline, not only the final ACK check.
+
 ## HTTP semantics
 
 Decoded requests validate pseudo-header order, uniqueness, required fields, lowercase names, connection-specific fields, `te: trailers`, content length, classic CONNECT, and RFC 8441 Extended CONNECT. Request metadata is exposed through the shared `Request` model with `.version = .http_2`, `scheme`, `effective_authority`, and `protocol`.
 
 Application response field names are lowercased during HPACK encoding. HTTP/1-only fields and status `101` are rejected. `Response.Stream` maps to HEADERS, fair DATA scheduling, and optional trailing HEADERS. A successful `Response.tunnel` maps takeover reads and writes to bidirectional stream DATA. `Response.upgrade` is invalid in HTTP/2.
 
-Client `PUSH_PROMISE` is a connection `PROTOCOL_ERROR`; server push is intentionally excluded. PRIORITY is parsed and validated but ignored by the round-robin scheduler.
+Responses are prepared and validated before their deadline starts or final HEADERS are written. With the default `application_error_policy = .internal_server_error`, a dispatcher failure or invalid response becomes a minimal `:status 500` response with `END_STREAM`; the original response completion observes the real failure and its producer is finalized without running. If the peer cannot accept even that mandatory pseudo-header, the stream is reset. `.reset_stream` selects strict `RST_STREAM(INTERNAL_ERROR)` behavior instead. Failures after final HEADERS have started always reset the stream because a second final response cannot be sent.
+
+Client `PUSH_PROMISE` is a connection `PROTOCOL_ERROR`; server push is intentionally excluded. The server omits `SETTINGS_ENABLE_PUSH`, which RFC 9113 defines as equivalent to sending `0` from a server, and validates the client's boolean value when present. PRIORITY is parsed and validated but ignored by the round-robin scheduler.
 
 ## Graceful shutdown
 

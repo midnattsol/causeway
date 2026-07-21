@@ -4,14 +4,19 @@ const std = @import("std");
 const frame = @import("../frame/root.zig");
 const Io = std.Io;
 
+/// Maps application failures before final response headers reach the peer.
 pub const ApplicationErrorPolicy = enum {
+    /// Emit a minimal `500` response when possible, otherwise reset the stream.
     internal_server_error,
+    /// Reset the affected stream without synthesizing a response.
     reset_stream,
 };
 
 pub const Options = struct {
     max_concurrent_streams: usize = 100,
+    /// Bounded SPSC slots between the sole socket reader and controller.
     frame_queue_slots: usize = 16,
+    /// Output scheduling operations processed before the controller checks input again.
     output_batch_size: usize = 16,
     max_frame_size: usize = frame.default_max_frame_size,
     max_header_block_size: usize = 64 * 1024,
@@ -24,6 +29,8 @@ pub const Options = struct {
     max_body_size: usize = 1024 * 1024,
     request_body_timeout: ?Io.Duration = null,
     response_write_timeout: ?Io.Duration = null,
+    /// Bounds the client preface, initial SETTINGS, and acknowledgement phase.
+    /// `null` disables this entire initial handshake deadline.
     settings_ack_timeout: ?Io.Duration = .fromSeconds(10),
     max_request_trailer_count: usize = 32,
     max_request_trailer_size: usize = 8 * 1024,
@@ -35,6 +42,7 @@ pub const Options = struct {
     write_buffer_size: usize = 16 * 1024,
     control_queue_capacity: usize = 256,
     enable_extended_connect: bool = true,
+    /// Handles dispatcher failures and invalid responses before final HEADERS.
     application_error_policy: ApplicationErrorPolicy = .internal_server_error,
 };
 
