@@ -6,7 +6,9 @@ const context_module = @import("../../../context.zig");
 const Exchange = @import("../../../exchange.zig").Exchange;
 const Header = @import("../../../message/headers.zig").Header;
 const Headers = @import("../../../message/headers.zig").Headers;
-const Request = @import("../../../message/request.zig").Request;
+const request_module = @import("../../../message/request.zig");
+const Method = request_module.Method;
+const Request = request_module.Request;
 const RequestBody = @import("../../../message/request_body.zig").RequestBody;
 const response_module = @import("../../../message/response.zig");
 const Response = response_module.Response;
@@ -109,6 +111,10 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             expected_response_length: ?u64 = null,
             response_bytes_sent: u64 = 0,
             response_trailers: Headers = .empty,
+            tunnel: bool = false,
+            handshake_complete: bool = false,
+            input_direction_failed: bool = false,
+            output_direction_failed: bool = false,
             output_done: bool = false,
             output_acked: bool = false,
             completion_notified: bool = false,
@@ -305,8 +311,12 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                         std.debug.assert(self.pending_tasks != 0);
                         self.pending_tasks -= 1;
                         done.slot.task_done = true;
-                        if (done.err) |err| self.failRequest(done.slot, .internal_error, err);
-                        if (!done.slot.receive_finished and !done.slot.abandoned_input) {
+                        if (done.err) |err| {
+                            if (!(done.slot.tunnel and (done.slot.input_direction_failed or done.slot.output_direction_failed))) {
+                                self.failRequest(done.slot, if (done.slot.tunnel) .connect_error else .internal_error, err);
+                            }
+                        }
+                        if (!done.slot.receive_finished and !done.slot.abandoned_input and !done.slot.tunnel) {
                             done.slot.abandoned_input = true;
                             if (done.slot.input) |input| input.fail(error.BodyAbandoned);
                             self.connection.stopSending(done.slot.id, @intFromEnum(errors.Code.request_cancelled)) catch {};
@@ -326,6 +336,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             var result: ?u64 = null;
             for (self.requests) |slot| {
                 if (!slot.occupied or slot.output_done or slot.response == null) continue;
+                if (slot.tunnel and slot.handshake_complete) continue;
                 const deadline = slot.response.?.write_deadline orelse continue;
                 if (deadline.clock != .awake) continue;
                 const value = std.math.cast(u64, deadline.raw.nanoseconds) orelse continue;
@@ -337,6 +348,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         fn checkResponseDeadlines(self: *Self) void {
             for (&self.requests) |*slot| {
                 if (!slot.occupied or slot.output_done or slot.response == null) continue;
+                if (slot.tunnel and slot.handshake_complete) continue;
                 const deadline = slot.response.?.write_deadline orelse continue;
                 if (deadline.clock.now(self.io).nanoseconds >= deadline.raw.nanoseconds) {
                     self.failRequest(slot, .request_cancelled, error.ResponseTimeout);
@@ -380,7 +392,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 return self.processUni(slot, now);
             }
             const slot = self.findRequest(id) orelse return error.UnknownRequestStream;
-            if (slot.output_done) return;
+            if (slot.output_done and !slot.tunnel) return;
             self.processRequestBytes(slot, now) catch |err| switch (err) {
                 error.Blocked => return,
                 error.MessageError, error.BodyTooLarge => self.failRequest(slot, if (err == error.MessageError) .message_error else .excessive_load, err),
@@ -429,9 +441,13 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     const body_bytes = try self.connection.streamReadable(slot.id);
                     if (body_bytes.len == 0) return;
                     const amount = @min(body_bytes.len, @min(available, wire.length - slot.payload_seen));
-                    const total = std.math.add(u64, slot.received_body, amount) catch return error.BodyTooLarge;
-                    if (total > config.max_body_size) return error.BodyTooLarge;
-                    if (slot.content_length) |expected| if (total > expected) return error.MessageError;
+                    const tunnel_data = slot.tunnel or isConnect(slot);
+                    const total = if (tunnel_data)
+                        slot.received_body
+                    else
+                        std.math.add(u64, slot.received_body, amount) catch return error.BodyTooLarge;
+                    if (!tunnel_data and total > config.max_body_size) return error.BodyTooLarge;
+                    if (!tunnel_data) if (slot.content_length) |expected| if (total > expected) return error.MessageError;
                     slot.payload_staged = amount;
                     slot.payload_seen += amount;
                     slot.received_body = total;
@@ -479,6 +495,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         fn processRequestFrame(self: *Self, slot: *RequestSlot, value: frame.Frame) !void {
+            if (slot.tunnel and value.frame_type == .headers) return error.MessageError;
             const previous_state = slot.state;
             try slot.state.observe(value);
             switch (value.payload) {
@@ -501,7 +518,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                         slot.initial_field_count = slot.field_count;
                         slot.head = head;
                         slot.content_length = head.content_length;
-                        if (head.content_length != null) try self.ensureRequest(slot, true);
+                        if (head.content_length != null or head.method.is(.CONNECT)) try self.ensureRequest(slot, true);
                     } else {
                         const trailers = semantics.validateTrailers(section_fields) catch return error.MessageError;
                         trailer_policy.validateIncoming(trailers, config.max_header_count, config.max_header_bytes) catch return error.MessageError;
@@ -574,7 +591,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 return;
             };
             try self.ensureRequest(slot, false);
-            if (slot.content_length) |expected| if (slot.received_body != expected) {
+            if (!slot.tunnel and !isConnect(slot)) if (slot.content_length) |expected| if (slot.received_body != expected) {
                 self.failRequest(slot, .message_error, error.ContentLengthMismatch);
                 return;
             };
@@ -588,7 +605,12 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         fn resetReceived(self: *Self, id: StreamId) !void {
             _ = try self.connection.readStreamReset(id);
-            if (self.findRequest(id)) |slot| self.failRequest(slot, .request_cancelled, error.PeerReset);
+            if (self.findRequest(id)) |slot| {
+                if (!slot.tunnel) return self.failRequest(slot, .request_cancelled, error.PeerReset);
+                slot.input_direction_failed = true;
+                slot.receive_finished = true;
+                if (slot.input) |input| input.fail(error.PeerReset);
+            }
         }
 
         fn stopped(self: *Self, id: StreamId) void {
@@ -596,7 +618,14 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 self.closeFor(error.ClosedCriticalStream, 0);
                 return;
             }
-            if (self.findRequest(id)) |slot| self.failRequest(slot, .request_cancelled, error.PeerStopped);
+            if (self.findRequest(id)) |slot| {
+                if (!slot.tunnel) return self.failRequest(slot, .request_cancelled, error.PeerStopped);
+                slot.output_direction_failed = true;
+                slot.output_done = true;
+                slot.output_acked = true;
+                if (slot.output) |output| output.abort(error.PeerStopped);
+                slot.notifyCompletion(.{ .failure = error.PeerStopped });
+            }
         }
 
         fn returnCredits(self: *Self) !usize {
@@ -620,16 +649,16 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         fn startResponse(self: *Self, slot: *RequestSlot) !void {
             if (!slot.occupied or slot.response == null) return;
             const response = &slot.response.?;
-            if (response.takeover != null) return error.UnsupportedHttp3Takeover;
+            try validateTakeover(slot.request.?.method, response.*);
             const maximum: u32 = @intCast(@min(self.peer_max_field_section_size, std.math.maxInt(u32)));
             const plan = try response_semantics.plan(slot.request.?.method, response.*, maximum);
             if (response.body == .stream) try trailer_policy.validateNames(response.body.stream.trailer_names, config.max_response_trailer_count, config.max_response_trailer_size);
             slot.suppress_response_body = !plan.produce_body;
-            slot.expected_response_length = plan.expected_length;
+            slot.expected_response_length = if (slot.tunnel) null else plan.expected_length;
             if (response.body == .bytes and response.body.bytes.len > config.max_response_body_size) return error.ResponseBodyTooLarge;
             try self.appendHeaderFrame(slot, response.status, response.headers);
             slot.response_headers_sent = true;
-            slot.response_started.set(self.io);
+            if (!slot.tunnel) slot.response_started.set(self.io);
         }
 
         fn flushResponses(self: *Self) !usize {
@@ -645,6 +674,14 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     slot.control_sent = 0;
                 }
                 if (!slot.response_headers_sent) continue;
+                if (slot.tunnel and !slot.handshake_complete) {
+                    slot.handshake_complete = true;
+                    slot.response_started.set(self.io);
+                }
+                if (slot.tunnel) {
+                    total += try self.flushTunnel(slot);
+                    continue;
+                }
                 if (slot.suppress_response_body or slot.response.?.body == .empty) {
                     try self.finishResponse(slot);
                     continue;
@@ -687,6 +724,22 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             return total;
         }
 
+        fn flushTunnel(self: *Self, slot: *RequestSlot) !usize {
+            const output = slot.output orelse return 0;
+            if (output.failure()) |err| {
+                if (!slot.output_direction_failed) self.failRequest(slot, .connect_error, err);
+                return 0;
+            }
+            if (slot.data_header_len != 0) return self.flushDataFrame(slot);
+            const bytes = output.peek(config.max_frame_size);
+            if (bytes.len != 0) {
+                try self.beginDataFrame(slot, bytes.len);
+                return self.flushDataFrame(slot);
+            }
+            if (output.isFinished()) try self.finishResponse(slot);
+            return 0;
+        }
+
         fn beginDataFrame(_: *Self, slot: *RequestSlot, length: usize) !void {
             std.debug.assert(slot.data_header_len == 0 and length != 0);
             var cursor: usize = 0;
@@ -713,21 +766,27 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
             const remaining = slot.data_payload_len - slot.data_payload_sent;
             if (remaining != 0) {
-                const source = switch (slot.response.?.body) {
+                const source = if (slot.tunnel)
+                    slot.output.?.peek(remaining)
+                else switch (slot.response.?.body) {
                     .bytes => |bytes| bytes[slot.bytes_offset..][0..remaining],
                     .stream => slot.output.?.peek(remaining),
                     .empty => unreachable,
                 };
                 const written = try self.tryWrite(slot.id, source);
                 slot.data_payload_sent += written;
-                slot.response_bytes_sent += written;
-                switch (slot.response.?.body) {
-                    .bytes => slot.bytes_offset += written,
-                    .stream => slot.output.?.consume(written),
-                    .empty => unreachable,
+                if (slot.tunnel) {
+                    slot.output.?.consume(written);
+                } else {
+                    slot.response_bytes_sent += written;
+                    switch (slot.response.?.body) {
+                        .bytes => slot.bytes_offset += written,
+                        .stream => slot.output.?.consume(written),
+                        .empty => unreachable,
+                    }
+                    if (slot.response_bytes_sent > config.max_response_body_size) return error.ResponseBodyTooLarge;
                 }
                 total += written;
-                if (slot.response_bytes_sent > config.max_response_body_size) return error.ResponseBodyTooLarge;
             }
             if (slot.data_payload_sent == slot.data_payload_len) {
                 slot.data_header_len = 0;
@@ -740,7 +799,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         fn finishResponse(self: *Self, slot: *RequestSlot) !void {
             if (slot.finish_queued) return;
-            if (slot.expected_response_length) |expected| if (slot.response_bytes_sent != expected) {
+            if (!slot.tunnel) if (slot.expected_response_length) |expected| if (slot.response_bytes_sent != expected) {
                 self.failRequest(slot, .internal_error, error.ResponseContentLengthMismatch);
                 return;
             };
@@ -762,6 +821,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             if (slot.input) |input| input.fail(err);
             if (slot.output) |output| output.abort(err);
             slot.notifyCompletion(.{ .failure = err });
+            if (slot.response != null and !slot.handshake_complete) slot.response_started.set(self.io);
             self.connection.resetStream(slot.id, @intFromEnum(code)) catch {};
             self.connection.stopSending(slot.id, @intFromEnum(code)) catch {};
             slot.output_done = true;
@@ -771,6 +831,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         fn collectRequests(self: *Self) void {
             for (&self.requests) |*slot| {
                 if (!slot.occupied or !slot.task_done or !slot.output_done or !slot.output_acked) continue;
+                if (slot.tunnel and !slot.receive_finished) continue;
                 slot.deinit();
             }
         }
@@ -821,7 +882,9 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 response.write_deadline = .fromNow(self.io, .{ .raw = timeout, .clock = .awake });
             };
             exchange.beginFinal();
-            if (response.body == .stream) {
+            try validateTakeover(slot.request.?.method, response);
+            if (response.takeover != null) slot.tunnel = true;
+            if (response.body == .stream or slot.tunnel) {
                 const ring = try allocator.alloc(u8, config.response_body_buffer_size);
                 const writer_buffer = try allocator.alloc(u8, config.response_writer_buffer_size);
                 const output = try allocator.create(outbound_body.Pipe);
@@ -831,8 +894,24 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             slot.response = response;
             try self.messages.putOne(self.io, .{ .response_ready = slot });
             try slot.response_started.wait(self.io);
+            if (slot.output_done) return;
+            if (slot.tunnel) return self.runTunnel(slot, allocator);
             if (slot.suppress_response_body or response.body != .stream) return;
             try self.runProducer(slot, allocator);
+        }
+
+        fn runTunnel(_: *Self, slot: *RequestSlot, allocator: std.mem.Allocator) !void {
+            const input = try slot.input.?.activate(allocator);
+            var takeover = &slot.response.?.takeover.?;
+            takeover.run(input, &slot.output.?.writer) catch |err| {
+                if (slot.input_direction_failed or slot.output_direction_failed) {
+                    if (!slot.output_direction_failed) try slot.output.?.finish();
+                    return err;
+                }
+                slot.output.?.abort(err);
+                return err;
+            };
+            if (!slot.output_direction_failed) try slot.output.?.finish();
         }
 
         fn runProducer(self: *Self, slot: *RequestSlot, allocator: std.mem.Allocator) !void {
@@ -888,6 +967,26 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 .value = try allocator.dupe(u8, source.value),
             };
             return .{ .items = fields };
+        }
+
+        fn validateTakeover(method: Method, response: Response) !void {
+            if (response.takeover) |takeover| switch (takeover.kind) {
+                .upgrade => return error.UnsupportedHttp3Upgrade,
+                .tunnel => {
+                    if (!method.is(.CONNECT)) return error.TakeoverRequiresConnect;
+                    if (response.status.class() != .success) return error.TunnelRequiresSuccessfulConnect;
+                    if (response.body != .empty) return error.TunnelResponseBodyConflict;
+                    if (response.headers.contains("content-length")) return error.TunnelContentLengthForbidden;
+                },
+            } else if (method.is(.CONNECT) and response.status.class() == .success) {
+                return error.ConnectSuccessRequiresTakeover;
+            }
+        }
+
+        fn isConnect(slot: *const RequestSlot) bool {
+            if (slot.request) |request| return request.method.is(.CONNECT);
+            if (slot.head) |head| return head.method.is(.CONNECT);
+            return false;
         }
 
         fn processUni(self: *Self, slot: *UniSlot, now: u64) !void {
@@ -1011,6 +1110,9 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 .{ .id = .max_field_section_size, .value = config.max_field_section_size },
             };
             for (entries) |entry| cursor += try settings.encodeEntry(payload[cursor..], entry);
+            if (config.enable_extended_connect) {
+                cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .enable_connect_protocol, .value = 1 });
+            }
             var encoded: [80]u8 = undefined;
             const length = try frame.encode(&encoded, .{ .frame_type = .settings, .payload = .{ .settings = payload[0..cursor] } });
             try self.writeAll(self.local_control, encoded[0..length]);

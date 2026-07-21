@@ -126,6 +126,14 @@ Streaming responses run in their own task and write through bounded response and
 
 Handlers may run concurrently up to the available HTTP/3 request slots, QUIC stream slots, transport-advertised limits, and the `std.Io` executor's async capacity. The executor must permit asynchronous work: a configuration that cannot run handler/producer tasks cannot make progress. Applications should size executor concurrency for their maximum desired active handlers rather than assuming `max_requests` creates threads by itself.
 
+## CONNECT takeover
+
+When `enable_extended_connect` is enabled, the server advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`. A successful classic or extended CONNECT handler can return `Response.tunnel`; the shared `Takeover` callback then receives a reader and writer backed by bounded body pipes while the session owner continues framing DATA and driving QUIC flow control. Final response HEADERS are staged before the callback starts. Tunnel payload is not treated as an HTTP message body and is therefore independent of content-length and response-body limits.
+
+The two QUIC stream directions remain independent: peer FIN or `RESET_STREAM` closes/fails only takeover input, while `STOP_SENDING` closes/fails only output. Callback failures use `H3_CONNECT_ERROR`. The response write deadline covers establishment of the final response, not the lifetime of an established tunnel. Active tunnels participate in normal GOAWAY draining and the existing shutdown timeout.
+
+HTTP/3 forbids 101-based upgrades. Protocols such as WebSocket must use extended CONNECT rather than `Response.upgrade`.
+
 See [`http-streaming.md`](http-streaming.md) for the shared request/response APIs and protocol-specific framing notes.
 
 ## Deadlines and cancellation
@@ -218,6 +226,6 @@ These targets validate Causeway's own invariants and regression cases. They do n
 
 - Server push is disabled.
 - 0-RTT/early data and session resumption are unsupported.
-- HTTP takeover is unsupported by the HTTP/3 response path.
+
 - WebTransport is not implemented.
 - HTTP/3 datagrams are not a core application API. QUIC transport parameters can parse `max_datagram_frame_size`, but the HTTP/3 engine does not expose H3 DATAGRAM/WebTransport semantics.

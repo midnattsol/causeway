@@ -3,6 +3,7 @@ const Io = std.Io;
 const stream_id = @import("../../../../quic/stream/id.zig");
 const frame = @import("../frame/root.zig");
 const stream = @import("../stream.zig");
+const settings = @import("../settings.zig");
 const qpack = @import("../qpack/root.zig");
 const Session = @import("session.zig").Session;
 const Headers = @import("../../../message/headers.zig").Headers;
@@ -21,6 +22,23 @@ fn encodePostHead(destination: []u8, content_length: []const u8) !usize {
         .{ .name = ":authority", .value = "example.test" },
         .{ .name = ":path", .value = "/echo" },
         .{ .name = "content-length", .value = content_length },
+    }, "");
+}
+
+fn encodeConnectHead(destination: []u8) !usize {
+    return support.encodeRequestFields(destination, 0, &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    }, "");
+}
+
+fn encodeExtendedConnectHead(destination: []u8, path: []const u8) !usize {
+    return support.encodeRequestFields(destination, 0, &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "test" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = ":path", .value = path },
     }, "");
 }
 
@@ -58,6 +76,18 @@ test "HTTP/3 session incrementally serves a request over the generic QUIC API" {
     defer session.deinit();
     try session.activate();
 
+    const local_control = try stream_id.Id.fromParts(.server, .unidirectional, 0);
+    const local_output = transport.output(local_control);
+    const prefix = try stream.parsePrefix(local_output);
+    try std.testing.expectEqual(stream.Type.control, prefix.stream_type);
+    const local_settings = (try frame.parse(local_output[prefix.consumed..])).frame.payload.settings;
+    var setting_entries = settings.iterator(local_settings);
+    var advertised_extended_connect = false;
+    while (try setting_entries.next()) |entry| {
+        if (entry.id == .enable_connect_protocol and entry.value == 1) advertised_extended_connect = true;
+    }
+    try std.testing.expect(advertised_extended_connect);
+
     const control = try stream_id.Id.fromParts(.client, .unidirectional, 0);
     try transport.feed(control, "\x00", false);
     _ = try session.poll(1);
@@ -85,6 +115,333 @@ test "HTTP/3 session incrementally serves a request over the generic QUIC API" {
     const data = (try parser.next()).?;
     try std.testing.expectEqualStrings("pong", data.payload.data);
     try std.testing.expect(transport.close_code == null);
+}
+
+test "HTTP/3 CONNECT waits for drained headers, bypasses body limits, survives deadline, and half-closes" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.max_body_size = 1;
+        value.max_response_body_size = 1;
+        value.request_body_buffer_size = 2;
+        value.response_body_buffer_size = 2;
+        value.response_writer_buffer_size = 1;
+        value.response_write_timeout = .fromMilliseconds(3);
+        break :blk value;
+    };
+    const State = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        saw_fin: std.atomic.Value(bool) = .init(false),
+    };
+    const Echo = struct {
+        state: *State,
+        pub fn run(self: *@This(), input: *Io.Reader, output: *Io.Writer) !void {
+            self.state.started.store(true, .release);
+            var bytes: [6]u8 = undefined;
+            try input.readSliceAll(&bytes);
+            try std.testing.expectEqualStrings("abcdef", &bytes);
+            try std.testing.expectError(error.EndOfStream, input.takeByte());
+            self.state.saw_fin.store(true, .release);
+            try output.writeAll("echo:abcdef");
+            try output.flush();
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .empty, try response_module.Takeover.init(
+                context.execution.allocator,
+                Echo{ .state = context.execution.state },
+            ));
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{};
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    try session.activate();
+    transport.writes_blocked = true;
+
+    var request_bytes: [512]u8 = undefined;
+    var request_len = try encodeConnectHead(&request_bytes);
+    request_len += try frame.encode(request_bytes[request_len..], .{ .frame_type = .data, .payload = .{ .data = "abcdef" } });
+    const request_id = try stream_id.Id.fromParts(.client, .bidirectional, 0);
+    try transport.feed(request_id, request_bytes[0..request_len], false);
+    _ = try session.poll(1);
+    try Io.sleep(io, .fromMilliseconds(1), .awake);
+    _ = try session.poll(2);
+    try std.testing.expect(!state.started.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), transport.output(request_id).len);
+
+    transport.writes_blocked = false;
+    transport.write_limit = 1;
+    for (0..100) |step| {
+        _ = try session.poll(3 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.started.load(.acquire)) break;
+    }
+    try std.testing.expect(state.started.load(.acquire));
+    try std.testing.expect(transport.find(request_id).?.reset_code == null);
+
+    try Io.sleep(io, .fromMilliseconds(6), .awake);
+    for (0..20) |step| {
+        _ = try session.poll(200 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(transport.find(request_id).?.reset_code == null);
+    try std.testing.expect(!state.saw_fin.load(.acquire));
+
+    try transport.feed(request_id, "", true);
+    for (0..200) |step| {
+        _ = try session.poll(300 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (transport.find(request_id).?.finished) break;
+    }
+    try std.testing.expect(state.saw_fin.load(.acquire));
+    try std.testing.expect(transport.find(request_id).?.finished);
+    var parser = frame.Parser{ .bytes = transport.output(request_id) };
+    try std.testing.expectEqual(frame.Type.headers, (try parser.next()).?.frame_type);
+    var reply: [11]u8 = undefined;
+    var reply_len: usize = 0;
+    while (try parser.next()) |item| switch (item.payload) {
+        .data => |bytes| {
+            @memcpy(reply[reply_len..][0..bytes.len], bytes);
+            reply_len += bytes.len;
+        },
+        else => {},
+    };
+    try std.testing.expectEqualStrings("echo:abcdef", reply[0..reply_len]);
+}
+
+test "HTTP/3 CONNECT validates takeover kind, method, status, and empty body" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.max_requests = 5;
+        value.qpack_blocked_streams = 5;
+        break :blk value;
+    };
+    const State = struct {};
+    const Noop = struct {
+        pub fn run(_: *@This(), _: *Io.Reader, _: *Io.Writer) !void {}
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            if (context.request.method.is(.GET)) {
+                return Response.tunnel(.ok, .empty, try response_module.Takeover.init(context.execution.allocator, Noop{}));
+            }
+            if (std.mem.eql(u8, context.request.path, "/body")) {
+                var response = Response.tunnel(.ok, .empty, try response_module.Takeover.init(context.execution.allocator, Noop{}));
+                response.body = .{ .bytes = "conflict" };
+                return response;
+            }
+            if (std.mem.eql(u8, context.request.path, "/upgrade")) {
+                return Response.upgrade(.empty, "test", try response_module.Takeover.init(context.execution.allocator, Noop{}));
+            }
+            if (std.mem.eql(u8, context.request.path, "/length")) {
+                return Response.tunnel(.ok, .{ .items = &.{.{ .name = "content-length", .value = "0" }} }, try response_module.Takeover.init(context.execution.allocator, Noop{}));
+            }
+            return .{ .status = .ok };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(12));
+    const io = threaded.io();
+    var transport: FakeConnection = .{};
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    try session.activate();
+
+    var buffers: [5][512]u8 = undefined;
+    const lengths = [_]usize{
+        try encodeGetHead(&buffers[0]),
+        try encodeConnectHead(&buffers[1]),
+        try encodeExtendedConnectHead(&buffers[2], "/body"),
+        try encodeExtendedConnectHead(&buffers[3], "/upgrade"),
+        try encodeExtendedConnectHead(&buffers[4], "/length"),
+    };
+    for (0..5) |index| {
+        const id = try stream_id.Id.fromParts(.client, .bidirectional, index);
+        try transport.feed(id, buffers[index][0..lengths[index]], true);
+    }
+    for (0..100) |step| {
+        _ = try session.poll(1 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    for (0..5) |index| {
+        const id = try stream_id.Id.fromParts(.client, .bidirectional, index);
+        try std.testing.expect(transport.find(id).?.reset_code != null);
+    }
+}
+
+test "HTTP/3 CONNECT peer reset closes input but preserves output" {
+    const State = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        read_failed: std.atomic.Value(bool) = .init(false),
+    };
+    const Handler = struct {
+        state: *State,
+        pub fn run(self: *@This(), input: *Io.Reader, output: *Io.Writer) !void {
+            self.state.started.store(true, .release);
+            _ = input.takeByte() catch {
+                self.state.read_failed.store(true, .release);
+                try output.writeAll("after-reset");
+                try output.flush();
+                return;
+            };
+            return error.ExpectedPeerReset;
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .empty, try response_module.Takeover.init(
+                context.execution.allocator,
+                Handler{ .state = context.execution.state },
+            ));
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{};
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, test_config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    var bytes: [256]u8 = undefined;
+    const length = try encodeConnectHead(&bytes);
+    const id = try stream_id.Id.fromParts(.client, .bidirectional, 0);
+    try transport.feed(id, bytes[0..length], false);
+    for (0..50) |step| {
+        _ = try session.poll(1 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.started.load(.acquire)) break;
+    }
+    try std.testing.expect(state.started.load(.acquire));
+    try transport.peerReset(id, 0);
+    for (0..100) |step| {
+        _ = try session.poll(100 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (transport.find(id).?.finished) break;
+    }
+    try std.testing.expect(state.read_failed.load(.acquire));
+    try std.testing.expect(transport.find(id).?.finished);
+    try std.testing.expect(transport.find(id).?.reset_code == null);
+    var output_frames = frame.Parser{ .bytes = transport.output(id) };
+    _ = try output_frames.next();
+    var payload: [11]u8 = undefined;
+    var payload_len: usize = 0;
+    while (try output_frames.next()) |item| if (item.payload == .data) {
+        const data = item.payload.data;
+        @memcpy(payload[payload_len..][0..data.len], data);
+        payload_len += data.len;
+    };
+    try std.testing.expectEqualStrings("after-reset", payload[0..payload_len]);
+}
+
+test "HTTP/3 CONNECT peer stop closes output but preserves input" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.response_body_buffer_size = 1;
+        value.response_writer_buffer_size = 1;
+        break :blk value;
+    };
+    const State = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        write_failed: std.atomic.Value(bool) = .init(false),
+        read_after_stop: std.atomic.Value(bool) = .init(false),
+    };
+    const Handler = struct {
+        state: *State,
+        pub fn run(self: *@This(), input: *Io.Reader, output: *Io.Writer) !void {
+            self.state.started.store(true, .release);
+            output.writeAll("blocked") catch {
+                self.state.write_failed.store(true, .release);
+            };
+            const byte = try input.takeByte();
+            if (byte != 'x') return error.UnexpectedTunnelByte;
+            self.state.read_after_stop.store(true, .release);
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .empty, try response_module.Takeover.init(
+                context.execution.allocator,
+                Handler{ .state = context.execution.state },
+            ));
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{};
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    var bytes: [256]u8 = undefined;
+    const length = try encodeConnectHead(&bytes);
+    const id = try stream_id.Id.fromParts(.client, .bidirectional, 0);
+    try transport.feed(id, bytes[0..length], false);
+    for (0..50) |step| {
+        _ = try session.poll(1 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.started.load(.acquire)) break;
+    }
+    try std.testing.expect(state.started.load(.acquire));
+    try transport.peerStop(id, 0);
+    for (0..20) |step| {
+        _ = try session.poll(100 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.write_failed.load(.acquire)) break;
+    }
+    try std.testing.expect(state.write_failed.load(.acquire));
+    var tunnel_data: [32]u8 = undefined;
+    const tunnel_length = try frame.encode(&tunnel_data, .{ .frame_type = .data, .payload = .{ .data = "x" } });
+    try transport.feed(id, tunnel_data[0..tunnel_length], true);
+    for (0..50) |step| {
+        _ = try session.poll(200 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.read_after_stop.load(.acquire)) break;
+    }
+    try std.testing.expect(state.read_after_stop.load(.acquire));
+    try std.testing.expectEqual(@as(?u64, null), transport.find(id).?.stop_code);
+}
+
+test "HTTP/3 CONNECT callback failure resets with H3_CONNECT_ERROR" {
+    const State = struct {};
+    const Failing = struct {
+        pub fn run(_: *@This(), _: *Io.Reader, _: *Io.Writer) !void {
+            return error.TunnelCallbackFailed;
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .empty, try response_module.Takeover.init(context.execution.allocator, Failing{}));
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{};
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, test_config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    var bytes: [256]u8 = undefined;
+    const length = try encodeConnectHead(&bytes);
+    const id = try stream_id.Id.fromParts(.client, .bidirectional, 0);
+    try transport.feed(id, bytes[0..length], false);
+    for (0..50) |step| {
+        _ = try session.poll(1 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (transport.find(id).?.reset_code != null) break;
+    }
+    try std.testing.expectEqual(@as(?u64, @intFromEnum(@import("../error.zig").Code.connect_error)), transport.find(id).?.reset_code);
 }
 
 test "HTTP/3 session graceful shutdown drains accepted requests before final GOAWAY" {

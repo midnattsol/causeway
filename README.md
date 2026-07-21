@@ -11,7 +11,7 @@ The implemented server cores include:
 - QUIC transport (RFC 9000), TLS and packet protection (RFC 9001), recovery/congestion control (RFC 9002), HTTP/3 (RFC 9114), and QPACK (RFC 9204);
 - typed compile-time routing, extractors, middleware, buffered and streaming bodies, limits, deadlines, cancellation, trailers, informational responses, compression, files/ranges, caching utilities, cookies, sessions, CSRF, forms, multipart, and SSE.
 
-HTTP/3 is server-side and poll-driven over UDP. It supports bounded streaming requests/responses, concurrent handlers, per-packet application-limited recovery, cross-space persistent-congestion detection, and opt-in validated ECN with a Linux ancillary-data backend. Server push, 0-RTT, HTTP/3 takeover, WebTransport, and an H3 DATAGRAM application API are not implemented. See [`docs/http3.md`](docs/http3.md) for exact behavior and limits.
+HTTP/3 is server-side and poll-driven over UDP. It supports bounded streaming requests/responses, concurrent handlers, CONNECT takeover with directional half-close, per-packet application-limited recovery, cross-space persistent-congestion detection, and opt-in validated ECN with a Linux ancillary-data backend. Server push, 0-RTT, WebTransport, and an H3 DATAGRAM application API are not implemented. See [`docs/http3.md`](docs/http3.md) for exact behavior and limits.
 
 REST, GraphQL, OpenAPI, and adapters remain separate higher-level phases.
 
