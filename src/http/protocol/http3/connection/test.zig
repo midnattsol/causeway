@@ -89,7 +89,10 @@ const FakeConnection = struct {
             slot.input_len += bytes.len;
             try self.push(.{ .readable = id });
         }
-        if (finish) try self.push(.{ .finished = id });
+        if (finish) try self.push(.{ .receive_finished = id });
+    }
+    fn acknowledgeFinish(self: *@This(), id: StreamId) !void {
+        try self.push(.{ .send_finished = id });
     }
     fn output(self: *@This(), id: StreamId) []const u8 {
         const slot = self.find(id).?;
@@ -196,7 +199,7 @@ test "HTTP/3 session incrementally serves a request over the generic QUIC API" {
     try std.testing.expect(transport.close_code == null);
 }
 
-test "HTTP/3 session graceful shutdown queues GOAWAY on its control stream" {
+test "HTTP/3 session graceful shutdown drains accepted requests before final GOAWAY" {
     const State = struct {};
     const Dispatcher = struct {
         pub fn dispatch(_: anytype) !Response {
@@ -209,14 +212,39 @@ test "HTTP/3 session graceful shutdown queues GOAWAY on its control stream" {
     var state: State = .{};
     var session = Session(State, Dispatcher, FakeConnection, test_config).init(&transport, std.testing.allocator, &state, threaded.io());
 
-    try session.beginShutdown(1);
+    var request_bytes: [512]u8 = undefined;
+    const request_len = try encodeRequest(&request_bytes);
+    const accepted = try stream_id.Id.fromParts(.client, .bidirectional, 0);
+    try transport.feed(accepted, request_bytes[0..request_len], false);
+    _ = try session.poll(1);
+
     try session.beginShutdown(2);
+    try session.beginShutdown(3);
+    try std.testing.expect(!session.drainComplete());
+
+    const rejected = try stream_id.Id.fromParts(.client, .bidirectional, 1);
+    try transport.feed(rejected, "", false);
+    _ = try session.poll(4);
+    try std.testing.expectEqual(@as(?u64, @intFromEnum(@import("../error.zig").Code.request_rejected)), transport.find(rejected).?.reset_code);
+
+    try transport.feed(accepted, "", true);
+    _ = try session.poll(5);
+    try std.testing.expect(!session.drainComplete());
+    try transport.acknowledgeFinish(accepted);
+    _ = try session.poll(6);
+    try std.testing.expect(session.drainComplete());
+    try session.finishShutdown(7);
+    try session.finishShutdown(8);
+
     const control_output = transport.output(session.local_control);
     var parser = frame.Parser{ .bytes = control_output[1..] };
     try std.testing.expectEqual(frame.Type.settings, (try parser.next()).?.frame_type);
-    const goaway = (try parser.next()).?;
-    try std.testing.expectEqual(frame.Type.goaway, goaway.frame_type);
-    try std.testing.expectEqual((@as(u64, 1) << 62) - 4, goaway.payload.goaway);
+    const initial_goaway = (try parser.next()).?;
+    try std.testing.expectEqual(frame.Type.goaway, initial_goaway.frame_type);
+    try std.testing.expectEqual((@as(u64, 1) << 62) - 4, initial_goaway.payload.goaway);
+    const final_goaway = (try parser.next()).?;
+    try std.testing.expectEqual(frame.Type.goaway, final_goaway.frame_type);
+    try std.testing.expectEqual(@as(u64, 4), final_goaway.payload.goaway);
     try std.testing.expect((try parser.next()) == null);
     try std.testing.expect(transport.close_code == null);
 }

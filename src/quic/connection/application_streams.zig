@@ -8,7 +8,8 @@ const transport_parameters = @import("../crypto/transport_parameters.zig");
 pub const Event = union(enum) {
     opened: stream.Id,
     readable: stream.Id,
-    finished: stream.Id,
+    receive_finished: stream.Id,
+    send_finished: stream.Id,
     reset: struct { id: stream.Id, application_error: u64 },
     stopped: struct { id: stream.Id, application_error: u64 },
 };
@@ -69,7 +70,8 @@ pub fn Application(
             stop_error: u64 = 0,
             opened_event: bool = false,
             readable_event: bool = false,
-            finished_event: bool = false,
+            receive_finished_event: bool = false,
+            send_finished_event: bool = false,
             reset_event: bool = false,
             stopped_event: bool = false,
         };
@@ -175,9 +177,13 @@ pub fn Application(
                     slot.stopped_event = false;
                     return .{ .stopped = .{ .id = slot.id, .application_error = slot.stop_error } };
                 }
-                if (slot.finished_event) {
-                    slot.finished_event = false;
-                    return .{ .finished = slot.id };
+                if (slot.receive_finished_event) {
+                    slot.receive_finished_event = false;
+                    return .{ .receive_finished = slot.id };
+                }
+                if (slot.send_finished_event) {
+                    slot.send_finished_event = false;
+                    return .{ .send_finished = slot.id };
                 }
             }
             return null;
@@ -196,7 +202,7 @@ pub fn Application(
             try receiver.consume(amount);
             try receive_flow.consume(amount, &self.receive_connection);
             try receiver.updateMaxStreamData(receive_flow.maximum_stream_data);
-            if (receiver.isFinished()) slot.finished_event = true;
+            if (receiver.isFinished()) slot.receive_finished_event = true;
             if (receiver.readable().len != 0) slot.readable_event = true;
         }
 
@@ -207,7 +213,7 @@ pub fn Application(
             const application_error = try receiver.readReset();
             const discarded = receive_flow.highest_received - receive_flow.consumed;
             if (discarded != 0) try receive_flow.consume(discarded, &self.receive_connection);
-            slot.finished_event = true;
+            slot.receive_finished_event = true;
             return application_error;
         }
 
@@ -253,7 +259,7 @@ pub fn Application(
             const result = try receiver.receive(value.offset, value.data, value.fin);
             _ = try receive_flow.accountHighest(receiver.highest_received, &self.receive_connection);
             if (result.became_readable) slot.readable_event = true;
-            if (result.complete and receiver.readable().len == 0) slot.finished_event = true;
+            if (result.complete and receiver.readable().len == 0) slot.receive_finished_event = true;
         }
 
         pub fn onResetStream(self: *Self, value: frame.ResetStream) !void {
@@ -401,12 +407,12 @@ pub fn Application(
                 .stream => |value| {
                     const slot = self.find(value.id) orelse return;
                     try slot.sender.?.onAcknowledged(value.offset, value.length, value.fin);
-                    if (slot.sender.?.state == .data_received) slot.finished_event = true;
+                    if (slot.sender.?.state == .data_received) slot.send_finished_event = true;
                 },
                 .control => |control| switch (control) {
                     .reset_stream => |value| if (self.find(value.id)) |slot| {
                         if (slot.sender.?.state == .reset_sent) try slot.sender.?.onResetAcknowledged();
-                        slot.finished_event = true;
+                        slot.send_finished_event = true;
                     },
                     else => {},
                 },
@@ -685,5 +691,5 @@ test "application stream send ACK loss retransmission and lifecycle" {
     application.onPacketSent(retry.item);
     try application.onAcknowledged(retry.item);
     try std.testing.expectEqual(stream.send.State.data_received, application.find(id).?.sender.?.state);
-    try std.testing.expectEqual(Event{ .finished = id }, application.nextEvent().?);
+    try std.testing.expectEqual(Event{ .send_finished = id }, application.nextEvent().?);
 }

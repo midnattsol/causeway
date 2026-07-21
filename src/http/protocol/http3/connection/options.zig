@@ -25,6 +25,7 @@ pub const Config = struct {
     max_field_section_size: u64 = 64 * 1024,
     enable_extended_connect: bool = true,
     application_error_policy: ApplicationErrorPolicy = .internal_server_error,
+    shutdown_timeout: u64 = 30 * 1_000_000_000,
 
     pub fn validate(comptime self: Config) void {
         if (self.max_requests == 0) @compileError("HTTP/3 max_requests must be non-zero");
@@ -33,5 +34,6 @@ pub const Config = struct {
         if (self.qpack_entries == 0 or self.qpack_sections == 0) @compileError("HTTP/3 QPACK metadata limits must be non-zero");
         if (self.qpack_blocked_streams > self.max_requests) @compileError("HTTP/3 QPACK blocked streams cannot exceed request slots");
         if (self.max_field_section_size > self.max_header_bytes) @compileError("HTTP/3 max_field_section_size cannot exceed header storage");
+        if (self.shutdown_timeout == 0) @compileError("HTTP/3 shutdown_timeout must be non-zero");
     }
 };

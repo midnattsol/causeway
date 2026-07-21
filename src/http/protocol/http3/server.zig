@@ -71,6 +71,7 @@ fn ServerType(
         allocator: std.mem.Allocator = undefined,
         state: *State = undefined,
         shutting_down: bool = false,
+        shutdown_started: ?u64 = null,
 
         /// Initializes around an already-bound UDP socket. `self` must remain at
         /// a stable address until `deinit`.
@@ -122,7 +123,10 @@ fn ServerType(
 
         pub fn nextDeadline(self: *const Self, now: u64) ?u64 {
             if (self.hasCloseAfterDrive()) return now;
-            return self.endpoint.nextDeadline(now);
+            const transport_deadline = self.endpoint.nextDeadline(now);
+            const shutdown_deadline = if (self.shutdown_started) |started| started +| http3_config.shutdown_timeout else null;
+            if (transport_deadline) |transport| if (shutdown_deadline) |shutdown| return @min(transport, shutdown);
+            return transport_deadline orelse shutdown_deadline;
         }
 
         /// Stops admission and queues HTTP/3 GOAWAY on every initialized session.
@@ -131,6 +135,7 @@ fn ServerType(
         pub fn closeAll(self: *Self, now: u64) void {
             if (self.shutting_down) return;
             self.shutting_down = true;
+            self.shutdown_started = now;
             self.endpoint.beginShutdown();
             for (&self.endpoint.slots, &self.sessions) |*endpoint_slot, *session_slot| {
                 if (!endpoint_slot.occupied) {
@@ -142,7 +147,6 @@ fn ServerType(
                 }
                 if (session_slot.initialized) {
                     session_slot.session.beginShutdown(now) catch {};
-                    session_slot.close_after_drive = true;
                 } else {
                     endpoint_slot.connection.close(
                         @intFromEnum(errors.Code.no_error),
@@ -181,18 +185,22 @@ fn ServerType(
                     session_slot.initialized = true;
                 }
                 _ = session_slot.session.poll(now) catch {};
-                if (self.shutting_down and !session_slot.close_after_drive) {
+                if (self.shutting_down) {
                     session_slot.session.beginShutdown(now) catch {};
-                    session_slot.close_after_drive = true;
+                    if (session_slot.session.drainComplete() and !session_slot.close_after_drive) {
+                        session_slot.session.finishShutdown(now) catch {};
+                        session_slot.close_after_drive = true;
+                    }
                 }
             }
         }
 
         fn finishShutdownDrive(self: *Self, now: u64) void {
             if (!self.shutting_down) return;
+            const expired = if (self.shutdown_started) |started| now >= started +| http3_config.shutdown_timeout else false;
             for (&self.endpoint.slots, &self.sessions) |*endpoint_slot, *session_slot| {
                 if (!endpoint_slot.occupied or session_slot.generation != endpoint_slot.generation) continue;
-                if (!session_slot.close_after_drive) continue;
+                if (!session_slot.close_after_drive and !expired) continue;
                 endpoint_slot.connection.close(
                     @intFromEnum(errors.Code.no_error),
                     null,
@@ -345,8 +353,10 @@ test "HTTP/3 server gates sessions and safely reaps and reuses endpoint slots" {
     try std.testing.expectEqualStrings("server-b", server.sessions[0].session.connection.serverConnectionId());
 
     server.closeAll(5);
+    server.pollSessions(std.testing.io, 5);
     try std.testing.expect(server.endpoint.shutting_down);
     try std.testing.expect(server.sessions[0].session.shutting_down);
+    try std.testing.expect(server.sessions[0].session.final_goaway_sent);
     try std.testing.expect(server.sessions[0].close_after_drive);
     try std.testing.expectEqual(@as(?u64, 5), server.nextDeadline(5));
     try std.testing.expect(server.endpoint.slots[0].connection.state != .closing);

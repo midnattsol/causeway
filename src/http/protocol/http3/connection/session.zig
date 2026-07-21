@@ -69,6 +69,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             output_len: usize = 0,
             output_sent: usize = 0,
             output_finished: bool = false,
+            output_acked: bool = false,
             response_body: [config.max_response_body_size]u8 = undefined,
         };
 
@@ -86,6 +87,8 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         io: Io,
         active: bool = false,
         shutting_down: bool = false,
+        final_goaway_sent: bool = false,
+        highest_request_id: ?u64 = null,
         local_control: StreamId = undefined,
         local_encoder: StreamId = undefined,
         local_decoder: StreamId = undefined,
@@ -183,11 +186,41 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             self.shutting_down = true;
         }
 
+        pub fn drainComplete(self: *const Self) bool {
+            if (!self.shutting_down) return false;
+            for (self.requests) |slot| if (slot.occupied) return false;
+            return true;
+        }
+
+        /// Queues the final GOAWAY after all accepted requests have completed.
+        pub fn finishShutdown(self: *Self, now: u64) !void {
+            if (self.final_goaway_sent or !self.drainComplete()) return;
+            var encoded: [16]u8 = undefined;
+            const maximum_client_bidi_id = (@as(u64, 1) << 62) - 4;
+            const first_rejected = if (self.highest_request_id) |highest|
+                @min(highest +| 4, maximum_client_bidi_id)
+            else
+                0;
+            const length = frame.encode(&encoded, .{
+                .frame_type = .goaway,
+                .payload = .{ .goaway = first_rejected },
+            }) catch |err| {
+                self.closeFor(err, now);
+                return err;
+            };
+            self.writeAll(self.local_control, encoded[0..length]) catch |err| {
+                self.closeFor(err, now);
+                return err;
+            };
+            self.final_goaway_sent = true;
+        }
+
         fn handleEvent(self: *Self, event: anytype, now: u64) !void {
             switch (event) {
                 .opened => |id| try self.opened(id),
                 .readable => |id| try self.readable(id, now),
-                .finished => |id| try self.finished(id, now),
+                .receive_finished => |id| try self.receiveFinished(id, now),
+                .send_finished => |id| self.sendFinished(id),
                 .reset => |item| try self.resetReceived(item.id),
                 .stopped => |item| try self.stopped(item.id),
             }
@@ -197,12 +230,18 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             if (id.initiator() != .client) return error.InvalidPeerStream;
             if (id.direction() == .bidirectional) {
                 if (self.findRequest(id) != null) return;
+                if (self.shutting_down) {
+                    try self.connection.resetStream(id, @intFromEnum(errors.Code.request_rejected));
+                    try self.connection.stopSending(id, @intFromEnum(errors.Code.request_rejected));
+                    return;
+                }
                 const slot = self.freeRequest() orelse {
                     try self.connection.resetStream(id, @intFromEnum(errors.Code.request_rejected));
                     try self.connection.stopSending(id, @intFromEnum(errors.Code.request_rejected));
                     return;
                 };
                 slot.* = .{ .occupied = true, .id = id };
+                self.highest_request_id = if (self.highest_request_id) |highest| @max(highest, id.value) else id.value;
             } else {
                 if (self.findUni(id) != null) return;
                 const slot = self.freeUni() orelse return error.ExcessivePeerStreams;
@@ -226,19 +265,25 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
         }
 
-        fn finished(self: *Self, id: StreamId, now: u64) !void {
+        fn receiveFinished(self: *Self, id: StreamId, now: u64) !void {
             if (id.direction() == .bidirectional) {
                 const slot = self.findRequest(id) orelse return;
                 slot.finished = true;
                 try self.processRequest(slot, now);
-                if (slot.input_len != 0) return error.Truncated;
-                try slot.state.closed();
-                try self.dispatch(slot);
+                if (slot.occupied and slot.input_len != 0) return error.Truncated;
+                if (slot.occupied and slot.output_acked) slot.occupied = false;
             } else if (self.findUni(id)) |slot| {
                 try self.processUni(slot, now);
                 if (slot.input_len != 0 or slot.stream_type == null) return error.Truncated;
                 try self.peer_streams.closed(slot.stream_type.?);
                 slot.occupied = false;
+            }
+        }
+
+        fn sendFinished(self: *Self, id: StreamId) void {
+            if (self.findRequest(id)) |slot| {
+                slot.output_acked = true;
+                if (slot.finished) slot.occupied = false;
             }
         }
 
@@ -537,7 +582,6 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 if (slot.output_sent == slot.output_len and !slot.output_finished) {
                     try self.connection.finishStream(slot.id);
                     slot.output_finished = true;
-                    slot.occupied = false;
                     total += 1;
                 }
             }
