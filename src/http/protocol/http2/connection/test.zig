@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const connection = @import("root.zig");
+const connection_options = @import("options.zig");
 const frame = @import("../frame/root.zig");
 const headers_module = @import("../../../message/headers.zig");
 const Header = headers_module.Header;
@@ -427,6 +428,32 @@ test "HTTP/2 graceful drain sends GOAWAY and waits for active dispatch" {
     try trigger.await(io);
     try std.testing.expect(serverOutputContains(output.written(), .goaway, 0));
     try std.testing.expect(serverOutputContains(output.written(), .headers, 1));
+}
+
+test "HTTP/2 server advertises its aggregate connection receive capacity" {
+    const AppState = struct {};
+    const Dispatcher = struct {
+        pub fn dispatch(_: anytype) !Response {
+            return .{ .status = .ok };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(3));
+    const bytes = frame.client_preface ++
+        "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++
+        "\x00\x00\x03\x01\x05\x00\x00\x00\x01\x82\x87\x84";
+    var input: Io.Reader = .fixed(bytes);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: AppState = .{};
+    const options: connection.Options = .{};
+    var handler = Handler(AppState, Dispatcher).init(std.testing.allocator, &state, options);
+    try handler.serve(&input, &output.writer, threaded.io());
+    try std.testing.expectEqual(
+        @as(u64, connection_options.connectionReceiveWindowSize(options) - 65_535),
+        serverWindowCredit(output.written(), 0),
+    );
 }
 
 test "HTTP/2 SETTINGS acknowledgement deadline cancels a blocked socket read" {

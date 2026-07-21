@@ -913,6 +913,11 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 settings.encodeEntry(payload[24..30], .max_header_list_size, @intCast(self.owner.options.max_header_list_size));
                 settings.encodeEntry(payload[30..36], .enable_connect_protocol, @intFromBool(self.owner.options.enable_extended_connect));
                 try self.writer.writeSettings(&payload);
+                const receive_window = options_module.connectionReceiveWindowSize(self.owner.options);
+                const increment = receive_window - 65_535;
+                if (increment == 0) return;
+                try self.connection_receive_window.increase(increment);
+                try self.writer.writeWindowUpdate(0, increment);
             }
         };
 

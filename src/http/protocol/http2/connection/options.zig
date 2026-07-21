@@ -38,6 +38,13 @@ pub const Options = struct {
     handler_error_policy: HandlerErrorPolicy = .internal_server_error,
 };
 
+pub fn connectionReceiveWindowSize(options: Options) u32 {
+    const streams: u64 = @intCast(@min(options.max_concurrent_streams, std.math.maxInt(u32)));
+    const per_stream: u64 = @intCast(@min(options.request_body_buffer_size, 0x7fff_ffff));
+    const aggregate = streams * per_stream;
+    return @intCast(@max(@as(u64, 65_535), @min(aggregate, 0x7fff_ffff)));
+}
+
 pub fn validate(options: Options) !void {
     if (options.max_concurrent_streams == 0 or options.max_concurrent_streams > std.math.maxInt(u32)) return error.InvalidConcurrentStreamLimit;
     if (options.frame_queue_slots == 0) return error.InvalidFrameQueueSlots;
@@ -59,6 +66,15 @@ pub fn validate(options: Options) !void {
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
+
+test "HTTP/2 connection receive window follows aggregate stream capacity" {
+    try std.testing.expectEqual(@as(u32, 6_553_500), connectionReceiveWindowSize(.{}));
+    try std.testing.expectEqual(@as(u32, 65_535), connectionReceiveWindowSize(.{ .max_concurrent_streams = 1 }));
+    try std.testing.expectEqual(@as(u32, 0x7fff_ffff), connectionReceiveWindowSize(.{
+        .max_concurrent_streams = std.math.maxInt(u32),
+        .request_body_buffer_size = 0x7fff_ffff,
+    }));
+}
 
 test "HTTP/2 connection options validate independent input and output batching" {
     try validate(.{});
