@@ -1,5 +1,6 @@
 const std = @import("std");
 const varint = @import("quic/varint.zig");
+const transport_parameters = @import("quic/crypto/transport_parameters.zig");
 const frame = @import("quic/frame/root.zig");
 const packet_header = @import("quic/packet/header.zig");
 const packet_number = @import("quic/packet/number.zig");
@@ -26,6 +27,8 @@ fn fuzzQuic(_: std.Io, smith: *std.testing.Smith) !void {
         const canonical = try varint.encode(&encoded, decoded.value);
         try std.testing.expectEqual(decoded.value, (try varint.decode(canonical)).value);
     } else |_| {}
+
+    _ = transport_parameters.parse(input, if (input.len != 0 and input[0] & 1 != 0) .server else .client) catch {};
 
     var frames: frame.Iterator = .{ .payload = input };
     while (frames.next() catch null) |_| {}

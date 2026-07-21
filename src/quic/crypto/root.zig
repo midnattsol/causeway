@@ -1,11 +1,8 @@
-//! QUIC transport implementation for Causeway.
+//! QUIC TLS integration, transport parameters, and packet keys.
 
 const std = @import("std");
 
-pub const varint = @import("varint.zig");
-pub const crypto = @import("crypto/root.zig");
-pub const frame = @import("frame/root.zig");
-pub const packet = @import("packet/root.zig");
+pub const transport_parameters = @import("transport_parameters.zig");
 
 // -----------------------------------------------------------------------------
 // Tests
