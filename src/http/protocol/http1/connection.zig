@@ -184,6 +184,8 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         const RequestOutcome = enum { keep_alive, close };
         const PreparedRequest = union(enum) { request: Request, close };
+        const DispatchResult = union(enum) { response: Response, generated: RequestOutcome };
+        const RequestBodyPlan = struct { framed: bool, limit: usize };
 
         /// Serves an HTTP/1 connection over caller-owned streams.
         /// Unlike `handle`, this function does not close an underlying transport.
@@ -242,15 +244,49 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             completed_requests: usize,
             control: ?ConnectionControl,
         ) !RequestOutcome {
-            const head_timeout = if (completed_requests == 0)
+            const head = (try self.receiveHead(input, output, request_allocator, completed_requests, control, io)) orelse return .close;
+            const request = switch (try self.prepareRequest(input, output, head, request_allocator, transfer_buffer, io)) {
+                .request => |request| request,
+                .close => return .close,
+            };
+            const connection_keep_alive = head.keep_alive and
+                !requestLimitReached(self.options.max_requests, completed_requests + 1) and
+                !(if (control) |connection_control| connection_control.isDraining() else false);
+            const dispatch = try self.dispatchRequest(output, head, request, request_allocator, connection_keep_alive, io);
+            return switch (dispatch) {
+                .generated => |outcome| outcome,
+                .response => |response| self.writeResponse(
+                    input,
+                    output,
+                    head,
+                    request,
+                    response,
+                    request_allocator,
+                    transfer_buffer,
+                    connection_keep_alive,
+                    io,
+                ),
+            };
+        }
+
+        fn receiveHead(
+            self: *Self,
+            input: *Io.Reader,
+            output: *Io.Writer,
+            allocator: std.mem.Allocator,
+            completed_requests: usize,
+            control: ?ConnectionControl,
+            io: Io,
+        ) !?head_module.Head {
+            const timeout = if (completed_requests == 0)
                 self.options.request_head_timeout
             else
                 self.options.keep_alive_timeout orelse self.options.request_head_timeout;
-            const head = switch (try request_head.receive(
+            return switch (try request_head.receive(
                 io,
                 input,
                 output,
-                request_allocator,
+                allocator,
                 self.options.max_header_size,
                 .{
                     .request_line_size = self.options.max_request_line_size,
@@ -259,48 +295,39 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     .header_value_size = self.options.max_header_value_size,
                 },
                 self.options.automatic_date,
-                head_timeout,
+                timeout,
                 completed_requests != 0,
                 control,
             )) {
-                .request => |request_head_value| request_head_value,
-                .close => return .close,
+                .request => |head| head,
+                .close => null,
             };
-            const version = wireVersion(head.version);
-            const request_count = completed_requests + 1;
-            const request = switch (try self.prepareRequest(
-                input,
-                output,
-                head,
-                request_allocator,
-                transfer_buffer,
-                io,
-            )) {
-                .request => |request| request,
-                .close => return .close,
-            };
+        }
 
-            var http1_exchange: exchange_adapter.Adapter = .{
-                .output = output,
-                .version = version,
-            };
+        fn dispatchRequest(
+            self: *Self,
+            output: *Io.Writer,
+            head: head_module.Head,
+            request: Request,
+            allocator: std.mem.Allocator,
+            connection_keep_alive: bool,
+            io: Io,
+        ) !DispatchResult {
+            const version = wireVersion(head.version);
+            var http1_exchange: exchange_adapter.Adapter = .{ .output = output, .version = version };
             var exchange = Exchange.borrowed(&http1_exchange);
             var locals: if (Locals) |RequestLocals| RequestLocals else void = if (Locals != null) .{} else {};
             const context = if (Locals) |_| Context{
-                .execution = .{ .state = self.state, .allocator = request_allocator, .io = io },
+                .execution = .{ .state = self.state, .allocator = allocator, .io = io },
                 .request = request,
                 .locals = &locals,
                 .exchange = &exchange,
             } else Context{
-                .execution = .{ .state = self.state, .allocator = request_allocator, .io = io },
+                .execution = .{ .state = self.state, .allocator = allocator, .io = io },
                 .request = request,
                 .exchange = &exchange,
             };
-
-            const connection_keep_alive = head.keep_alive and
-                !requestLimitReached(self.options.max_requests, request_count) and
-                !(if (control) |connection_control| connection_control.isDraining() else false);
-            var response = Dispatcher.dispatch(&context) catch |err| {
+            const response = Dispatcher.dispatch(&context) catch |err| {
                 const failure = dispatchFailure(err, self.options.handler_error_policy) orelse return err;
                 const body_complete = self.finishRequestBody(head.expect_continue, request.body);
                 const keep_alive = connection_keep_alive and body_complete;
@@ -314,24 +341,37 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     keep_alive,
                     request.method.is(.HEAD),
                 );
-                return if (keep_alive) .keep_alive else .close;
+                return .{ .generated = if (keep_alive) .keep_alive else .close };
             };
-
             exchange.beginFinal();
-            if (response.write_deadline == null) {
-                if (self.options.response_write_timeout) |timeout| {
-                    response.write_deadline = .fromNow(io, .{ .raw = timeout, .clock = .awake });
-                }
-            }
+            return .{ .response = response };
+        }
+
+        fn writeResponse(
+            self: *Self,
+            input: *Io.Reader,
+            output: *Io.Writer,
+            head: head_module.Head,
+            request: Request,
+            response_value: Response,
+            allocator: std.mem.Allocator,
+            transfer_buffer: []u8,
+            connection_keep_alive: bool,
+            io: Io,
+        ) !RequestOutcome {
+            var response = response_value;
+            if (response.write_deadline == null) if (self.options.response_write_timeout) |timeout| {
+                response.write_deadline = .fromNow(io, .{ .raw = timeout, .clock = .awake });
+            };
             const body_complete = self.finishRequestBody(head.expect_continue, request.body);
             const outcome = response_writer.write(
                 io,
                 input,
                 output,
-                version,
+                wireVersion(head.version),
                 request.headers,
                 &response,
-                request_allocator,
+                allocator,
                 transfer_buffer,
                 .{
                     .method = request.method,
@@ -362,7 +402,36 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         ) !PreparedRequest {
             const body_state = try allocator.create(RequestBody.State);
             body_state.* = .initAbsent();
-            const request: Request = .{
+            const request = requestFromHead(head, body_state);
+            const body_plan = self.planRequestBody(head, request);
+            if (self.knownBodyExceedsLimits(head, body_plan.limit)) {
+                try respondGeneratedError(
+                    io,
+                    output,
+                    wireVersion(head.version),
+                    self.options.automatic_date,
+                    "request body too large",
+                    .payload_too_large,
+                    false,
+                    head.method.is(.HEAD),
+                );
+                return .close;
+            }
+            if (body_plan.framed) try self.initializeRequestBody(
+                body_state,
+                input,
+                output,
+                head,
+                allocator,
+                transfer_buffer,
+                body_plan.limit,
+                io,
+            );
+            return .{ .request = request };
+        }
+
+        fn requestFromHead(head: head_module.Head, body_state: *RequestBody.State) Request {
+            return .{
                 .raw = head.raw_target,
                 .method = head.method,
                 .version = head.version,
@@ -377,52 +446,58 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 .effective_authority = head.effective_authority,
                 .body = .init(body_state),
             };
+        }
+
+        fn planRequestBody(self: *Self, head: head_module.Head, request: Request) RequestBodyPlan {
             const framed = requestHasFramedBody(head.framing);
-            const body_limit = if (framed)
-                effectiveBodyLimit(Dispatcher, request.method, request.path, self.options.max_body_size)
-            else
-                self.options.max_body_size;
+            return .{
+                .framed = framed,
+                .limit = if (framed)
+                    effectiveBodyLimit(Dispatcher, request.method, request.path, self.options.max_body_size)
+                else
+                    self.options.max_body_size,
+            };
+        }
+
+        fn knownBodyExceedsLimits(self: *Self, head: head_module.Head, body_limit: usize) bool {
             const content_length = framingContentLength(head.framing);
-            if (bodyExceedsKnownLimit(content_length, self.options.max_encoded_body_size) or
-                (head.content_encoding == .identity and bodyExceedsKnownLimit(content_length, body_limit)))
-            {
-                try respondGeneratedError(
-                    io,
-                    output,
-                    wireVersion(head.version),
-                    self.options.automatic_date,
-                    "request body too large",
-                    .payload_too_large,
-                    false,
-                    head.method.is(.HEAD),
-                );
-                return .close;
-            }
-            if (framed) {
-                const adapter = try allocator.create(request_body_adapter.Adapter);
-                adapter.* = .{
-                    .input = input,
-                    .output = output,
-                    .transfer_buffer = transfer_buffer,
-                    .framing = head.framing,
-                    .content_encoding = head.content_encoding,
-                    .expect_continue = head.expect_continue,
-                    .trailer_names = head.trailer_names,
-                    .max_encoded_body_size = self.options.max_encoded_body_size,
-                    .max_chunk_count = self.options.max_chunk_count,
-                    .max_chunk_extension_size = self.options.max_chunk_extension_size,
-                    .max_trailer_count = self.options.max_trailer_count,
-                    .max_trailer_size = self.options.max_trailer_size,
-                };
-                body_state.* = request_body_adapter.initState(
-                    adapter,
-                    allocator,
-                    body_limit,
-                    io,
-                    self.options.request_body_timeout,
-                );
-            }
-            return .{ .request = request };
+            return bodyExceedsKnownLimit(content_length, self.options.max_encoded_body_size) or
+                (head.content_encoding == .identity and bodyExceedsKnownLimit(content_length, body_limit));
+        }
+
+        fn initializeRequestBody(
+            self: *Self,
+            body_state: *RequestBody.State,
+            input: *Io.Reader,
+            output: *Io.Writer,
+            head: head_module.Head,
+            allocator: std.mem.Allocator,
+            transfer_buffer: []u8,
+            body_limit: usize,
+            io: Io,
+        ) !void {
+            const adapter = try allocator.create(request_body_adapter.Adapter);
+            adapter.* = .{
+                .input = input,
+                .output = output,
+                .transfer_buffer = transfer_buffer,
+                .framing = head.framing,
+                .content_encoding = head.content_encoding,
+                .expect_continue = head.expect_continue,
+                .trailer_names = head.trailer_names,
+                .max_encoded_body_size = self.options.max_encoded_body_size,
+                .max_chunk_count = self.options.max_chunk_count,
+                .max_chunk_extension_size = self.options.max_chunk_extension_size,
+                .max_trailer_count = self.options.max_trailer_count,
+                .max_trailer_size = self.options.max_trailer_size,
+            };
+            body_state.* = request_body_adapter.initState(
+                adapter,
+                allocator,
+                body_limit,
+                io,
+                self.options.request_body_timeout,
+            );
         }
 
         fn finishRequestBody(self: *Self, expect_continue: bool, body: RequestBody) bool {
