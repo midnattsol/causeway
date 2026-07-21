@@ -244,9 +244,7 @@ fn parseGoaway(header: Header, payload: []const u8) !Goaway {
 
 fn parseWindowUpdate(payload: []const u8) !u32 {
     if (payload.len != 4) return error.FrameSizeError;
-    const increment = readU32(payload) & 0x7fff_ffff;
-    if (increment == 0) return error.ProtocolError;
-    return increment;
+    return readU32(payload) & 0x7fff_ffff;
 }
 
 fn parseContinuation(header: Header, payload: []const u8) !Continuation {
@@ -329,7 +327,10 @@ test "connection frames enforce exact payload lengths and stream zero" {
     try std.testing.expectError(error.FrameSizeError, parse(.{ .length = 6, .frame_type = .settings, .flags = Flag.ack, .stream_id = 0 }, &.{ 0, 1, 0, 0, 0, 0 }));
     try std.testing.expectError(error.ProtocolError, parse(.{ .length = 8, .frame_type = .ping, .flags = 0, .stream_id = 1 }, "12345678"));
     try std.testing.expectError(error.FrameSizeError, parse(.{ .length = 3, .frame_type = .window_update, .flags = 0, .stream_id = 0 }, &.{ 0, 0, 1 }));
-    try std.testing.expectError(error.ProtocolError, parse(.{ .length = 4, .frame_type = .window_update, .flags = 0, .stream_id = 0 }, &.{ 0, 0, 0, 0 }));
+    try std.testing.expectEqual(@as(u32, 0), (try parse(
+        .{ .length = 4, .frame_type = .window_update, .flags = 0, .stream_id = 0 },
+        &.{ 0, 0, 0, 0 },
+    )).payload.window_update);
 }
 
 test "unknown frame types remain skippable" {

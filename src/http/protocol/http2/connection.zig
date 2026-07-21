@@ -402,6 +402,10 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
 
             fn handleWindowUpdate(self: *Controller, stream_id: u32, increment: u32) !void {
+                if (increment == 0) {
+                    if (stream_id == 0) return self.connectionFailure(.protocol_error, error.ZeroWindowIncrement);
+                    return self.streamFailure(stream_id, .protocol_error, error.ZeroWindowIncrement);
+                }
                 if (stream_id == 0) return self.connection_send_window.increase(increment) catch |err| self.connectionFailure(.flow_control_error, err);
                 const stream = self.registry.get(stream_id) orelse {
                     if (stream_id > self.registry.highest_opened) return self.connectionFailure(.protocol_error, error.WindowUpdateOnIdleStream);

@@ -52,6 +52,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_http2_fuzz_tests = b.addRunArtifact(http2_fuzz_tests);
 
+    const http2_compliance_tests = b.addTest(.{
+        .name = "HTTP2 compliance tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/http2_compliance_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_http2_compliance_tests = b.addRunArtifact(http2_compliance_tests);
+
     const integration_tests = b.addTest(.{
         .name = "integration tests",
         .root_module = b.createModule(.{
@@ -75,6 +85,9 @@ pub fn build(b: *std.Build) void {
     const http2_fuzz_step = b.step("http2-fuzz", "Fuzz HTTP/2 frames and connection state");
     http2_fuzz_step.dependOn(&run_http2_fuzz_tests.step);
 
+    const http2_compliance_step = b.step("http2-compliance", "Run the HTTP/2 RFC compliance matrix");
+    http2_compliance_step.dependOn(&run_http2_compliance_tests.step);
+
     const integration_test_step = b.step("integration-test", "Run HTTP integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
 
@@ -83,6 +96,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all Causeway tests");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_http2_compliance_tests.step);
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_smoke_tests.step);
 }
