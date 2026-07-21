@@ -196,6 +196,31 @@ test "HTTP/3 session incrementally serves a request over the generic QUIC API" {
     try std.testing.expect(transport.close_code == null);
 }
 
+test "HTTP/3 session graceful shutdown queues GOAWAY on its control stream" {
+    const State = struct {};
+    const Dispatcher = struct {
+        pub fn dispatch(_: anytype) !Response {
+            return .{ .status = .ok };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var transport: FakeConnection = .{};
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, test_config).init(&transport, std.testing.allocator, &state, threaded.io());
+
+    try session.beginShutdown(1);
+    try session.beginShutdown(2);
+    const control_output = transport.output(session.local_control);
+    var parser = frame.Parser{ .bytes = control_output[1..] };
+    try std.testing.expectEqual(frame.Type.settings, (try parser.next()).?.frame_type);
+    const goaway = (try parser.next()).?;
+    try std.testing.expectEqual(frame.Type.goaway, goaway.frame_type);
+    try std.testing.expectEqual((@as(u64, 1) << 62) - 4, goaway.payload.goaway);
+    try std.testing.expect((try parser.next()) == null);
+    try std.testing.expect(transport.close_code == null);
+}
+
 test "HTTP/3 session rejects a client push stream as a connection error" {
     const State = struct {};
     const Dispatcher = struct {

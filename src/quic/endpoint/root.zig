@@ -33,8 +33,9 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
 
     return struct {
         const Self = @This();
-        const Connection = connection.Connection(connection_limits);
+        pub const Connection = connection.Connection(connection_limits);
         const Storage = connection.Storage(connection_limits);
+        pub const capacity_value = capacity;
         pub const transcript_bytes = connection_limits.tls_transcript_bytes;
 
         pub const Slot = struct {
@@ -43,6 +44,9 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
             connection: Connection = undefined,
             peer: net.IpAddress = undefined,
             occupied: bool = false,
+            /// Changes on every admission so external per-connection state cannot
+            /// be confused with a later connection reusing this fixed slot.
+            generation: u64 = 0,
         };
 
         socket: net.Socket = undefined,
@@ -143,6 +147,8 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
                     },
                     .now = now,
                 }) catch continue;
+                slot.generation +%= 1;
+                if (slot.generation == 0) slot.generation = 1;
                 slot.occupied = true;
                 slot.connection.receiveDatagram(message.data, now) catch {};
                 if (slot.connection.space(.initial).received.largest() == null) slot.occupied = false;
@@ -170,9 +176,16 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
             return result;
         }
 
+        /// Stops admission while allowing existing connections to continue.
+        /// Protocol integrations use this to queue graceful application shutdown
+        /// signals before starting transport close.
+        pub fn beginShutdown(self: *Self) void {
+            self.shutting_down = true;
+        }
+
         /// Starts transport close for every connection. Repeated `poll`/`drive` calls progress shutdown.
         pub fn closeAll(self: *Self, now: u64) void {
-            self.shutting_down = true;
+            self.beginShutdown();
             for (&self.slots) |*slot| if (slot.occupied)
                 slot.connection.close(connection.CloseCode.no_error, null, "endpoint shutdown", now);
         }

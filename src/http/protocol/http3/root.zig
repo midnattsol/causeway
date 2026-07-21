@@ -1,6 +1,7 @@
 //! HTTP/3 RFC 9114 wire primitives and QPACK compression.
 
 pub const connection = @import("connection/root.zig");
+pub const server = @import("server.zig");
 pub const frame = @import("frame/root.zig");
 pub const settings = @import("settings.zig");
 pub const stream = @import("stream.zig");
@@ -12,6 +13,8 @@ pub const Handler = connection.Handler;
 pub const HandlerWithLocals = connection.HandlerWithLocals;
 pub const Session = connection.Session;
 pub const SessionWithLocals = connection.SessionWithLocals;
+pub const Server = server.Server;
+pub const ServerWithLocals = server.ServerWithLocals;
 pub const Config = connection.Config;
 pub const ErrorCode = errors.Code;
 pub const Role = stream.Role;
@@ -20,6 +23,7 @@ pub const RequestState = validation.RequestState;
 
 comptime {
     _ = connection;
+    _ = server;
     _ = frame;
     _ = settings;
     _ = stream;
@@ -30,6 +34,7 @@ comptime {
 
 test {
     _ = connection;
+    _ = server;
     _ = frame;
     _ = settings;
     _ = stream;

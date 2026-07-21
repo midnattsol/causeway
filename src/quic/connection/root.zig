@@ -69,6 +69,7 @@ pub fn Connection(comptime limits: Limits) type {
     if (limits.max_datagram_size < 1200) @compileError("QUIC max_datagram_size must be at least 1200");
     return struct {
         const Self = @This();
+        pub const StreamId = stream.Id;
         pub const Space = packet_space.PacketSpace(limits.ack_ranges);
         pub const Detector = loss.Detector(limits.sent_packets);
         pub const ApplicationStreams = application_streams.Application(
@@ -184,40 +185,40 @@ pub fn Connection(comptime limits: Limits) type {
             self.address_validated = true;
         }
 
-        pub fn openBidirectionalStream(self: *Self) !StreamId {
+        pub fn openBidirectionalStream(self: *Self) !Self.StreamId {
             return self.application.open(.bidirectional);
         }
-        pub fn openUnidirectionalStream(self: *Self) !StreamId {
+        pub fn openUnidirectionalStream(self: *Self) !Self.StreamId {
             return self.application.open(.unidirectional);
         }
-        pub fn acceptStream(self: *Self) ?StreamId {
+        pub fn acceptStream(self: *Self) ?Self.StreamId {
             return self.application.accept();
         }
         pub fn nextStreamEvent(self: *Self) ?StreamEvent {
             return self.application.nextEvent();
         }
-        pub fn streamReadable(self: *Self, id: StreamId) ![]const u8 {
+        pub fn streamReadable(self: *Self, id: Self.StreamId) ![]const u8 {
             return self.application.readable(id);
         }
-        pub fn consumeStream(self: *Self, id: StreamId, amount: usize) !void {
+        pub fn consumeStream(self: *Self, id: Self.StreamId, amount: usize) !void {
             return self.application.consume(id, amount);
         }
-        pub fn readStreamReset(self: *Self, id: StreamId) !u64 {
+        pub fn readStreamReset(self: *Self, id: Self.StreamId) !u64 {
             return self.application.readReset(id);
         }
-        pub fn streamWritableLen(self: *Self, id: StreamId) !usize {
+        pub fn streamWritableLen(self: *Self, id: Self.StreamId) !usize {
             return self.application.writableLen(id);
         }
-        pub fn writeStream(self: *Self, id: StreamId, bytes: []const u8) !usize {
+        pub fn writeStream(self: *Self, id: Self.StreamId, bytes: []const u8) !usize {
             return self.application.write(id, bytes);
         }
-        pub fn finishStream(self: *Self, id: StreamId) !void {
+        pub fn finishStream(self: *Self, id: Self.StreamId) !void {
             return self.application.finish(id);
         }
-        pub fn resetStream(self: *Self, id: StreamId, application_error: u64) !void {
+        pub fn resetStream(self: *Self, id: Self.StreamId, application_error: u64) !void {
             return self.application.reset(id, application_error);
         }
-        pub fn stopSending(self: *Self, id: StreamId, application_error: u64) !void {
+        pub fn stopSending(self: *Self, id: Self.StreamId, application_error: u64) !void {
             return self.application.stopSending(id, application_error);
         }
 

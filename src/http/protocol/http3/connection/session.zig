@@ -85,6 +85,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         state: *State,
         io: Io,
         active: bool = false,
+        shutting_down: bool = false,
         local_control: StreamId = undefined,
         local_encoder: StreamId = undefined,
         local_decoder: StreamId = undefined,
@@ -130,20 +131,51 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         /// Drains currently available QUIC events and advances queued response bytes.
         /// The caller invokes this after QUIC input, stream-credit changes, or output ACKs.
+        /// Every connection-level failure is translated to an HTTP/3 application
+        /// CONNECTION_CLOSE before it is returned.
         pub fn poll(self: *Self, now: u64) !usize {
+            return self.pollInner(now) catch |err| {
+                self.closeFor(err, now);
+                return err;
+            };
+        }
+
+        fn pollInner(self: *Self, now: u64) !usize {
             if (!self.active) try self.activate();
             var progressed: usize = 0;
             progressed += try self.flushResponses();
             while (self.connection.nextStreamEvent()) |event| {
                 progressed += 1;
-                self.handleEvent(event, now) catch |err| {
-                    self.closeFor(err, now);
-                    return err;
-                };
+                try self.handleEvent(event, now);
             }
             try self.retryRequests(now);
             progressed += try self.flushResponses();
             return progressed;
+        }
+
+        /// Queues the server's initial graceful-shutdown GOAWAY on the control
+        /// stream. The maximum valid client-initiated bidirectional stream ID
+        /// rejects no already-created request and permits a later lower GOAWAY.
+        pub fn beginShutdown(self: *Self, now: u64) !void {
+            if (self.shutting_down) return;
+            self.activate() catch |err| {
+                self.closeFor(err, now);
+                return err;
+            };
+            var encoded: [16]u8 = undefined;
+            const maximum_client_bidi_id = (@as(u64, 1) << 62) - 4;
+            const length = frame.encode(&encoded, .{
+                .frame_type = .goaway,
+                .payload = .{ .goaway = maximum_client_bidi_id },
+            }) catch |err| {
+                self.closeFor(err, now);
+                return err;
+            };
+            self.writeAll(self.local_control, encoded[0..length]) catch |err| {
+                self.closeFor(err, now);
+                return err;
+            };
+            self.shutting_down = true;
         }
 
         fn handleEvent(self: *Self, event: anytype, now: u64) !void {
