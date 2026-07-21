@@ -28,6 +28,8 @@ pub const Error = error{
     BadFinished,
 } || credentials_module.SignError;
 
+pub const ExporterError = key_schedule.ExporterError || error{HandshakeNotComplete};
+
 pub const X25519Material = union(enum) {
     seed: [32]u8,
     key_pair: X25519.KeyPair,
@@ -80,6 +82,7 @@ pub const Server = struct {
     peer_parameters: ?[]const u8 = null,
     handshake_keys_value: ?KeyPair = null,
     application_secrets_value: ?ApplicationTrafficSecrets = null,
+    exporter_master_secret: ?key_schedule.Secret = null,
     client_finished_key: [32]u8 = @splat(0),
 
     pub fn init(config: Config) Server {
@@ -118,11 +121,33 @@ pub const Server = struct {
     /// A second call returns null, avoiding long-lived duplicate secret state.
     pub fn takeApplicationTrafficSecrets(self: *Server) ?ApplicationTrafficSecrets {
         const result = self.application_secrets_value orelse return null;
-        @memset(&self.application_secrets_value.?.server, 0);
-        @memset(&self.application_secrets_value.?.client, 0);
+        std.crypto.secureZero(u8, &self.application_secrets_value.?.server);
+        std.crypto.secureZero(u8, &self.application_secrets_value.?.client);
         self.application_secrets_value = null;
         return result;
     }
+
+    /// Exports TLS keying material only after the peer Finished is verified.
+    pub fn exportKeyingMaterial(self: *const Server, label: []const u8, context: []const u8, out: []u8) ExporterError!void {
+        if (self.state != .connected) return error.HandshakeNotComplete;
+        const secret = self.exporter_master_secret orelse return error.HandshakeNotComplete;
+        return key_schedule.exportKeyingMaterial(secret, label, context, out);
+    }
+
+    /// Securely clears retained TLS secrets. Safe to call more than once.
+    pub fn deinit(self: *Server) void {
+        if (self.application_secrets_value) |*secrets| {
+            std.crypto.secureZero(u8, &secrets.server);
+            std.crypto.secureZero(u8, &secrets.client);
+            self.application_secrets_value = null;
+        }
+        if (self.exporter_master_secret) |*secret| {
+            std.crypto.secureZero(u8, secret);
+            self.exporter_master_secret = null;
+        }
+        std.crypto.secureZero(u8, &self.client_finished_key);
+    }
+
     pub fn initialKeysDiscardReady(self: *const Server) bool {
         return self.state != .expect_client_hello;
     }
@@ -163,13 +188,15 @@ pub const Server = struct {
         self.appendTranscript(message) catch unreachable;
         self.appendTranscript(server_hello) catch unreachable;
 
-        const hs = key_schedule.deriveHandshake(&shared, key_schedule.transcriptHash(self.transcriptBytes()));
+        var hs = key_schedule.deriveHandshake(&shared, key_schedule.transcriptHash(self.transcriptBytes()));
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&hs));
         const keys = KeyPair{
             .local = try packet_keys.derive(hs.server_handshake_traffic_secret, negotiated.cipher_suite),
             .remote = try packet_keys.derive(hs.client_handshake_traffic_secret, negotiated.cipher_suite),
         };
         const handshake_flight = try self.createHandshakeFlight(handshake_out, hs.server_finished_key);
-        const app = key_schedule.deriveApplication(hs.handshake_secret, key_schedule.transcriptHash(self.transcriptBytes()));
+        var app = key_schedule.deriveApplication(hs.handshake_secret, key_schedule.transcriptHash(self.transcriptBytes()));
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&app));
 
         self.selected_suite = negotiated.cipher_suite;
         self.selected_alpn = "h3";
@@ -180,6 +207,7 @@ pub const Server = struct {
             .client = app.client_application_traffic_secret_0,
             .cipher_suite = negotiated.cipher_suite,
         };
+        self.exporter_master_secret = app.exporter_master_secret;
         self.client_finished_key = hs.client_finished_key;
         self.state = .expect_client_finished;
         return .{ .initial = server_hello, .handshake = handshake_flight };
@@ -228,6 +256,7 @@ pub const Server = struct {
         HmacSha256.create(&expected, &transcript_hash, &self.client_finished_key);
         if (!std.crypto.timing_safe.eql([hash_length]u8, expected, frame.body[0..hash_length].*)) return error.BadFinished;
         try self.appendTranscript(message);
+        std.crypto.secureZero(u8, &self.client_finished_key);
         self.state = .connected;
         return .{};
     }
@@ -342,6 +371,7 @@ test "deterministic complete QUIC TLS server handshake" {
     const credentials = testCredentials();
     var transcript: [2048]u8 = undefined;
     var server = fixtureServer(&transcript, &credentials);
+    defer server.deinit();
     var initial: [256]u8 = undefined;
     var handshake: [1024]u8 = undefined;
     const flights = try server.receive(.initial, client_hello, &initial, &handshake);
@@ -352,7 +382,11 @@ test "deterministic complete QUIC TLS server handshake" {
     @memset(&client_hello_buffer, 0);
     try std.testing.expectEqualStrings("cp", server.peerTransportParameters().?);
     try std.testing.expect(server.handshakeKeys() != null);
-    const application_secrets = server.takeApplicationTrafficSecrets().?;
+    var application_secrets = server.takeApplicationTrafficSecrets().?;
+    defer {
+        std.crypto.secureZero(u8, &application_secrets.server);
+        std.crypto.secureZero(u8, &application_secrets.client);
+    }
     try std.testing.expectEqual(tls.CipherSuite.AES_128_GCM_SHA256, application_secrets.cipher_suite);
     try std.testing.expect(server.takeApplicationTrafficSecrets() == null);
     try std.testing.expect(server.initialKeysDiscardReady());
@@ -364,6 +398,22 @@ test "deterministic complete QUIC TLS server handshake" {
     _ = try server.receive(.handshake, finished, &.{}, &.{});
     try std.testing.expectEqual(State.connected, server.state);
     try std.testing.expect(server.handshakeKeysDiscardReady());
+
+    var exported: [32]u8 = undefined;
+    try server.exportKeyingMaterial("EXPORTER-WebTransport", "session", &exported);
+    var repeated: [32]u8 = undefined;
+    try server.exportKeyingMaterial("EXPORTER-WebTransport", "session", &repeated);
+    try std.testing.expectEqualSlices(u8, &exported, &repeated);
+}
+
+test "server exporter is unavailable before handshake and after deinit" {
+    const credentials = testCredentials();
+    var transcript: [2048]u8 = undefined;
+    var server = fixtureServer(&transcript, &credentials);
+    var output: [32]u8 = undefined;
+    try std.testing.expectError(error.HandshakeNotComplete, server.exportKeyingMaterial("EXPORTER-WebTransport", "", &output));
+    server.deinit();
+    try std.testing.expectError(error.HandshakeNotComplete, server.exportKeyingMaterial("EXPORTER-WebTransport", "", &output));
 }
 
 test "server rejects order level bad Finished and bounded buffers" {
@@ -373,6 +423,7 @@ test "server rejects order level bad Finished and bounded buffers" {
     const credentials = testCredentials();
     var transcript: [2048]u8 = undefined;
     var server = fixtureServer(&transcript, &credentials);
+    defer server.deinit();
     var initial: [256]u8 = undefined;
     var handshake: [1024]u8 = undefined;
     try std.testing.expectError(error.WrongEncryptionLevel, server.receive(.handshake, hello, &initial, &handshake));
@@ -389,5 +440,6 @@ test "server rejects order level bad Finished and bounded buffers" {
 
     var short_transcript: [16]u8 = undefined;
     var bounded = fixtureServer(&short_transcript, &credentials);
+    defer bounded.deinit();
     try std.testing.expectError(error.TranscriptBufferTooSmall, bounded.receive(.initial, hello, &initial, &handshake));
 }

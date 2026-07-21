@@ -146,7 +146,10 @@ pub fn EndpointWithFeatures(
 
         pub fn deinit(self: *Self, io: Io) void {
             self.socket.close(io);
-            for (&self.slots) |*slot| slot.occupied = false;
+            for (&self.slots) |*slot| {
+                if (slot.occupied) slot.connection.deinit();
+                slot.occupied = false;
+            }
         }
 
         pub fn localAddress(self: *const Self) net.IpAddress {
@@ -575,7 +578,10 @@ pub fn EndpointWithFeatures(
 
         fn reap(self: *Self) void {
             for (&self.slots) |*slot| {
-                if (slot.occupied and slot.connection.state == .closed) slot.occupied = false;
+                if (slot.occupied and slot.connection.state == .closed) {
+                    slot.connection.deinit();
+                    slot.occupied = false;
+                }
             }
         }
     };

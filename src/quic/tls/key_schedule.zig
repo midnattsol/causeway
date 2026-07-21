@@ -11,6 +11,13 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const secret_length = Hkdf.prk_length;
 pub const Secret = [secret_length]u8;
 pub const TranscriptHash = [Sha256.digest_length]u8;
+pub const max_exporter_label_length = 255 - "tls13 ".len;
+pub const max_exporter_output_length = 255 * secret_length;
+
+pub const ExporterError = error{
+    ExporterLabelTooLong,
+    ExporterOutputTooLong,
+};
 
 /// Hashes an already encoded transcript prefix.
 pub fn transcriptHash(bytes: []const u8) TranscriptHash {
@@ -75,6 +82,39 @@ pub fn finishedKey(base_key: Secret) Secret {
     return expand(base_key, "finished", "", secret_length);
 }
 
+/// RFC 8446 Section 7.5 exporter using a caller-provided, bounded output.
+/// `label` is the external exporter label without the TLS 1.3 prefix.
+pub fn exportKeyingMaterial(exporter_master_secret: Secret, label: []const u8, context: []const u8, out: []u8) ExporterError!void {
+    if (label.len > max_exporter_label_length) return error.ExporterLabelTooLong;
+    if (out.len > max_exporter_output_length) return error.ExporterOutputTooLong;
+
+    const empty_hash = transcriptHash("");
+    var secret = expand(exporter_master_secret, label, &empty_hash, secret_length);
+    defer std.crypto.secureZero(u8, &secret);
+    var context_hash = transcriptHash(context);
+    defer std.crypto.secureZero(u8, &context_hash);
+    try expandInto(secret, "exporter", &context_hash, out);
+}
+
+fn expandInto(key: Secret, label: []const u8, context: []const u8, out: []u8) ExporterError!void {
+    if (label.len > max_exporter_label_length) return error.ExporterLabelTooLong;
+    if (out.len > max_exporter_output_length) return error.ExporterOutputTooLong;
+
+    const prefix = "tls13 ";
+    var info: [2 + 1 + 255 + 1 + Sha256.digest_length]u8 = undefined;
+    std.mem.writeInt(u16, info[0..2], @intCast(out.len), .big);
+    info[2] = @intCast(prefix.len + label.len);
+    @memcpy(info[3..][0..prefix.len], prefix);
+    var cursor = 3 + prefix.len;
+    @memcpy(info[cursor..][0..label.len], label);
+    cursor += label.len;
+    info[cursor] = @intCast(context.len);
+    cursor += 1;
+    @memcpy(info[cursor..][0..context.len], context);
+    cursor += context.len;
+    Hkdf.expand(out, info[0..cursor], key);
+}
+
 fn expand(key: Secret, label: []const u8, context: []const u8, comptime length: usize) [length]u8 {
     return std.crypto.tls.hkdfExpandLabel(Hkdf, key, label, context, length);
 }
@@ -104,4 +144,31 @@ test "transcript boundaries deterministically separate traffic secrets" {
     try std.testing.expect(!std.mem.eql(u8, &handshake.client_handshake_traffic_secret, &handshake.server_handshake_traffic_secret));
     try std.testing.expect(!std.mem.eql(u8, &application.client_application_traffic_secret_0, &application.server_application_traffic_secret_0));
     try std.testing.expect(!std.mem.eql(u8, &application.exporter_master_secret, &application.master_secret));
+}
+
+test "RFC 8446 exporter vector and context determinism" {
+    var exporter_master_secret: Secret = undefined;
+    for (&exporter_master_secret, 0..) |*byte, index| byte.* = @intCast(index);
+    var first: [42]u8 = undefined;
+    var second: [42]u8 = undefined;
+    try exportKeyingMaterial(exporter_master_secret, "EXPORTER-WebTransport", "context", &first);
+    try exportKeyingMaterial(exporter_master_secret, "EXPORTER-WebTransport", "context", &second);
+    try expectHex("e2961d21ce698d91d9dc3dfeded350a2d601677364dbbbddcb2c3ab3b21b949beeeee353d40a02147577", &first);
+    try std.testing.expectEqualSlices(u8, &first, &second);
+
+    var changed: [42]u8 = undefined;
+    try exportKeyingMaterial(exporter_master_secret, "EXPORTER-WebTransport", "different context", &changed);
+    try std.testing.expect(!std.mem.eql(u8, &first, &changed));
+}
+
+test "exporter validates label and output bounds" {
+    const secret: Secret = @splat(0x42);
+    var empty: [0]u8 = .{};
+    try exportKeyingMaterial(secret, "", "", &empty);
+
+    var long_label: [max_exporter_label_length + 1]u8 = @splat('x');
+    try std.testing.expectError(error.ExporterLabelTooLong, exportKeyingMaterial(secret, &long_label, "", &empty));
+
+    var oversized: [max_exporter_output_length + 1]u8 = undefined;
+    try std.testing.expectError(error.ExporterOutputTooLong, exportKeyingMaterial(secret, "label", "", &oversized));
 }

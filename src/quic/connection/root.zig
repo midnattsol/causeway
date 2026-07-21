@@ -27,6 +27,7 @@ pub const State = types.State;
 pub const Level = types.Level;
 pub const TransportError = types.TransportError;
 pub const CloseCode = types.CloseCode;
+pub const ExporterError = tls_server.ExporterError;
 pub const StreamEvent = application_streams.Event;
 pub const StreamId = stream.Id;
 pub const StreamDirection = stream.Direction;
@@ -240,6 +241,16 @@ pub fn Connection(comptime limits: Limits) type {
             };
         }
 
+        /// Securely clears retained TLS secrets. Safe to call more than once.
+        pub fn deinit(self: *Self) void {
+            self.tls.deinit();
+        }
+
+        /// RFC 8446 Section 7.5 exporter with caller-owned output storage.
+        pub fn exportKeyingMaterial(self: *const Self, label: []const u8, context: []const u8, out: []u8) ExporterError!void {
+            return self.tls.exportKeyingMaterial(label, context, out);
+        }
+
         pub fn receiveDatagram(self: *Self, datagram: []u8, now: u64) !void {
             return self.receiveDatagramWithMetadata(datagram, now, .{});
         }
@@ -404,6 +415,7 @@ pub fn Connection(comptime limits: Limits) type {
         }
         pub fn onStatelessReset(self: *Self, now: u64) void {
             if (self.state == .closed or self.state == .draining) return;
+            self.tls.deinit();
             self.state = .draining;
             self.close_started = now;
         }
@@ -414,12 +426,14 @@ pub fn Connection(comptime limits: Limits) type {
 
         pub fn close(self: *Self, code: u64, frame_type: ?u64, reason: []const u8, now: u64) void {
             if (self.state == .closed or self.state == .draining) return;
+            self.tls.deinit();
             self.setCloseInfo(code, frame_type, reason);
             self.state = .closing;
             self.close_started = now;
         }
 
         pub fn peerClose(self: *Self, code: u64, frame_type: ?u64, reason: []const u8, now: u64) void {
+            self.tls.deinit();
             self.setCloseInfo(code, frame_type, reason);
             self.state = .draining;
             self.close_started = now;
@@ -537,6 +551,17 @@ test "connection storage and core are allocation free fixed-size values" {
     const C = Connection(.{ .crypto_receive_bytes = 32, .crypto_send_bytes = 32, .tls_output_bytes = 64 });
     try std.testing.expect(@sizeOf(C) > 0);
     try std.testing.expect(!@hasDecl(C, "allocator"));
+}
+
+test "connection exporter is unavailable before TLS handshake" {
+    const limits: Limits = .{ .crypto_receive_bytes = 64, .crypto_send_bytes = 64, .tls_output_bytes = 128 };
+    var storage: Storage(limits) = .{};
+    var transcript: [512]u8 = undefined;
+    const credentials = testCredentials();
+    var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+    defer connection.deinit();
+    var output: [32]u8 = undefined;
+    try std.testing.expectError(error.HandshakeNotComplete, connection.exportKeyingMaterial("EXPORTER-WebTransport", "", &output));
 }
 
 test "server anti-amplification allowance is exact and validation removes it" {
