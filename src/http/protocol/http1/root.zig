@@ -10,8 +10,8 @@ pub const chunked = @import("body/chunked.zig");
 pub const body_reader = @import("body/reader.zig");
 pub const body_writer = @import("body/writer.zig");
 pub const trailers = @import("body/trailers.zig");
-pub const response_plan = @import("response_plan.zig");
-pub const response_head = @import("response_head.zig");
+pub const response_plan = @import("response/plan.zig");
+pub const response_head = @import("response/head.zig");
 
 /// Configuration consumed by the HTTP/1 connection driver.
 pub const Options = connection.Options;

@@ -16,13 +16,13 @@ const Takeover = response_module.Takeover;
 const extractor_errors = @import("../../extractors/errors.zig");
 const Exchange = @import("../../exchange.zig").Exchange;
 const exchange_adapter = @import("exchange.zig");
-const protocol_error = @import("protocol_error.zig");
+const protocol_error = @import("response/protocol_error.zig");
 const request_body_adapter = @import("body/request.zig");
 const ConnectionControl = @import("../../transport/server.zig").ConnectionControl;
 const conditional = @import("../../semantics/conditional.zig");
 const request_head = @import("request/receive.zig");
 const head_module = @import("request/head.zig");
-const response_writer = @import("response_writer.zig");
+const response_writer = @import("response/writer.zig");
 const Io = std.Io;
 const net = Io.net;
 

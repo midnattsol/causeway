@@ -1,9 +1,9 @@
 //! Strict HTTP/1 response-head validation and serialization.
 
 const std = @import("std");
-const Headers = @import("../../message/headers.zig").Headers;
-const response_plan = @import("response_plan.zig");
-const syntax = @import("syntax.zig");
+const Headers = @import("../../../message/headers.zig").Headers;
+const response_plan = @import("plan.zig");
+const syntax = @import("../syntax.zig");
 const Io = std.Io;
 
 pub const Options = struct {

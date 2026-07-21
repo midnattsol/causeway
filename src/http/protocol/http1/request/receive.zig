@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const head_module = @import("head.zig");
-const protocol_error = @import("../protocol_error.zig");
+const protocol_error = @import("../response/protocol_error.zig");
 const validation = @import("validation.zig");
 const ConnectionControl = @import("../../../transport/server.zig").ConnectionControl;
 const Io = std.Io;

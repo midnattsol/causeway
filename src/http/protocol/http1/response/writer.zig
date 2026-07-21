@@ -1,14 +1,14 @@
 //! Final HTTP/1.x response planning, serialization, deadlines, and takeover.
 
 const std = @import("std");
-const Headers = @import("../../message/headers.zig").Headers;
-const Method = @import("../../message/request.zig").Method;
+const Headers = @import("../../../message/headers.zig").Headers;
+const Method = @import("../../../message/request.zig").Method;
 const date = @import("date.zig");
-const body_writer = @import("body/writer.zig");
-const response_head = @import("response_head.zig");
-const response_plan = @import("response_plan.zig");
-const syntax = @import("syntax.zig");
-const response_module = @import("../../message/response.zig");
+const body_writer = @import("../body/writer.zig");
+const response_head = @import("head.zig");
+const response_plan = @import("plan.zig");
+const syntax = @import("../syntax.zig");
+const response_module = @import("../../../message/response.zig");
 const Response = response_module.Response;
 const Takeover = response_module.Takeover;
 const Io = std.Io;

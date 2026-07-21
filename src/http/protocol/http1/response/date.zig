@@ -1,7 +1,7 @@
 //! Allocation-free HTTP/1 response Date generation.
 
 const std = @import("std");
-const conditional = @import("../../semantics/conditional.zig");
+const conditional = @import("../../../semantics/conditional.zig");
 const Io = std.Io;
 
 pub fn value(io: Io, buffer: *[29]u8) ?[]const u8 {

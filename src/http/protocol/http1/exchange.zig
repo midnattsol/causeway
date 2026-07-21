@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const Headers = @import("../../message/headers.zig").Headers;
-const response_head = @import("response_head.zig");
+const response_head = @import("response/head.zig");
 const Io = std.Io;
 
 pub const Adapter = struct {
