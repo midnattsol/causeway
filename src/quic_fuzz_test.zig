@@ -8,6 +8,7 @@ const packet_number = @import("quic/packet/number.zig");
 const packet_protection = @import("quic/packet/protection.zig");
 const retry = @import("quic/packet/retry.zig");
 const version_negotiation = @import("quic/packet/version_negotiation.zig");
+const congestion = @import("quic/recovery/congestion.zig");
 const loss = @import("quic/recovery/loss.zig");
 const packet_space = @import("quic/recovery/packet_space.zig");
 const rtt = @import("quic/recovery/rtt.zig");
@@ -82,14 +83,19 @@ fn fuzzAckTracker(input: []const u8) void {
 
 fn fuzzLossDetection(input: []const u8) void {
     var detector = loss.Detector(32).init(.application);
+    var controller = congestion.NewReno.init(1200) catch unreachable;
     const packet_count = @min(input.len, 32);
-    for (0..packet_count) |index| detector.onPacketSent(.{
-        .packet_number = index,
-        .time_sent = index * rtt.millisecond,
-        .sent_bytes = 1200,
-        .ack_eliciting = input[index] & 1 != 0,
-        .in_flight = input[index] & 2 != 0,
-    }) catch @panic("bounded loss fixture overflowed");
+    for (0..packet_count) |index| {
+        const packet: loss.SentPacket = .{
+            .packet_number = index,
+            .time_sent = index * rtt.millisecond,
+            .sent_bytes = 1200,
+            .ack_eliciting = input[index] & 1 != 0,
+            .in_flight = input[index] & 2 != 0,
+        };
+        detector.onPacketSent(packet) catch @panic("bounded loss fixture overflowed");
+        controller.onPacketSent(packet);
+    }
     if (packet_count == 0) return;
 
     const largest: u64 = input[0] % @as(u8, @intCast(packet_count));
@@ -102,7 +108,9 @@ fn fuzzLossDetection(input: []const u8) void {
         .ecn = null,
     };
     var estimator: rtt.Estimator = .{};
-    _ = detector.onAck(ack, 500 * rtt.millisecond, &estimator, 25 * rtt.millisecond, true) catch return;
+    const outcome = detector.onAck(ack, 500 * rtt.millisecond, &estimator, 25 * rtt.millisecond, true) catch return;
+    controller.onPacketsLost(outcome.lost.slice(), outcome.acknowledged.slice(), 500 * rtt.millisecond, &estimator, 25 * rtt.millisecond);
+    controller.onPacketsAcknowledged(outcome.acknowledged.slice(), false);
     _ = detector.timer(estimator, 25 * rtt.millisecond, true, if (input.len > 2) input[2] % 8 else 0);
 }
 
