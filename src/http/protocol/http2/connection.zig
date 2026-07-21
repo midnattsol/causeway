@@ -29,36 +29,10 @@ const stream_registry = @import("stream/registry.zig");
 const trailer_policy = @import("headers/trailers.zig");
 const Io = std.Io;
 const net = Io.net;
+const options_module = @import("connection/options.zig");
 
-pub const HandlerErrorPolicy = enum { internal_server_error, reset_stream };
-
-pub const Options = struct {
-    max_concurrent_streams: usize = 100,
-    frame_queue_slots: usize = 16,
-    max_frame_size: usize = frame.default_max_frame_size,
-    max_header_block_size: usize = 64 * 1024,
-    max_header_list_size: usize = 64 * 1024,
-    max_header_count: usize = 100,
-    max_header_name_size: usize = 256,
-    max_header_string_size: usize = 16 * 1024,
-    header_table_size: usize = 4096,
-    request_body_buffer_size: usize = 65_535,
-    max_body_size: usize = 1024 * 1024,
-    request_body_timeout: ?Io.Duration = null,
-    response_write_timeout: ?Io.Duration = null,
-    settings_ack_timeout: ?Io.Duration = .fromSeconds(10),
-    max_request_trailer_count: usize = 32,
-    max_request_trailer_size: usize = 8 * 1024,
-    max_response_trailer_count: usize = 32,
-    max_response_trailer_size: usize = 8 * 1024,
-    response_body_buffer_size: usize = 64 * 1024,
-    response_writer_buffer_size: usize = 8 * 1024,
-    read_buffer_size: usize = 16 * 1024,
-    write_buffer_size: usize = 16 * 1024,
-    control_queue_capacity: usize = 256,
-    enable_extended_connect: bool = true,
-    handler_error_policy: HandlerErrorPolicy = .internal_server_error,
-};
+pub const HandlerErrorPolicy = options_module.HandlerErrorPolicy;
+pub const Options = options_module.Options;
 
 pub fn Handler(comptime State: type, comptime Dispatcher: type) type {
     return HandlerType(State, null, Dispatcher);
@@ -510,44 +484,57 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
 
             fn createSession(self: *Controller, stream_id: u32, bytes: []const u8, end_stream: bool) !?*Session {
+                const session = try self.allocateSession(stream_id);
+                var committed = false;
+                defer if (!committed) session.deinit();
+
+                const head = (try self.decodeRequestHead(session, bytes)) orelse return null;
+                if (!try self.initializeRequest(session, head, end_stream)) return null;
+                committed = true;
+                return session;
+            }
+
+            fn allocateSession(self: *Controller, stream_id: u32) !*Session {
                 const session = try self.owner.allocator.create(Session);
                 session.* = .{
                     .owner = self.owner,
                     .id = stream_id,
-                    .arena = undefined,
+                    .arena = std.heap.ArenaAllocator.init(self.owner.allocator),
                     .input = undefined,
                     .body_state = undefined,
                     .request = undefined,
                     .content_length = null,
                 };
-                session.arena = std.heap.ArenaAllocator.init(self.owner.allocator);
-                var committed = false;
-                defer if (!committed) {
-                    session.arena.deinit();
-                    self.owner.allocator.destroy(session);
-                };
-                const allocator = session.arena.allocator();
-                var block = self.decoder.decode(allocator, bytes) catch |err| switch (err) {
+                return session;
+            }
+
+            fn decodeRequestHead(self: *Controller, session: *Session, bytes: []const u8) !?header_semantics.RequestHead {
+                const block = self.decoder.decode(session.arena.allocator(), bytes) catch |err| switch (err) {
                     error.HeaderListTooLarge, error.TooManyHeaderFields => {
-                        self.streamFailure(stream_id, .enhance_your_calm, err);
+                        self.streamFailure(session.id, .enhance_your_calm, err);
                         return null;
                     },
                     else => return self.connectionFailure(.compression_error, err),
                 };
                 const head = header_semantics.parseRequest(block.items, self.owner.options.enable_extended_connect) catch |err| {
-                    self.streamFailure(stream_id, .protocol_error, err);
+                    self.streamFailure(session.id, .protocol_error, err);
                     return null;
                 };
                 if (head.content_length) |length| if (length > self.owner.options.max_body_size) {
-                    self.streamFailure(stream_id, .cancel, error.BodyTooLarge);
+                    self.streamFailure(session.id, .cancel, error.BodyTooLarge);
                     return null;
                 };
+                return head;
+            }
 
+            fn initializeRequest(self: *Controller, session: *Session, head: header_semantics.RequestHead, end_stream: bool) !bool {
+                const allocator = session.arena.allocator();
                 const input_storage = try allocator.alloc(u8, self.owner.options.request_body_buffer_size);
                 const input = try allocator.create(inbound_body.Pipe);
                 session.input = input;
                 session.content_length = head.content_length;
                 input.* = try .init(self.io, input_storage, .{ .context = session, .consumed_fn = Session.credit });
+
                 const body_state = try allocator.create(RequestBody.State);
                 body_state.* = if (end_stream)
                     RequestBody.State.initAbsent()
@@ -561,19 +548,16 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     );
                 session.body_state = body_state;
                 session.request = request_adapter.build(head, .init(body_state)) catch |err| {
-                    self.streamFailure(stream_id, .protocol_error, err);
-                    return null;
+                    self.streamFailure(session.id, .protocol_error, err);
+                    return false;
                 };
-                if (end_stream) {
-                    self.verifyBodyEnd(session) catch |err| {
-                        self.streamFailure(stream_id, .protocol_error, err);
-                        return null;
-                    };
-                    input.finish();
-                }
-                _ = &block;
-                committed = true;
-                return session;
+                if (!end_stream) return true;
+                self.verifyBodyEnd(session) catch |err| {
+                    self.streamFailure(session.id, .protocol_error, err);
+                    return false;
+                };
+                input.finish();
+                return true;
             }
 
             fn handleData(self: *Controller, stream_id: u32, flow_length: u32, payload: frame.Data) !void {
@@ -686,7 +670,33 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 };
             }
 
+            const OutputChunk = struct {
+                bytes: []const u8,
+                producer_finished: bool,
+            };
+
+            const OutputInspection = union(enum) {
+                ready: OutputChunk,
+                not_ready,
+                failed,
+            };
+
             fn scheduleOutput(self: *Controller) !bool {
+                const session = self.selectReadySession() orelse return false;
+                const stream = self.registry.get(session.id) orelse return false;
+                const inspection = self.inspectOutput(session, self.outputAllowance(stream));
+                const chunk = switch (inspection) {
+                    .ready => |ready| ready,
+                    .not_ready => return false,
+                    .failed => return true,
+                };
+                if (chunk.bytes.len != 0) return self.emitData(session, stream, chunk);
+                if (!chunk.producer_finished) return false;
+                try self.finishOutput(session, stream);
+                return true;
+            }
+
+            fn selectReadySession(self: *Controller) ?*Session {
                 var selected: ?*Session = null;
                 var selected_id: u32 = std.math.maxInt(u32);
                 var wrapped: ?*Session = null;
@@ -695,83 +705,91 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 while (iterator.next()) |entry| {
                     const session = entry.value_ptr.*;
                     if (!self.outputReady(session)) continue;
-                    if (entry.key_ptr.* > self.round_robin_after and entry.key_ptr.* < selected_id) {
+                    const stream_id = entry.key_ptr.*;
+                    if (stream_id > self.round_robin_after and stream_id < selected_id) {
                         selected = session;
-                        selected_id = entry.key_ptr.*;
+                        selected_id = stream_id;
                     }
-                    if (entry.key_ptr.* < wrapped_id) {
+                    if (stream_id < wrapped_id) {
                         wrapped = session;
-                        wrapped_id = entry.key_ptr.*;
+                        wrapped_id = stream_id;
                     }
                 }
-                const session = selected orelse wrapped orelse return false;
-                const stream = self.registry.get(session.id) orelse return false;
-                const allowance: usize = if (stream.send_window.value > 0 and self.connection_send_window.value > 0)
-                    @intCast(@min(
-                        @as(i64, self.writer.peer_max_frame_size),
-                        @min(stream.send_window.value, self.connection_send_window.value),
-                    ))
-                else
-                    0;
-                const response = &session.response.?;
-                var bytes: []const u8 = &.{};
-                var producer_finished = false;
+                return selected orelse wrapped;
+            }
+
+            fn outputAllowance(self: *Controller, stream: *stream_module.Stream) usize {
+                if (stream.send_window.value <= 0 or self.connection_send_window.value <= 0) return 0;
+                return @intCast(@min(
+                    @as(i64, self.writer.peer_max_frame_size),
+                    @min(stream.send_window.value, self.connection_send_window.value),
+                ));
+            }
+
+            fn inspectOutput(self: *Controller, session: *Session, allowance: usize) OutputInspection {
                 if (session.tunnel) {
-                    const output = session.output orelse return false;
-                    bytes = output.peek(allowance);
-                    producer_finished = output.isFinished() and bytes.len == 0;
+                    const output = session.output orelse return .not_ready;
                     if (output.failure()) |err| {
                         self.streamFailure(session.id, .connect_error, err);
-                        return true;
+                        return .failed;
                     }
-                } else switch (response.body) {
-                    .empty => producer_finished = true,
-                    .bytes => |body| {
-                        bytes = body[session.bytes_offset..][0..@min(allowance, body.len - session.bytes_offset)];
-                        producer_finished = session.bytes_offset + bytes.len == body.len;
+                    const bytes = output.peek(allowance);
+                    return .{ .ready = .{ .bytes = bytes, .producer_finished = output.isFinished() and bytes.len == 0 } };
+                }
+
+                return switch (session.response.?.body) {
+                    .empty => .{ .ready = .{ .bytes = &.{}, .producer_finished = true } },
+                    .bytes => |body| blk: {
+                        const bytes = body[session.bytes_offset..][0..@min(allowance, body.len - session.bytes_offset)];
+                        break :blk .{ .ready = .{
+                            .bytes = bytes,
+                            .producer_finished = session.bytes_offset + bytes.len == body.len,
+                        } };
                     },
                     .stream => {
-                        const output = session.output orelse return false;
-                        bytes = output.peek(allowance);
-                        producer_finished = output.isFinished() and bytes.len == 0;
+                        const output = session.output orelse return .not_ready;
                         if (output.failure()) |err| {
                             self.streamFailure(session.id, .internal_error, err);
-                            return true;
+                            return .failed;
                         }
+                        const bytes = output.peek(allowance);
+                        return .{ .ready = .{ .bytes = bytes, .producer_finished = output.isFinished() and bytes.len == 0 } };
                     },
-                }
-                if (bytes.len != 0) {
-                    const end_stream = producer_finished and (session.tunnel or switch (response.body) {
-                        .stream => |body| body.trailer_names.len == 0,
-                        else => true,
-                    });
-                    try self.writer.writeData(session.id, bytes, end_stream);
-                    try stream.sendData(bytes.len, end_stream);
-                    try self.connection_send_window.consume(bytes.len);
-                    if (session.tunnel) {
-                        session.output.?.consume(bytes.len);
-                    } else switch (response.body) {
-                        .bytes => session.bytes_offset += bytes.len,
-                        .stream => session.output.?.consume(bytes.len),
-                        .empty => unreachable,
-                    }
-                    session.response_bytes_sent += bytes.len;
-                    if (end_stream) try self.completeOutput(session);
-                    self.round_robin_after = session.id;
-                    return true;
-                }
-                if (!producer_finished) return false;
+                };
+            }
 
+            fn emitData(self: *Controller, session: *Session, stream: *stream_module.Stream, chunk: OutputChunk) !bool {
+                const response = &session.response.?;
+                const end_stream = chunk.producer_finished and (session.tunnel or switch (response.body) {
+                    .stream => |body| body.trailer_names.len == 0,
+                    else => true,
+                });
+                try self.writer.writeData(session.id, chunk.bytes, end_stream);
+                try stream.sendData(chunk.bytes.len, end_stream);
+                try self.connection_send_window.consume(chunk.bytes.len);
+                if (session.tunnel) {
+                    session.output.?.consume(chunk.bytes.len);
+                } else switch (response.body) {
+                    .bytes => session.bytes_offset += chunk.bytes.len,
+                    .stream => session.output.?.consume(chunk.bytes.len),
+                    .empty => unreachable,
+                }
+                session.response_bytes_sent += chunk.bytes.len;
+                if (end_stream) try self.completeOutput(session);
+                self.round_robin_after = session.id;
+                return true;
+            }
+
+            fn finishOutput(self: *Controller, session: *Session, stream: *stream_module.Stream) !void {
+                const response = &session.response.?;
                 if (response.body == .stream and response.body.stream.trailer_names.len != 0 and !session.trailers_sent) {
                     try self.writeTrailers(session, session.response_trailers);
                     session.trailers_sent = true;
-                    try self.completeOutput(session);
-                    return true;
+                    return self.completeOutput(session);
                 }
                 try self.writer.writeData(session.id, &.{}, true);
                 try stream.sendData(0, true);
                 try self.completeOutput(session);
-                return true;
             }
 
             fn writeTrailers(self: *Controller, session: *Session, trailer_fields: Headers) !void {
@@ -898,7 +916,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         pub fn handle(self: *Self, stream: net.Stream, control: ConnectionControl, io: Io) !void {
             defer stream.close(io);
-            try validateOptions(self.options);
+            try options_module.validate(self.options);
             const read_buffer = try self.allocator.alloc(u8, self.options.read_buffer_size);
             defer self.allocator.free(read_buffer);
             const write_buffer = try self.allocator.alloc(u8, self.options.write_buffer_size);
@@ -911,7 +929,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         pub fn serve(self: *Self, input: *Io.Reader, output: *Io.Writer, io: Io) !void {
-            try validateOptions(self.options);
+            try options_module.validate(self.options);
             var controller: Controller = undefined;
             try controller.init(self, input, output, null, io);
             defer controller.deinit();
@@ -919,7 +937,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         pub fn serveControlled(self: *Self, input: *Io.Reader, output: *Io.Writer, control: ConnectionControl, io: Io) !void {
-            try validateOptions(self.options);
+            try options_module.validate(self.options);
             var controller: Controller = undefined;
             try controller.init(self, input, output, control, io);
             defer controller.deinit();
@@ -1563,21 +1581,4 @@ fn connectionErrorCode(err: anyerror) errors.Code {
         error.HeaderBlockTooLarge => .enhance_your_calm,
         else => .protocol_error,
     };
-}
-
-fn validateOptions(options: Options) !void {
-    if (options.max_concurrent_streams == 0 or options.max_concurrent_streams > std.math.maxInt(u32)) return error.InvalidConcurrentStreamLimit;
-    if (options.frame_queue_slots == 0) return error.InvalidFrameQueueSlots;
-    if (options.max_frame_size < frame.default_max_frame_size or options.max_frame_size > frame.maximum_frame_size) return error.InvalidFrameSize;
-    if (options.max_header_block_size == 0 or options.max_header_list_size == 0 or options.max_header_count == 0) return error.InvalidHeaderLimits;
-    if (options.max_header_name_size == 0 or options.max_header_string_size == 0) return error.InvalidHeaderLimits;
-    if (options.header_table_size > std.math.maxInt(u32)) return error.InvalidHeaderTableSize;
-    if (options.request_body_buffer_size < 65_535 or options.request_body_buffer_size > 0x7fff_ffff) return error.InvalidBodyBufferSize;
-    if (options.request_body_timeout) |timeout| if (timeout.nanoseconds <= 0) return error.InvalidRequestBodyTimeout;
-    if (options.response_write_timeout) |timeout| if (timeout.nanoseconds <= 0) return error.InvalidResponseWriteTimeout;
-    if (options.settings_ack_timeout) |timeout| if (timeout.nanoseconds <= 0) return error.InvalidSettingsTimeout;
-    if (options.max_request_trailer_count == 0 or options.max_request_trailer_size == 0 or
-        options.max_response_trailer_count == 0 or options.max_response_trailer_size == 0) return error.InvalidTrailerLimits;
-    if (options.response_body_buffer_size == 0 or options.response_writer_buffer_size == 0) return error.InvalidBodyBufferSize;
-    if (options.read_buffer_size == 0 or options.write_buffer_size == 0 or options.control_queue_capacity == 0) return error.InvalidBufferSize;
 }
