@@ -3,7 +3,9 @@
 const std = @import("std");
 const context_module = @import("../../context.zig");
 const Exchange = @import("../../exchange.zig").Exchange;
-const Headers = @import("../../message/headers.zig").Headers;
+const headers_module = @import("../../message/headers.zig");
+const Header = headers_module.Header;
+const Headers = headers_module.Headers;
 const Request = @import("../../message/request.zig").Request;
 const RequestBody = @import("../../message/request_body.zig").RequestBody;
 const response_module = @import("../../message/response.zig");
@@ -41,6 +43,8 @@ pub const Options = struct {
     header_table_size: usize = 4096,
     request_body_buffer_size: usize = 65_535,
     max_body_size: usize = 1024 * 1024,
+    request_body_timeout: ?Io.Duration = null,
+    response_write_timeout: ?Io.Duration = null,
     max_request_trailer_count: usize = 32,
     max_request_trailer_size: usize = 8 * 1024,
     max_response_trailer_count: usize = 32,
@@ -78,6 +82,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             response_ready: *Session,
             task_done: TaskDone,
             informational: *Informational,
+            response_timeout: u32,
             drain,
         };
         const MessageQueue = Io.Queue(Message);
@@ -127,6 +132,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             output_done: bool = false,
             bytes_offset: usize = 0,
             trailers_sent: bool = false,
+            response_trailers: Headers = .empty,
             tunnel: bool = false,
 
             fn deinit(self: *Session) void {
@@ -334,6 +340,11 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                         };
                         operation.done.set(self.io);
                     },
+                    .response_timeout => |stream_id| {
+                        if (self.sessions.get(stream_id)) |session| {
+                            if (!session.output_done) self.streamFailure(stream_id, .cancel, error.ResponseTimeout);
+                        }
+                    },
                     .drain => try self.beginDrain(),
                 }
             }
@@ -508,7 +519,13 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 body_state.* = if (end_stream)
                     RequestBody.State.initAbsent()
                 else
-                    RequestBody.State.initPending(.borrowed(input), allocator, self.owner.options.max_body_size, self.io, null);
+                    RequestBody.State.initPending(
+                        .borrowed(input),
+                        allocator,
+                        self.owner.options.max_body_size,
+                        self.io,
+                        self.owner.options.request_body_timeout,
+                    );
                 session.body_state = body_state;
                 session.request = request_adapter.build(head, .init(body_state)) catch |err| {
                     self.streamFailure(stream_id, .protocol_error, err);
@@ -574,6 +591,9 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
             fn startResponse(self: *Controller, session: *Session) !void {
                 const response = &session.response.?;
+                if (response.write_deadline) |deadline| {
+                    self.tasks.async(self.io, responseTimer, .{ deadline, session.id, &self.messages, &self.wake, self.io });
+                }
                 if (response.body == .stream) try trailer_policy.validateNames(
                     response.body.stream.trailer_names,
                     self.owner.options.max_response_trailer_count,
@@ -698,8 +718,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 if (!producer_finished) return false;
 
                 if (response.body == .stream and response.body.stream.trailer_names.len != 0 and !session.trailers_sent) {
-                    const trailers = response.body.stream.trailers();
-                    try self.writeTrailers(session, trailers);
+                    try self.writeTrailers(session, session.response_trailers);
                     session.trailers_sent = true;
                     self.completeOutput(session);
                     return true;
@@ -878,21 +897,17 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 .internal_server_error => Response{ .status = .internal_server_error },
                 .reset_stream => return err,
             };
+            defer response.body.finalize();
+            defer if (response.takeover) |*takeover| takeover.finalize();
+            if (response.write_deadline == null) if (owner.options.response_write_timeout) |duration| {
+                response.write_deadline = .fromNow(io, .{ .raw = duration, .clock = .awake });
+            };
             exchange.beginFinal();
             if (response.takeover) |takeover| switch (takeover.kind) {
-                .upgrade => {
-                    response.body.finalize();
-                    return error.UnsupportedHttp2Upgrade;
-                },
+                .upgrade => return error.UnsupportedHttp2Upgrade,
                 .tunnel => {
-                    if (!session.request.method.is(.CONNECT) or response.status.class() != .success) {
-                        response.body.finalize();
-                        return error.InvalidHttp2Tunnel;
-                    }
-                    if (response.body != .empty) {
-                        response.body.finalize();
-                        return error.TunnelResponseBodyConflict;
-                    }
+                    if (!session.request.method.is(.CONNECT) or response.status.class() != .success) return error.InvalidHttp2Tunnel;
+                    if (response.body != .empty) return error.TunnelResponseBodyConflict;
                     session.tunnel = true;
                 },
             };
@@ -908,24 +923,87 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             wake.signal();
             try session.response_started.wait(io);
 
+            if (session.tunnel or session.response.?.body == .stream) {
+                try runProducer(session, allocator, io);
+            }
+        }
+
+        fn runProducer(session: *Session, allocator: std.mem.Allocator, io: Io) !void {
+            const deadline = session.response.?.write_deadline orelse return produce(session, allocator);
+            const Race = union(enum) {
+                produce: anyerror!void,
+                timeout: anyerror!void,
+            };
+            var results: [2]Race = undefined;
+            var select = Io.Select(Race).init(io, &results);
+            select.async(.produce, produce, .{ session, allocator });
+            select.async(.timeout, waitUntil, .{ deadline, io });
+            const result = select.await() catch |err| {
+                select.cancelDiscard();
+                return err;
+            };
+            defer select.cancelDiscard();
+            switch (result) {
+                .produce => |produce_result| try produce_result,
+                .timeout => |timeout_result| {
+                    try timeout_result;
+                    session.output.?.abort(error.ResponseTimeout);
+                    return error.ResponseTimeout;
+                },
+            }
+        }
+
+        fn produce(session: *Session, allocator: std.mem.Allocator) !void {
             if (session.tunnel) {
                 const input = try session.input.activate(allocator);
                 var takeover = &session.response.?.takeover.?;
-                defer takeover.finalize();
                 takeover.run(input, &session.output.?.writer) catch |err| {
                     session.output.?.abort(err);
                     return err;
                 };
                 try session.output.?.finish();
-            } else if (session.response.?.body == .stream) {
-                var body = &session.response.?.body.stream;
-                defer body.finalize();
-                body.produce(&session.output.?.writer) catch |err| {
-                    session.output.?.abort(err);
-                    return err;
-                };
-                try session.output.?.finish();
+                return;
             }
+
+            var body = &session.response.?.body.stream;
+            body.produce(&session.output.?.writer) catch |err| {
+                session.output.?.abort(err);
+                return err;
+            };
+            session.response_trailers = try copyHeaders(allocator, body.trailers());
+            try session.output.?.finish();
+        }
+
+        fn waitUntil(deadline: Io.Clock.Timestamp, io: Io) anyerror!void {
+            try deadline.wait(io);
+        }
+
+        fn copyHeaders(allocator: std.mem.Allocator, headers: Headers) !Headers {
+            const fields = try allocator.alloc(Header, headers.items.len);
+            for (headers.items, fields) |source, *destination| {
+                destination.* = .{
+                    .name = try allocator.dupe(u8, source.name),
+                    .value = try allocator.dupe(u8, source.value),
+                };
+            }
+            return .{ .items = fields };
+        }
+
+        fn responseTimer(
+            deadline: Io.Clock.Timestamp,
+            stream_id: u32,
+            messages: *MessageQueue,
+            wake: *Wake,
+            io: Io,
+        ) Io.Cancelable!void {
+            deadline.wait(io) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+            };
+            messages.putOne(io, .{ .response_timeout = stream_id }) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.Closed => return,
+            };
+            wake.signal();
         }
 
         fn readFrames(queue: *frame_queue.Queue, input: *Io.Reader) Io.Cancelable!void {
@@ -1126,6 +1204,45 @@ test "HTTP/2 request and response trailers survive stream boundaries" {
     try std.testing.expectEqual(@as(usize, 2), serverFrameCount(output.written(), .headers, 1));
 }
 
+test "HTTP/2 response deadline cancels and finalizes a blocked producer" {
+    const AppState = struct { finalized: usize = 0 };
+    const Producer = struct {
+        io: Io,
+        state: *AppState,
+        pub fn produce(self: *@This(), _: *Io.Writer) !void {
+            try Io.sleep(self.io, .fromSeconds(60), .awake);
+        }
+        pub fn finalize(self: *@This()) void {
+            self.state.finalized += 1;
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            const body = try response_module.Stream.init(context.execution.allocator, Producer{
+                .io = context.execution.io,
+                .state = context.execution.state,
+            }, .{});
+            return Response.streaming(.ok, .empty, body);
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(6));
+    const bytes = frame.client_preface ++
+        "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++
+        "\x00\x00\x03\x01\x05\x00\x00\x00\x01\x82\x87\x84";
+    var input: Io.Reader = .fixed(bytes);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: AppState = .{};
+    var handler = Handler(AppState, Dispatcher).init(std.testing.allocator, &state, .{
+        .response_write_timeout = .fromMilliseconds(1),
+    });
+    try handler.serve(&input, &output.writer, threaded.io());
+    try std.testing.expectEqual(@as(usize, 1), state.finalized);
+    try std.testing.expect(serverOutputContains(output.written(), .rst_stream, 1));
+}
+
 test "HTTP/2 response stream backpressures only its producer" {
     const AppState = struct {};
     const Producer = struct {
@@ -1282,6 +1399,8 @@ fn validateOptions(options: Options) !void {
     if (options.max_header_name_size == 0 or options.max_header_string_size == 0) return error.InvalidHeaderLimits;
     if (options.header_table_size > std.math.maxInt(u32)) return error.InvalidHeaderTableSize;
     if (options.request_body_buffer_size < 65_535 or options.request_body_buffer_size > 0x7fff_ffff) return error.InvalidBodyBufferSize;
+    if (options.request_body_timeout) |timeout| if (timeout.nanoseconds <= 0) return error.InvalidRequestBodyTimeout;
+    if (options.response_write_timeout) |timeout| if (timeout.nanoseconds <= 0) return error.InvalidResponseWriteTimeout;
     if (options.max_request_trailer_count == 0 or options.max_request_trailer_size == 0 or
         options.max_response_trailer_count == 0 or options.max_response_trailer_size == 0) return error.InvalidTrailerLimits;
     if (options.response_body_buffer_size == 0 or options.response_writer_buffer_size == 0) return error.InvalidBodyBufferSize;
