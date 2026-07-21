@@ -12,6 +12,7 @@ pub const HandlerErrorPolicy = enum {
 pub const Options = struct {
     max_concurrent_streams: usize = 100,
     frame_queue_slots: usize = 16,
+    output_batch_size: usize = 16,
     max_frame_size: usize = frame.default_max_frame_size,
     max_header_block_size: usize = 64 * 1024,
     max_header_list_size: usize = 64 * 1024,
@@ -40,6 +41,7 @@ pub const Options = struct {
 pub fn validate(options: Options) !void {
     if (options.max_concurrent_streams == 0 or options.max_concurrent_streams > std.math.maxInt(u32)) return error.InvalidConcurrentStreamLimit;
     if (options.frame_queue_slots == 0) return error.InvalidFrameQueueSlots;
+    if (options.output_batch_size == 0) return error.InvalidOutputBatchSize;
     if (options.max_frame_size < frame.default_max_frame_size or options.max_frame_size > frame.maximum_frame_size) return error.InvalidFrameSize;
     if (options.max_header_block_size == 0 or options.max_header_list_size == 0 or options.max_header_count == 0) return error.InvalidHeaderLimits;
     if (options.max_header_name_size == 0 or options.max_header_string_size == 0) return error.InvalidHeaderLimits;
@@ -52,4 +54,15 @@ pub fn validate(options: Options) !void {
         options.max_response_trailer_count == 0 or options.max_response_trailer_size == 0) return error.InvalidTrailerLimits;
     if (options.response_body_buffer_size == 0 or options.response_writer_buffer_size == 0) return error.InvalidBodyBufferSize;
     if (options.read_buffer_size == 0 or options.write_buffer_size == 0 or options.control_queue_capacity == 0) return error.InvalidBufferSize;
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+test "HTTP/2 connection options validate independent input and output batching" {
+    try validate(.{});
+    try std.testing.expectError(error.InvalidFrameQueueSlots, validate(.{ .frame_queue_slots = 0 }));
+    try std.testing.expectError(error.InvalidOutputBatchSize, validate(.{ .output_batch_size = 0 }));
+    try validate(.{ .frame_queue_slots = 1, .output_batch_size = 64 });
 }

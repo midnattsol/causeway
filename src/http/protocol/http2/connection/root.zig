@@ -169,7 +169,6 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             peer_settings: settings.Values = .{},
             connection_receive_window: stream_module.Window = .{},
             connection_send_window: stream_module.Window = .{},
-            pending_header_stream: ?u32 = null,
             pending_header_end_stream: bool = false,
             received_initial_settings: bool = false,
             awaiting_settings_ack: bool = true,
@@ -260,7 +259,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     progressed = try self.processMessages() or progressed;
                     progressed = try self.processFrames() or progressed;
                     progressed = try self.returnCredits() or progressed;
-                    var output_budget = self.owner.options.frame_queue_slots;
+                    var output_budget = self.owner.options.output_batch_size;
                     while (output_budget != 0 and try self.scheduleOutput()) : (output_budget -= 1) progressed = true;
                     progressed = self.collectSessions() or progressed;
 
@@ -430,7 +429,6 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     };
                     _ = try stream.receiveHeaders(payload.end_stream);
                 }
-                self.pending_header_stream = stream_id;
                 self.pending_header_end_stream = payload.end_stream;
                 if (self.assembler.begin(stream_id, payload.fragment, payload.end_headers) catch |err| return self.connectionFailure(
                     if (err == error.HeaderBlockTooLarge) .enhance_your_calm else .protocol_error,
@@ -453,7 +451,6 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
 
             fn clearPendingHeader(self: *Controller) void {
-                self.pending_header_stream = null;
                 self.pending_header_end_stream = false;
             }
 
