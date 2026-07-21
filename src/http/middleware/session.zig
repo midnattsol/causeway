@@ -268,12 +268,14 @@ fn testContext(
     cookie_header: ?[]const u8,
 ) TestContext {
     const Headers = @import("../message/headers.zig").Headers;
+    const request_headers = if (cookie_header) |value| headers: {
+        const item = allocator.create(@import("../message/headers.zig").Header) catch unreachable;
+        item.* = .{ .name = "cookie", .value = value };
+        break :headers Headers{ .items = item[0..1] };
+    } else Headers.empty;
     return .{
         .locals = locals,
-        .request = .{ .headers = if (cookie_header) |value|
-            Headers{ .items = &.{.{ .name = "cookie", .value = value }} }
-        else
-            .empty },
+        .request = .{ .headers = request_headers },
         .execution = .{ .allocator = allocator },
         .backend = backend,
     };
