@@ -3,7 +3,7 @@
 const request_module = @import("../../message/request.zig");
 const Request = request_module.Request;
 const RequestBody = @import("../../message/request_body.zig").RequestBody;
-const RequestHead = @import("header_semantics.zig").RequestHead;
+const RequestHead = @import("headers/semantics.zig").RequestHead;
 
 pub fn build(head: RequestHead, body: RequestBody) !Request {
     var request = try Request.initVersion(
@@ -24,7 +24,7 @@ pub fn build(head: RequestHead, body: RequestBody) !Request {
 // -----------------------------------------------------------------------------
 
 const std = @import("std");
-const semantics = @import("header_semantics.zig");
+const semantics = @import("headers/semantics.zig");
 const Header = @import("../../message/headers.zig").Header;
 
 test "HTTP/2 request conversion preserves wire metadata" {

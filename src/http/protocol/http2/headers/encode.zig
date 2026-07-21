@@ -1,9 +1,9 @@
 //! HTTP/2 response-head validation and HPACK encoding.
 
 const std = @import("std");
-const Header = @import("../../message/headers.zig").Header;
-const Headers = @import("../../message/headers.zig").Headers;
-const hpack = @import("hpack/codec.zig");
+const Header = @import("../../../message/headers.zig").Header;
+const Headers = @import("../../../message/headers.zig").Headers;
+const hpack = @import("../hpack/codec.zig");
 const Io = std.Io;
 
 pub fn encode(

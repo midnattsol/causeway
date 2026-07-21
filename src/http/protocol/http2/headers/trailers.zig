@@ -1,7 +1,7 @@
 //! HTTP trailer policy shared by HTTP/2 request and response streams.
 
 const std = @import("std");
-const Headers = @import("../../message/headers.zig").Headers;
+const Headers = @import("../../../message/headers.zig").Headers;
 
 pub fn validateIncoming(fields: Headers, maximum_count: usize, maximum_size: usize) !void {
     if (fields.len() > maximum_count) return error.TooManyTrailers;

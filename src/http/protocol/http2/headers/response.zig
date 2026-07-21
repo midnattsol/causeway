@@ -1,9 +1,9 @@
 //! Protocol-specific planning for final HTTP/2 responses.
 
 const std = @import("std");
-const Headers = @import("../../message/headers.zig").Headers;
-const Method = @import("../../message/request.zig").Method;
-const response_module = @import("../../message/response.zig");
+const Headers = @import("../../../message/headers.zig").Headers;
+const Method = @import("../../../message/request.zig").Method;
+const response_module = @import("../../../message/response.zig");
 const Response = response_module.Response;
 
 pub const Plan = struct {

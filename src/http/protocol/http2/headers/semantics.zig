@@ -1,8 +1,8 @@
 //! HTTP/2 pseudo-header and field semantics after HPACK decoding.
 
 const std = @import("std");
-const headers_module = @import("../../message/headers.zig");
-const request_module = @import("../../message/request.zig");
+const headers_module = @import("../../../message/headers.zig");
+const request_module = @import("../../../message/request.zig");
 const Header = headers_module.Header;
 const Headers = headers_module.Headers;
 
