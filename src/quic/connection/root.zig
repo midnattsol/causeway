@@ -26,6 +26,7 @@ pub const Limits = struct {
     ack_ranges: usize = 16,
     sent_packets: usize = 64,
     tls_output_bytes: usize = 8192,
+    tls_transcript_bytes: usize = 16 * 1024,
     max_datagram_size: usize = 1200,
 };
 
