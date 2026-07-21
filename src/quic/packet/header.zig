@@ -44,8 +44,9 @@ pub fn parse(datagram: []const u8, short_destination_id_length: usize) !Header {
     var cursor: usize = 1;
     const version = std.mem.readInt(u32, datagram[cursor..][0..4], .big);
     cursor += 4;
-    const destination_id = try readConnectionId(datagram, &cursor);
-    const source_id = try readConnectionId(datagram, &cursor);
+    const maximum_id_length: usize = if (version == 0) std.math.maxInt(u8) else maximum_connection_id_length;
+    const destination_id = try readConnectionId(datagram, &cursor, maximum_id_length);
+    const source_id = try readConnectionId(datagram, &cursor, maximum_id_length);
     if (version == 0) {
         if ((datagram.len - cursor) % 4 != 0) return error.InvalidVersionNegotiation;
         return .{
@@ -149,11 +150,11 @@ fn parseRetry(
     };
 }
 
-fn readConnectionId(datagram: []const u8, cursor: *usize) ![]const u8 {
+fn readConnectionId(datagram: []const u8, cursor: *usize, maximum_length: usize) ![]const u8 {
     if (cursor.* == datagram.len) return error.TruncatedPacket;
     const length = datagram[cursor.*];
     cursor.* += 1;
-    if (length > maximum_connection_id_length) return error.InvalidConnectionIdLength;
+    if (length > maximum_length) return error.InvalidConnectionIdLength;
     if (length > datagram.len - cursor.*) return error.TruncatedPacket;
     const id = datagram[cursor.* .. cursor.* + length];
     cursor.* += length;

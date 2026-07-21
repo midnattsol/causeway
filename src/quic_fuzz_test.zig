@@ -6,6 +6,8 @@ const frame = @import("quic/frame/root.zig");
 const packet_header = @import("quic/packet/header.zig");
 const packet_number = @import("quic/packet/number.zig");
 const packet_protection = @import("quic/packet/protection.zig");
+const retry = @import("quic/packet/retry.zig");
+const version_negotiation = @import("quic/packet/version_negotiation.zig");
 
 const corpus = &.{
     "\x00",
@@ -36,6 +38,9 @@ fn fuzzQuic(_: std.Io, smith: *std.testing.Smith) !void {
     while (frames.next() catch null) |_| {}
 
     _ = packet_header.parse(input, if (input.len == 0) 0 else input[0] % 21) catch {};
+    var retry_scratch: [2069]u8 = undefined;
+    _ = retry.validate(input, &.{}, &.{}, &retry_scratch) catch {};
+    _ = version_negotiation.validate(input, &.{}, &.{}, 1, false) catch {};
     fuzzInitialProtection(input);
     if (input.len >= 6) {
         const encoded_length: u3 = @intCast(input[0] % 4 + 1);
