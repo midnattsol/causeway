@@ -8,6 +8,7 @@ pub const frame = @import("frame/root.zig");
 pub const packet = @import("packet/root.zig");
 pub const recovery = @import("recovery/root.zig");
 pub const stream = @import("stream/root.zig");
+pub const tls = @import("tls/root.zig");
 
 // -----------------------------------------------------------------------------
 // Tests

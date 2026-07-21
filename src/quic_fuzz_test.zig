@@ -13,6 +13,7 @@ const loss = @import("quic/recovery/loss.zig");
 const packet_space = @import("quic/recovery/packet_space.zig");
 const rtt = @import("quic/recovery/rtt.zig");
 const stream = @import("quic/stream/root.zig");
+const quic_tls = @import("quic/tls/root.zig");
 
 const corpus = &.{
     "\x00",
@@ -59,6 +60,7 @@ fn fuzzQuic(_: std.Io, smith: *std.testing.Smith) !void {
     fuzzLossDetection(input);
     fuzzStreamReceive(input);
     fuzzStreamSend(input);
+    fuzzTlsWire(input);
     if (input.len >= 6) {
         const encoded_length: u3 = @intCast(input[0] % 4 + 1);
         const truncated = try packet_number.decodeTruncated(input[1 .. 1 + encoded_length]);
@@ -168,6 +170,32 @@ fn fuzzStreamSend(input: []const u8) void {
         }
     }
     std.testing.expectEqual(stream.send.State.data_received, sender.state) catch @panic("stream send schedule did not terminate");
+}
+
+fn fuzzTlsWire(input: []const u8) void {
+    const handshake = quic_tls.parseHandshake(input) catch return;
+    const hello = handshake.clientHello() catch return;
+
+    var extensions = hello.extensionIterator();
+    while (extensions.next()) |_| {}
+    var cipher_suites = hello.cipherSuiteIterator();
+    while (cipher_suites.next()) |_| {}
+    var versions = hello.supportedVersionIterator();
+    while (versions.next()) |_| {}
+    var groups = hello.supportedGroupIterator();
+    while (groups.next()) |_| {}
+    var signatures = hello.signatureSchemeIterator();
+    while (signatures.next()) |_| {}
+    var key_shares = hello.keyShareIterator();
+    while (key_shares.next()) |_| {}
+    var names = hello.serverNameIterator();
+    while (names.next()) |_| {}
+    var protocols = hello.protocolIterator();
+    while (protocols.next()) |_| {}
+    _ = hello.selectH3();
+    _ = hello.selectCipherSuite(&.{ .AES_128_GCM_SHA256, .CHACHA20_POLY1305_SHA256 });
+    _ = hello.selectX25519KeyShare();
+    _ = hello.selectSignatureScheme(&.{ .ecdsa_secp256r1_sha256, .ed25519 });
 }
 
 fn fuzzTransportParameters(input: []const u8, role: transport_parameters.Role) !void {
