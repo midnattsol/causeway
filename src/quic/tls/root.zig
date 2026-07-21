@@ -1,13 +1,13 @@
 //! QUIC TLS 1.3 wire parsing, server handshake encoding, semantic negotiation,
 //! and key derivation.
 //!
-//! Handshake state and certificate credential handling remain outside this
-//! isolated cryptographic phase.
+//! Handshake state remains outside this isolated cryptographic phase.
 
 const std = @import("std");
 
 pub const wire = @import("wire.zig");
 pub const encoder = @import("encoder.zig");
+pub const credentials = @import("credentials.zig");
 pub const negotiation = @import("negotiation.zig");
 pub const key_schedule = @import("key_schedule.zig");
 pub const packet_keys = @import("packet_keys.zig");
@@ -24,6 +24,7 @@ pub const encodeEncryptedExtensions = encoder.encodeEncryptedExtensions;
 pub const encodeCertificate = encoder.encodeCertificate;
 pub const encodeCertificateVerify = encoder.encodeCertificateVerify;
 pub const encodeFinished = encoder.encodeFinished;
+pub const ServerCredentials = credentials.ServerCredentials;
 
 // -----------------------------------------------------------------------------
 // Tests
