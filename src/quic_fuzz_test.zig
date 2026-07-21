@@ -8,6 +8,7 @@ const packet_number = @import("quic/packet/number.zig");
 const packet_protection = @import("quic/packet/protection.zig");
 const retry = @import("quic/packet/retry.zig");
 const version_negotiation = @import("quic/packet/version_negotiation.zig");
+const packet_space = @import("quic/recovery/packet_space.zig");
 
 const corpus = &.{
     "\x00",
@@ -50,6 +51,7 @@ fn fuzzQuic(_: std.Io, smith: *std.testing.Smith) !void {
     _ = retry.validate(input, &.{}, &.{}, &retry_scratch) catch {};
     _ = version_negotiation.validate(input, &.{}, &.{}, 1, false) catch {};
     fuzzInitialProtection(input);
+    fuzzAckTracker(input);
     if (input.len >= 6) {
         const encoded_length: u3 = @intCast(input[0] % 4 + 1);
         const truncated = try packet_number.decodeTruncated(input[1 .. 1 + encoded_length]);
@@ -58,6 +60,21 @@ fn fuzzQuic(_: std.Io, smith: *std.testing.Smith) !void {
         var encoded: [4]u8 = undefined;
         _ = try packet_number.encode(&encoded, full, encoded_length);
     }
+}
+
+fn fuzzAckTracker(input: []const u8) void {
+    var tracker: packet_space.AckTracker(16) = .{};
+    var cursor: usize = 0;
+    while (cursor + 4 <= input.len) : (cursor += 4) {
+        _ = tracker.record(std.mem.readInt(u32, input[cursor..][0..4], .big));
+    }
+    if (tracker.largest() == null) return;
+    var ranges: [256]u8 = undefined;
+    const ack = tracker.ackFrame(0, null, &ranges) catch return;
+    var encoded: [512]u8 = undefined;
+    const bytes = frame.writer.encode(&encoded, ack) catch @panic("ACK tracker emitted an invalid frame");
+    var frame_cursor: usize = 0;
+    _ = frame.parseOne(bytes, &frame_cursor) catch @panic("ACK tracker emitted an unparsable frame");
 }
 
 fn fuzzTransportParameters(input: []const u8, role: transport_parameters.Role) !void {
