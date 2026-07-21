@@ -23,8 +23,8 @@ REST, GraphQL, OpenAPI, and adapters remain separate higher-level phases.
 
 ## Toolchain
 
-This project targets the active ZVM Zig master toolchain (`0.17.0-dev`). Protocol
-engines use only APIs verified against that toolchain.
+This project currently requires Zig `0.17.0-dev.1413+addc3c3b8`, a Zig master
+snapshot. Protocol engines use only APIs verified against that exact toolchain.
 
 ## Commands
 
@@ -55,7 +55,6 @@ iteration limit for CI and omit it for an interactive, continuous campaign.
 `http2-fuzz` mutates frames, HPACK and complete multiplexed connection
 sequences, while `http2-bench` reports frame-header and HPACK hot-path costs.
 
-The project uses the active ZVM master toolchain (`0.17.0-dev`).
 
 ## Examples
 
