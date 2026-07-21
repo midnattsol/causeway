@@ -1,5 +1,6 @@
 //! HTTP/3 RFC 9114 wire primitives and QPACK compression.
 
+pub const capsule = @import("capsule/root.zig");
 pub const connection = @import("connection/root.zig");
 pub const server = @import("server.zig");
 pub const frame = @import("frame/root.zig");
@@ -26,6 +27,7 @@ pub const RequestState = validation.RequestState;
 pub const ResponseState = validation.ResponseState;
 
 comptime {
+    _ = capsule;
     _ = connection;
     _ = server;
     _ = frame;
@@ -37,6 +39,7 @@ comptime {
 }
 
 test {
+    _ = capsule;
     _ = connection;
     _ = server;
     _ = frame;
