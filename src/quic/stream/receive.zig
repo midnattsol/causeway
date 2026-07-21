@@ -143,7 +143,10 @@ pub const Receiver = struct {
     pub fn consume(self: *Receiver, amount: usize) !void {
         const available = self.readableLen();
         if (amount > available) return error.ConsumeBeyondReadable;
-        if (amount == 0) return;
+        if (amount == 0) {
+            if (self.final_size != null and self.final_size.? == self.read_offset and self.state == .data_received) self.state = .data_read;
+            return;
+        }
         const old_offset = self.read_offset;
         const new_offset = old_offset + amount;
         try self.received.remove(.{ .start = old_offset, .end = new_offset });
@@ -197,6 +200,17 @@ test "receiver reassembles reorder and accepts identical overlap" {
     try std.testing.expect(duplicate.duplicate);
     try receiver.consume(10);
     try std.testing.expectEqual(State.data_read, receiver.state);
+}
+
+test "receiver marks an empty FIN delivered after zero-byte consumption" {
+    var bytes: [1]u8 = undefined;
+    var range_storage: [1]ranges.Range = undefined;
+    var receiver = try Receiver.init(&bytes, &range_storage, 1);
+    _ = try receiver.receive(0, "", true);
+    try std.testing.expectEqual(State.data_received, receiver.state);
+    try receiver.consume(0);
+    try std.testing.expectEqual(State.data_read, receiver.state);
+    try std.testing.expect(receiver.isFinished());
 }
 
 test "receiver rejects conflicting overlap and inconsistent final sizes" {

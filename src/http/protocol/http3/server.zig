@@ -232,7 +232,7 @@ const test_limits: quic.connection.Limits = .{
     .tls_output_bytes = 1024,
     .tls_transcript_bytes = 2048,
     .max_datagram_size = 1200,
-    .max_streams = 8,
+    .max_streams = 9,
     .stream_receive_bytes = 256,
     .stream_send_bytes = 512,
 };

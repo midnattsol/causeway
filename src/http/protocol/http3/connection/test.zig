@@ -57,6 +57,10 @@ const FakeConnection = struct {
         std.mem.copyForwards(u8, slot.input[0 .. slot.input_len - amount], slot.input[amount..slot.input_len]);
         slot.input_len -= amount;
     }
+    pub fn readStreamReset(self: *@This(), id: StreamId) !u64 {
+        _ = self.find(id) orelse return error.StreamNotFound;
+        return 0;
+    }
     pub fn writeStream(self: *@This(), id: StreamId, bytes: []const u8) !usize {
         const slot = try self.ensure(id);
         if (bytes.len > slot.output.len - slot.output_len) return error.SendBufferFull;

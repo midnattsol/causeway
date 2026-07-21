@@ -306,7 +306,7 @@ fn mapError(err: anyerror) u64 {
         error.StreamLimitError => types.CloseCode.stream_limit_error,
         error.StreamStateError => types.CloseCode.stream_state_error,
         error.FinalSizeError => types.CloseCode.final_size_error,
-        error.ReassemblyLimitExceeded, error.InsufficientRangeCapacity, error.StreamCapacityExceeded => types.CloseCode.internal_error,
+        error.ReassemblyLimitExceeded, error.InsufficientRangeCapacity, error.StreamCapacityExceeded, error.ClosedStreamCapacityExceeded => types.CloseCode.internal_error,
         error.TransportParameterError => types.CloseCode.transport_parameter_error,
         error.ConnectionIdLimitExceeded => types.CloseCode.connection_id_limit_error,
         error.UnknownFrameType, error.Truncated, error.InvalidAckRange, error.InvalidAckRanges => types.CloseCode.frame_encoding_error,

@@ -8,7 +8,7 @@ const quic_limits: causeway.quic.connection.Limits = .{
     .tls_output_bytes = 16 * 1024,
     .tls_transcript_bytes = 32 * 1024,
     .max_datagram_size = 1350,
-    .max_streams = 32,
+    .max_streams = 35,
     .stream_receive_bytes = 64 * 1024,
     .stream_send_bytes = 64 * 1024,
 };

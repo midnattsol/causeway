@@ -38,7 +38,10 @@ pub const Limits = struct {
     tls_output_bytes: usize = 8192,
     tls_transcript_bytes: usize = 16 * 1024,
     max_datagram_size: usize = 1200,
+    /// Total concurrently active application-stream slots.
     max_streams: usize = 16,
+    /// Receive-side final sizes retained after active slots are recycled.
+    max_closed_streams: usize = 1024,
     stream_receive_bytes: usize = 4096,
     stream_send_bytes: usize = 4096,
     stream_receive_ranges: usize = 16,
@@ -91,6 +94,7 @@ pub fn Connection(comptime limits: Limits) type {
         pub const Detector = loss.Detector(limits.sent_packets);
         pub const ApplicationStreams = application_streams.Application(
             limits.max_streams,
+            limits.max_closed_streams,
             limits.stream_receive_bytes,
             limits.stream_send_bytes,
             limits.stream_receive_ranges,

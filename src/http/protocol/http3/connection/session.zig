@@ -288,6 +288,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         fn resetReceived(self: *Self, id: StreamId) !void {
+            _ = try self.connection.readStreamReset(id);
             if (self.findRequest(id)) |slot| slot.occupied = false;
             if (self.findUni(id)) |slot| {
                 if (slot.stream_type) |stream_type| try self.peer_streams.closed(stream_type);
