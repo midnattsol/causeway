@@ -274,6 +274,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 self.owner.controller_wake = &self.wake;
                 defer self.owner.controller_wake = null;
                 try self.writeInitialSettings();
+                try self.output.flush();
                 if (self.owner.options.settings_ack_timeout) |timeout| {
                     self.tasks.async(self.io, settingsTimer, .{ timeout, &self.messages, &self.wake, self.io });
                 }
@@ -285,7 +286,8 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     progressed = try self.processMessages() or progressed;
                     progressed = try self.processFrames() or progressed;
                     progressed = try self.returnCredits() or progressed;
-                    progressed = try self.scheduleOutput() or progressed;
+                    var output_budget = self.owner.options.frame_queue_slots;
+                    while (output_budget != 0 and try self.scheduleOutput()) : (output_budget -= 1) progressed = true;
                     progressed = self.collectSessions() or progressed;
 
                     if (self.frames.failure()) |err| return self.connectionFailure(connectionErrorCode(err), err);
@@ -294,7 +296,10 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                         return;
                     }
                     if ((self.frames.ended() or self.peer_goaway) and self.sessions.count() == 0) return;
-                    if (progressed) continue;
+                    if (progressed) {
+                        try self.output.flush();
+                        continue;
+                    }
 
                     self.wake.event.reset();
                     if (try self.hasWork()) continue;
@@ -854,6 +859,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             fn connectionFailure(self: *Controller, code: errors.Code, err: anyerror) anyerror {
                 if (!self.final_goaway_sent) {
                     self.writer.writeGoaway(self.registry.highest_opened, code, @errorName(err)) catch {};
+                    self.output.flush() catch {};
                     self.goaway_sent = true;
                     self.final_goaway_sent = true;
                 }
@@ -870,6 +876,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             fn finishDrain(self: *Controller) !void {
                 if (self.final_goaway_sent) return;
                 try self.writer.writeGoaway(self.registry.highest_opened, .no_error, &.{});
+                try self.output.flush();
                 self.final_goaway_sent = true;
             }
 
@@ -898,6 +905,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             defer self.allocator.free(write_buffer);
             var reader = stream.reader(io, read_buffer);
             var writer = stream.writer(io, write_buffer);
+            defer writer.interface.flush() catch {};
             try self.serveControlled(&reader.interface, &writer.interface, control, io);
             try writer.interface.flush();
         }
