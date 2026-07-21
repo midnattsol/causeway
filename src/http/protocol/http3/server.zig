@@ -61,7 +61,8 @@ fn ServerType(
 
         const SessionSlot = struct {
             generation: u64 = 0,
-            session: ?SessionType = null,
+            session: SessionType = undefined,
+            initialized: bool = false,
             close_after_drive: bool = false,
         };
 
@@ -139,8 +140,8 @@ fn ServerType(
                 if (session_slot.generation != endpoint_slot.generation) {
                     session_slot.* = .{ .generation = endpoint_slot.generation };
                 }
-                if (session_slot.session) |*session| {
-                    session.beginShutdown(now) catch {};
+                if (session_slot.initialized) {
+                    session_slot.session.beginShutdown(now) catch {};
                     session_slot.close_after_drive = true;
                 } else {
                     endpoint_slot.connection.close(
@@ -169,18 +170,19 @@ fn ServerType(
                 }
                 if (!applicationReady(&endpoint_slot.connection)) continue;
 
-                if (session_slot.session == null) {
-                    session_slot.session = SessionType.init(
+                if (!session_slot.initialized) {
+                    SessionType.initInPlace(
+                        &session_slot.session,
                         &endpoint_slot.connection,
                         self.allocator,
                         self.state,
                         io,
                     );
+                    session_slot.initialized = true;
                 }
-                const session = &session_slot.session.?;
-                _ = session.poll(now) catch {};
+                _ = session_slot.session.poll(now) catch {};
                 if (self.shutting_down and !session_slot.close_after_drive) {
-                    session.beginShutdown(now) catch {};
+                    session_slot.session.beginShutdown(now) catch {};
                     session_slot.close_after_drive = true;
                 }
             }
@@ -317,32 +319,32 @@ test "HTTP/3 server gates sessions and safely reaps and reuses endpoint slots" {
 
     try installTestConnection(&server, 1, "server-a");
     server.pollSessions(std.testing.io, 1);
-    try std.testing.expect(server.sessions[0].session == null);
+    try std.testing.expect(!server.sessions[0].initialized);
 
     try makeApplicationReady(&server.endpoint.slots[0].connection);
     server.pollSessions(std.testing.io, 2);
-    try std.testing.expect(server.sessions[0].session != null);
+    try std.testing.expect(server.sessions[0].initialized);
     try std.testing.expectEqual(@as(u64, 1), server.sessions[0].generation);
     try std.testing.expectEqual(
         &server.endpoint.slots[0].connection,
-        server.sessions[0].session.?.connection,
+        server.sessions[0].session.connection,
     );
 
     server.endpoint.slots[0].occupied = false;
     server.pollSessions(std.testing.io, 3);
-    try std.testing.expect(server.sessions[0].session == null);
+    try std.testing.expect(!server.sessions[0].initialized);
     try std.testing.expectEqual(@as(u64, 0), server.sessions[0].generation);
 
     try installTestConnection(&server, 2, "server-b");
     try makeApplicationReady(&server.endpoint.slots[0].connection);
     server.pollSessions(std.testing.io, 4);
-    try std.testing.expect(server.sessions[0].session != null);
+    try std.testing.expect(server.sessions[0].initialized);
     try std.testing.expectEqual(@as(u64, 2), server.sessions[0].generation);
-    try std.testing.expectEqualStrings("server-b", server.sessions[0].session.?.connection.serverConnectionId());
+    try std.testing.expectEqualStrings("server-b", server.sessions[0].session.connection.serverConnectionId());
 
     server.closeAll(5);
     try std.testing.expect(server.endpoint.shutting_down);
-    try std.testing.expect(server.sessions[0].session.?.shutting_down);
+    try std.testing.expect(server.sessions[0].session.shutting_down);
     try std.testing.expect(server.sessions[0].close_after_drive);
     try std.testing.expectEqual(@as(?u64, 5), server.nextDeadline(5));
     try std.testing.expect(server.endpoint.slots[0].connection.state != .closing);
@@ -385,6 +387,6 @@ test "HTTP/3 server loopback poll admits a QUIC Initial" {
     try client.send(std.testing.io, &server.localAddress(), packet.packet);
     try std.testing.expectEqual(@as(usize, 1), try server.poll(std.testing.io, .none, 1));
     try std.testing.expectEqual(@as(usize, 1), server.endpoint.activeCount());
-    try std.testing.expect(server.sessions[0].session == null);
+    try std.testing.expect(!server.sessions[0].initialized);
     try std.testing.expectEqual(@as(u64, 1), server.endpoint.slots[0].generation);
 }

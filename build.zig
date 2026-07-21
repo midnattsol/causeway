@@ -36,6 +36,19 @@ pub fn build(b: *std.Build) void {
     });
     const run_http2_example = b.addRunArtifact(http2_example);
 
+    const http3_example = b.addExecutable(.{
+        .name = "causeway-http3-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/http3.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "causeway", .module = causeway },
+            },
+        }),
+    });
+    const run_http3_example = b.addRunArtifact(http3_example);
+
     const unit_tests = b.addTest(.{
         .name = "unit tests",
         .root_module = causeway,
@@ -132,6 +145,9 @@ pub fn build(b: *std.Build) void {
     const http2_example_step = b.step("example-http2", "Run the HTTP/2 prior-knowledge example server");
     http2_example_step.dependOn(&run_http2_example.step);
 
+    const http3_example_step = b.step("example-http3", "Run the HTTP/3 example server");
+    http3_example_step.dependOn(&run_http3_example.step);
+
     const unit_test_step = b.step("unit-test", "Run unit tests");
     unit_test_step.dependOn(&run_unit_tests.step);
 
@@ -159,6 +175,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all Causeway tests");
     test_step.dependOn(&http1_example.step);
     test_step.dependOn(&http2_example.step);
+    test_step.dependOn(&http3_example.step);
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_http2_compliance_tests.step);
     test_step.dependOn(&run_integration_tests.step);

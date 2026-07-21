@@ -114,6 +114,11 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             return .{ .connection = connection, .allocator = allocator, .state = state_value, .io = io };
         }
 
+        /// Initializes large bounded sessions directly in their final storage.
+        pub fn initInPlace(self: *Self, connection: *Connection, allocator: std.mem.Allocator, state_value: *State, io: Io) void {
+            self.* = .{ .connection = connection, .allocator = allocator, .state = state_value, .io = io };
+        }
+
         /// Opens the three server critical streams and sends their prefixes plus SETTINGS.
         pub fn activate(self: *Self) !void {
             if (self.active) return;
