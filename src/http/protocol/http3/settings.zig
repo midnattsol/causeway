@@ -8,7 +8,11 @@ pub const Id = enum(u64) {
     max_field_section_size = 0x6,
     qpack_blocked_streams = 0x7,
     enable_connect_protocol = 0x8,
+    wt_initial_max_data = 0x2b61,
+    wt_initial_max_streams_uni = 0x2b64,
+    wt_initial_max_streams_bidi = 0x2b65,
     h3_datagram = 0x33,
+    wt_enabled = 0x2c7cf000,
     _,
 
     pub fn isReservedHttp2(self: Id) bool {
@@ -26,6 +30,14 @@ pub fn h3DatagramEnabled(value: u64) !bool {
         0 => false,
         1 => true,
         else => error.InvalidH3DatagramSetting,
+    };
+}
+
+pub fn webTransportEnabled(value: u64) !bool {
+    return switch (value) {
+        0 => false,
+        1 => true,
+        else => error.InvalidWebTransportSetting,
     };
 }
 
@@ -106,6 +118,20 @@ test "SETTINGS_H3_DATAGRAM accepts zero and one only" {
     try std.testing.expect(!(try h3DatagramEnabled(0)));
     try std.testing.expect(try h3DatagramEnabled(1));
     try std.testing.expectError(error.InvalidH3DatagramSetting, h3DatagramEnabled(2));
+}
+
+test "WebTransport setting identifiers match draft-ietf-webtrans-http3-16" {
+    try std.testing.expectEqual(@as(u64, 0x2c7cf000), @intFromEnum(Id.wt_enabled));
+    try std.testing.expectEqual(@as(u64, 0x2b61), @intFromEnum(Id.wt_initial_max_data));
+    try std.testing.expectEqual(@as(u64, 0x2b64), @intFromEnum(Id.wt_initial_max_streams_uni));
+    try std.testing.expectEqual(@as(u64, 0x2b65), @intFromEnum(Id.wt_initial_max_streams_bidi));
+}
+
+test "SETTINGS_WT_ENABLED accepts zero and one only" {
+    try std.testing.expect(!(try webTransportEnabled(0)));
+    try std.testing.expect(try webTransportEnabled(1));
+    try std.testing.expectError(error.InvalidWebTransportSetting, webTransportEnabled(2));
+    try std.testing.expectError(error.InvalidWebTransportSetting, webTransportEnabled(std.math.maxInt(u64)));
 }
 
 test "SETTINGS accepts non-minimal varints and rejects semantic or malformed values" {
