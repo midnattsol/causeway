@@ -136,7 +136,7 @@ fn parseStream(payload: []const u8, cursor: *usize, frame_type: u8) !Stream {
 
 fn parseStreamCount(payload: []const u8, cursor: *usize) !u64 {
     const count = try varint.decodeAt(payload, cursor);
-    if (count > 1 << 60) return error.StreamLimitError;
+    if (count > 1 << 60) return error.FrameEncodingError;
     return count;
 }
 

@@ -312,6 +312,7 @@ pub fn Application(
                 break :slot try self.incoming(id);
             };
             var sender = &(slot.sender orelse return error.StreamStateError);
+            if (sender.state == .data_received or sender.state == .reset_received) return;
             _ = try sender.onStopSending(value.application_error);
             slot.reset_pending = true;
             slot.stop_error = value.application_error;
@@ -852,6 +853,33 @@ test "application stream reset consumption releases connection credit" {
     try std.testing.expectEqual(@as(u64, 42), try application.readReset(id));
     try std.testing.expectEqual(@as(u64, 8), application.receive_connection.consumed);
     try std.testing.expectEqual(@as(?u64, 18), application.receive_connection.pending_max_data);
+}
+
+test "late STOP_SENDING leaves terminal sender and events untouched" {
+    const A = TestApplication(5, 16);
+    var receive_bytes: [5][16]u8 = undefined;
+    var receive_ranges: [5][8]stream.range_set.Range = undefined;
+    var send_bytes: [5][16]u8 = undefined;
+    var ack_ranges: [5][8]stream.range_set.Range = undefined;
+    var lost_ranges: [5][8]stream.range_set.Range = undefined;
+    var application = A.init(&receive_bytes, &receive_ranges, &send_bytes, &ack_ranges, &lost_ranges);
+    try application.applyTransportParameters(testLocal(), testPeer());
+
+    const id = try application.open(.bidirectional);
+    const slot = application.find(id).?;
+    slot.sender.?.state = .data_received;
+    try application.onStopSending(.{ .id = id.value, .application_error = 42 });
+    try std.testing.expectEqual(stream.send.State.data_received, slot.sender.?.state);
+    try std.testing.expect(!slot.reset_pending);
+    try std.testing.expect(!slot.stopped_event);
+    try std.testing.expect(application.nextEvent() == null);
+
+    slot.sender.?.state = .reset_received;
+    try application.onStopSending(.{ .id = id.value, .application_error = 43 });
+    try std.testing.expectEqual(stream.send.State.reset_received, slot.sender.?.state);
+    try std.testing.expect(!slot.reset_pending);
+    try std.testing.expect(!slot.stopped_event);
+    try std.testing.expect(application.nextEvent() == null);
 }
 
 test "application streams reject unidirectional state violations" {

@@ -25,7 +25,6 @@ pub fn build(self: anytype, output: []u8, now: u64) ![]u8 {
     const bytes = cursor.bytes();
     if (handshake_written) self.discardInitial();
     if (bytes.len != 0) self.bytes_sent +|= bytes.len;
-    self.probe_pending = false;
     return bytes;
 }
 
@@ -123,7 +122,8 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
         const encoded = try frame.writer.encode(payload_storage[payload_length..], .{ .crypto = .{ .offset = tx.offset, .data = tx.data } });
         payload_length += encoded.len;
     }
-    if (self.probe_pending and transmission == null) {
+    const sending_probe = self.probe_space == level;
+    if (sending_probe and transmission == null) {
         const encoded = try frame.writer.encode(payload_storage[payload_length..], .ping);
         payload_length += encoded.len;
     }
@@ -135,9 +135,9 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
 
     const estimated_size = if (level == .initial) @max(@as(usize, 1200), payload_length + 64) else payload_length + 64;
     const has_application_item = std.meta.activeTag(application_item) != .none;
-    const ack_eliciting = transmission != null or has_application_item or self.probe_pending or (level == .application and (connection_id_frame != null or self.handshake_done_pending));
+    const ack_eliciting = transmission != null or has_application_item or sending_probe or (level == .application and (connection_id_frame != null or self.handshake_done_pending));
     const congestion_controlled = ack_eliciting;
-    if (!self.congestion.canSend(estimated_size, self.probe_pending) or !self.pacer.canSend(estimated_size, congestion_controlled)) {
+    if (!self.congestion.canSend(estimated_size, sending_probe) or !self.pacer.canSend(estimated_size, congestion_controlled)) {
         if (transmission) |tx| try sender.onLost(tx.offset, tx.data.len);
         if (has_application_item) try self.application.onLost(application_item);
         return false;
@@ -197,6 +197,7 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
         if (connection_id_frame) |sent_frame| self.cids.markPendingFrameSent(sent_frame);
         if (self.handshake_done_pending) self.handshake_done_pending = false;
     }
+    if (sending_probe and ack_eliciting) self.probe_space = null;
     return true;
 }
 
@@ -316,8 +317,20 @@ pub fn timeout(self: anytype, now: u64) void {
         }
     }
     if (!loss_found) {
-        self.probe_pending = true;
-        self.pto_count +|= 1;
+        var earliest_space: ?types.Level = null;
+        var earliest_deadline: u64 = std.math.maxInt(u64);
+        inline for (.{ types.Level.initial, types.Level.handshake, types.Level.application }) |level| {
+            if (self.detector(level).timer(self.rtt, self.peer_max_ack_delay, self.state == .active, self.pto_count)) |timer| {
+                if (timer.mode == .pto and timer.deadline <= now and timer.deadline < earliest_deadline) {
+                    earliest_deadline = timer.deadline;
+                    earliest_space = level;
+                }
+            }
+        }
+        if (earliest_space) |space| {
+            self.probe_space = space;
+            self.pto_count +|= 1;
+        }
     }
 }
 
@@ -352,7 +365,7 @@ fn markLost(self: anytype, level: types.Level, packet_number: u64) void {
 }
 
 fn hasPending(self: anytype) bool {
-    if (self.probe_pending or self.cids.pendingFrame() != null or self.handshake_done_pending) return true;
+    if (self.probe_space != null or self.cids.pendingFrame() != null or self.handshake_done_pending) return true;
     for (self.ack_pending) |pending| if (pending) return true;
     return self.application.hasPending() or
         self.crypto.initial.sender.sent_offset != self.crypto.initial.sender.write_offset or

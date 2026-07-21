@@ -145,8 +145,9 @@ pub fn Connection(comptime limits: Limits) type {
         congestion: congestion.NewReno,
         pacer: congestion.Pacer,
         peer_max_ack_delay: u64 = 25 * rtt.millisecond,
+        peer_ack_delay_exponent: u8 = 3,
         pto_count: u8 = 0,
-        probe_pending: bool = false,
+        probe_space: ?Level = null,
         ack_pending: [3]bool = @splat(false),
         handshake_done_pending: bool = false,
         initial_discarded: bool = false,
@@ -583,7 +584,7 @@ fn putTestU16(out: []u8, cursor: *usize, value: usize) void {
     cursor.* += 2;
 }
 
-fn makeTestClientHello(out: []u8, client_public: [32]u8) []u8 {
+fn makeTestClientHello(out: []u8, client_public: [32]u8, parameters: []const u8) []u8 {
     const tls = std.crypto.tls;
     var cursor: usize = 4;
     putTestU16(out, &cursor, 0x0303);
@@ -621,9 +622,9 @@ fn makeTestClientHello(out: []u8, client_public: [32]u8) []u8 {
     @memcpy(out[cursor..][0..2], "h3");
     cursor += 2;
     putTestU16(out, &cursor, 0x0039);
-    putTestU16(out, &cursor, 4);
-    @memcpy(out[cursor..][0..4], "\x04\x02\x40\x40"); // initial_max_data = 64
-    cursor += 4;
+    putTestU16(out, &cursor, parameters.len);
+    @memcpy(out[cursor..][0..parameters.len], parameters);
+    cursor += parameters.len;
     const extensions_length = cursor - extensions_length_offset - 2;
     out[extensions_length_offset] = @truncate(extensions_length >> 8);
     out[extensions_length_offset + 1] = @truncate(extensions_length);
@@ -692,7 +693,7 @@ test "deterministic client Initial through server flight and Finished" {
     var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
     const client_key = try X25519.KeyPair.generateDeterministic(@splat(0x11));
     var hello_storage: [256]u8 = undefined;
-    const hello = makeTestClientHello(&hello_storage, client_key.public_key);
+    const hello = makeTestClientHello(&hello_storage, client_key.public_key, "\x04\x02\x40\x40\x0f\x06client");
     const split = hello.len / 2;
     const initial_keys: protection.Keys = .{ .aes_128_gcm = crypto_initial.derive("original").client.keys };
 
@@ -997,7 +998,7 @@ test "local application key update requires current generation ACK" {
     try std.testing.expect(connection.application_send_keys.?.phase());
     try std.testing.expectError(error.KeyUpdateNotAcknowledged, connection.requestApplicationKeyUpdate());
 
-    connection.probe_pending = true;
+    connection.probe_space = .application;
     var updated_storage: [256]u8 = undefined;
     const updated = try connection.buildDatagram(&updated_storage, 100 * rtt.millisecond);
     const updated_header = try packet_header.parse(updated, "client".len);
@@ -1017,6 +1018,187 @@ test "PTO deadline and timeout queue a probe" {
     connection.congestion.onPacketSent(sent);
     const due = connection.nextDeadline(10).?;
     connection.onTimeout(due);
-    try std.testing.expect(connection.probe_pending);
+    try std.testing.expectEqual(Level.initial, connection.probe_space.?);
     try std.testing.expectEqual(@as(u8, 1), connection.pto_count);
+}
+
+test "peer initial source connection ID is mandatory and Retry compares the client SCID" {
+    const packet_writer = @import("../packet/writer.zig");
+    const X25519 = std.crypto.dh.X25519;
+    const limits: Limits = .{
+        .crypto_receive_bytes = 4096,
+        .crypto_send_bytes = 4096,
+        .tls_output_bytes = 4096,
+        .max_datagram_size = 1200,
+    };
+    const cases = [_]struct {
+        parameters: []const u8,
+        retry: bool,
+        valid: bool,
+    }{
+        .{ .parameters = "", .retry = false, .valid = false },
+        .{ .parameters = "\x0f\x05wrong", .retry = false, .valid = false },
+        .{ .parameters = "\x0f\x06client", .retry = true, .valid = true },
+    };
+    const credentials = testCredentials();
+    const client_key = try X25519.KeyPair.generateDeterministic(@splat(0x11));
+
+    for (cases) |case| {
+        var storage: Storage(limits) = .{};
+        var transcript: [8192]u8 = undefined;
+        var options = testInit(&credentials, &transcript);
+        options.initial_destination_id = if (case.retry) "retry" else null;
+        var connection = try Connection(limits).init(&storage, options);
+        var hello_storage: [256]u8 = undefined;
+        const hello = makeTestClientHello(&hello_storage, client_key.public_key, case.parameters);
+        var frame_storage: [512]u8 = undefined;
+        const crypto_frame = try cryptoPayload(&frame_storage, 0, hello);
+        const destination_id = if (case.retry) "retry" else "original";
+        const client_keys: protection.Keys = .{ .aes_128_gcm = crypto_initial.derive(destination_id).client.keys };
+        var datagram: [1200]u8 = undefined;
+        const packet = try packet_writer.writeInitial(&datagram, client_keys, .{
+            .destination_id = destination_id,
+            .source_id = "client",
+            .packet_number = 0,
+            .packet_number_length = 2,
+            .payload = crypto_frame,
+            .minimum_datagram_size = 1200,
+        });
+
+        if (case.valid) {
+            try connection.receiveDatagram(packet.packet, 1);
+            try std.testing.expect(connection.application.parameters_applied);
+            try std.testing.expectEqualStrings("client", connection.application.peer.initial_source_connection_id.?);
+        } else {
+            try std.testing.expectError(error.TransportParameterError, connection.receiveDatagram(packet.packet, 1));
+            try std.testing.expectEqual(State.closing, connection.state);
+            try std.testing.expectEqual(CloseCode.transport_parameter_error, connection.close_info.?.code);
+        }
+    }
+}
+
+test "wire ACK delay exponent updates application RTT and is ignored in Handshake" {
+    const packet_writer = @import("../packet/writer.zig");
+    const frame = @import("../frame/root.zig");
+    const limits: Limits = .{ .crypto_receive_bytes = 64, .crypto_send_bytes = 64, .tls_output_bytes = 128 };
+    const keys: protection.Keys = .{ .aes_128_gcm = .{
+        .key = @splat(0x31),
+        .iv = @splat(0x42),
+        .hp = @splat(0x53),
+    } };
+    const credentials = testCredentials();
+
+    inline for (.{ Level.application, Level.handshake }) |level| {
+        var storage: Storage(limits) = .{};
+        var transcript: [512]u8 = undefined;
+        var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+        connection.rtt.update(100 * rtt.millisecond, 0, 25 * rtt.millisecond, false, 100 * rtt.millisecond);
+        connection.peer_ack_delay_exponent = 4;
+        if (level == .application) {
+            connection.state = .active;
+            connection.application_remote = keys;
+        } else {
+            connection.handshake_remote = keys;
+        }
+        _ = try connection.space(level).allocatePacketNumber();
+        const sent: loss.SentPacket = .{
+            .packet_number = 0,
+            .time_sent = 0,
+            .sent_bytes = 100,
+            .ack_eliciting = true,
+            .in_flight = true,
+        };
+        try connection.detector(level).onPacketSent(sent);
+        connection.congestion.onPacketSent(sent);
+
+        var frame_storage: [32]u8 = undefined;
+        const ack_frame = try frame.writer.encode(&frame_storage, .{ .ack = .{
+            .largest = 0,
+            .delay = 1000,
+            .range_count = 0,
+            .first_range = 0,
+            .ranges = &.{},
+            .ecn = null,
+        } });
+        var datagram: [96]u8 = undefined;
+        const packet = if (level == .application)
+            try packet_writer.writeOneRtt(&datagram, keys, .{
+                .destination_id = "server",
+                .packet_number = 0,
+                .packet_number_length = 2,
+                .payload = ack_frame,
+                .key_phase = false,
+            })
+        else
+            try packet_writer.writeHandshake(&datagram, keys, .{
+                .destination_id = "server",
+                .source_id = "client",
+                .packet_number = 0,
+                .packet_number_length = 2,
+                .payload = ack_frame,
+            });
+        try connection.receiveDatagram(packet.packet, 120 * rtt.millisecond);
+        try std.testing.expectEqual(@as(u64, 120 * rtt.millisecond), connection.rtt.latest);
+        try std.testing.expectEqual(
+            if (level == .application) @as(u64, 100_500_000) else @as(u64, 102_500_000),
+            connection.rtt.smoothed,
+        );
+    }
+}
+
+test "wire MAX_STREAMS above 2^60 closes with FRAME_ENCODING_ERROR" {
+    const packet_writer = @import("../packet/writer.zig");
+    const varint = @import("../varint.zig");
+    const limits: Limits = .{ .crypto_receive_bytes = 64, .crypto_send_bytes = 64, .tls_output_bytes = 128 };
+    var storage: Storage(limits) = .{};
+    var transcript: [512]u8 = undefined;
+    const credentials = testCredentials();
+    var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+    const keys: protection.Keys = .{ .aes_128_gcm = .{
+        .key = @splat(0x31),
+        .iv = @splat(0x42),
+        .hp = @splat(0x53),
+    } };
+    connection.application_remote = keys;
+    connection.state = .active;
+
+    var payload: [9]u8 = undefined;
+    payload[0] = 0x12;
+    const encoded = try varint.encode(payload[1..], (@as(u64, 1) << 60) + 1);
+    var datagram: [64]u8 = undefined;
+    const packet = try packet_writer.writeOneRtt(&datagram, keys, .{
+        .destination_id = "server",
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = payload[0 .. 1 + encoded.len],
+        .key_phase = false,
+    });
+    try std.testing.expectError(error.FrameEncodingError, connection.receiveDatagram(packet.packet, 1));
+    try std.testing.expectEqual(State.closing, connection.state);
+    try std.testing.expectEqual(CloseCode.frame_encoding_error, connection.close_info.?.code);
+}
+
+test "probe remains pending until an ack-eliciting probe is emitted" {
+    const limits: Limits = .{ .crypto_receive_bytes = 64, .crypto_send_bytes = 64, .tls_output_bytes = 128 };
+    var storage: Storage(limits) = .{};
+    var transcript: [512]u8 = undefined;
+    const credentials = testCredentials();
+    var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+    connection.probe_space = .initial;
+
+    var output: [1200]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), (try connection.buildDatagram(&output, 0)).len);
+    try std.testing.expectEqual(Level.initial, connection.probe_space.?); // Amplification blocked.
+
+    connection.validateAddress();
+    try std.testing.expectEqual(@as(usize, 0), (try connection.buildDatagram(output[0..64], 0)).len);
+    try std.testing.expectEqual(Level.initial, connection.probe_space.?); // Capacity blocked.
+
+    connection.pacer.budget = 0;
+    try std.testing.expectEqual(@as(usize, 0), (try connection.buildDatagram(&output, 0)).len);
+    try std.testing.expectEqual(Level.initial, connection.probe_space.?); // Pacing blocked.
+
+    connection.pacer.budget = connection.pacer.maximum_burst;
+    try std.testing.expect((try connection.buildDatagram(&output, 0)).len != 0);
+    try std.testing.expect(connection.probe_space == null);
 }

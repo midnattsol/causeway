@@ -209,6 +209,14 @@ fn driveTls(self: anytype, level: types.Level, now: u64) !void {
                 fail(self, types.CloseCode.transport_parameter_error, null, "invalid peer transport parameters", now);
                 return error.TransportParameterError;
             };
+            const peer_initial_source_id = peer.initial_source_connection_id orelse {
+                fail(self, types.CloseCode.transport_parameter_error, null, "missing peer initial source connection ID", now);
+                return error.TransportParameterError;
+            };
+            if (!std.mem.eql(u8, peer_initial_source_id, self.initialClientConnectionId())) {
+                fail(self, types.CloseCode.transport_parameter_error, null, "peer initial source connection ID mismatch", now);
+                return error.TransportParameterError;
+            }
             self.application.applyTransportParameters(local, peer) catch {
                 fail(self, types.CloseCode.transport_parameter_error, null, "unsupported transport parameters", now);
                 return error.TransportParameterError;
@@ -218,6 +226,7 @@ fn driveTls(self: anytype, level: types.Level, now: u64) !void {
                 return error.TransportParameterError;
             };
             self.peer_max_ack_delay = peer.max_ack_delay *| @import("../recovery/rtt.zig").millisecond;
+            self.peer_ack_delay_exponent = peer.ack_delay_exponent;
         }
         if (self.tls.state == .connected) {
             self.state = .active;
@@ -234,7 +243,12 @@ fn writeAll(sender: anytype, bytes: []const u8) !void {
 
 fn onAck(self: anytype, level: types.Level, ack: frame.Ack, now: u64) !void {
     const index = @intFromEnum(level);
-    const outcome = try self.detector(level).onAck(ack, now, &self.rtt, self.peer_max_ack_delay, self.state == .active);
+    var scaled_ack = ack;
+    scaled_ack.delay = if (level == .application)
+        scaleAckDelay(ack.delay, self.peer_ack_delay_exponent)
+    else
+        0;
+    const outcome = try self.detector(level).onAck(scaled_ack, now, &self.rtt, self.peer_max_ack_delay, self.state == .active);
     self.spaces[index].recordAcknowledgedByPeer(ack.largest) catch |err| return err;
     self.congestion.onPacketsAcknowledged(outcome.acknowledged.slice(), false);
     self.congestion.onPacketsLost(outcome.lost.slice(), outcome.acknowledged.slice(), now, &self.rtt, self.peer_max_ack_delay);
@@ -255,6 +269,16 @@ fn onAck(self: anytype, level: types.Level, ack: frame.Ack, now: u64) !void {
         }
     }
     if (outcome.acknowledged.count != 0) self.pto_count = 0;
+}
+
+fn scaleAckDelay(raw: u64, exponent: u8) u64 {
+    const microseconds = raw *| (@as(u64, 1) << @intCast(exponent));
+    return microseconds *| 1_000;
+}
+
+test "ACK delay scaling converts microseconds to nanoseconds and saturates" {
+    try std.testing.expectEqual(@as(u64, 8_000), scaleAckDelay(1, 3));
+    try std.testing.expectEqual(std.math.maxInt(u64), scaleAckDelay(std.math.maxInt(u64), 20));
 }
 
 fn markCrypto(self: anytype, level: types.Level, packet_number: u64, acknowledged: bool) !void {
@@ -309,7 +333,7 @@ fn mapError(err: anyerror) u64 {
         error.ReassemblyLimitExceeded, error.InsufficientRangeCapacity, error.StreamCapacityExceeded, error.ClosedStreamCapacityExceeded => types.CloseCode.internal_error,
         error.TransportParameterError => types.CloseCode.transport_parameter_error,
         error.ConnectionIdLimitExceeded => types.CloseCode.connection_id_limit_error,
-        error.UnknownFrameType, error.Truncated, error.InvalidAckRange, error.InvalidAckRanges => types.CloseCode.frame_encoding_error,
+        error.FrameEncodingError, error.UnknownFrameType, error.Truncated, error.InvalidAckRange, error.InvalidAckRanges => types.CloseCode.frame_encoding_error,
         else => types.CloseCode.protocol_violation,
     };
 }

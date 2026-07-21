@@ -131,27 +131,10 @@ fn writeLongPadded(
         encoded_token_length[0..0];
     const base_header_length = try add(invariant_length, try add(token_length_bytes.len, initial_token.len));
     const unpadded_length_value = try add(packet_number.len, try add(options.payload.len, protection.authentication_tag_length));
-    var padding_length: usize = 0;
-
-    if (minimum_datagram_size) |minimum| {
-        const target_packet_length = minimum -| datagram_prefix_length;
-        const lengths = [_]usize{ 1, 2, 4, 8 };
-        for (lengths) |varint_length| {
-            const header_length = try add(base_header_length, varint_length);
-            if (target_packet_length < header_length) continue;
-            const candidate_length_value = target_packet_length - header_length;
-            if (candidate_length_value < unpadded_length_value) continue;
-            const canonical_length: usize = varint.encodedLength(@intCast(candidate_length_value)) catch continue;
-            if (canonical_length == varint_length) {
-                padding_length = candidate_length_value - unpadded_length_value;
-                break;
-            }
-        } else {
-            const canonical_length: usize = try varint.encodedLength(@intCast(unpadded_length_value));
-            const current_length = try add(datagram_prefix_length, try add(base_header_length, try add(canonical_length, unpadded_length_value)));
-            if (current_length < minimum) padding_length = minimum - current_length;
-        }
-    }
+    const padding_length = if (minimum_datagram_size) |minimum|
+        try paddingForMinimum(base_header_length, unpadded_length_value, datagram_prefix_length, minimum)
+    else
+        0;
 
     const length_value = try add(unpadded_length_value, padding_length);
     var encoded_length: [8]u8 = undefined;
@@ -214,6 +197,30 @@ fn writeShort(buffer: []u8, keys: protection.Keys, options: OneRttOptions) !Pack
     return .{ .packet = protected, .packet_number_offset = packet_number_offset, .payload_offset = payload_offset };
 }
 
+fn paddingForMinimum(base_header_length: usize, unpadded_length_value: usize, datagram_prefix_length: usize, minimum: usize) !usize {
+    const target_packet_length = minimum -| datagram_prefix_length;
+    const lengths = [_]usize{ 1, 2, 4, 8 };
+    const lower_bounds = [_]u64{ 0, 1 << 6, 1 << 14, 1 << 30 };
+    var best_value: ?usize = null;
+    var best_packet_length: usize = std.math.maxInt(usize);
+
+    for (lengths, lower_bounds) |encoded_length, lower_bound| {
+        const header_length = try add(base_header_length, encoded_length);
+        var candidate = @max(unpadded_length_value, std.math.cast(usize, lower_bound) orelse continue);
+        if (target_packet_length > header_length) candidate = @max(candidate, target_packet_length - header_length);
+        const candidate_u64 = std.math.cast(u64, candidate) orelse continue;
+        if (candidate_u64 > varint.maximum) continue;
+        if ((varint.encodedLength(candidate_u64) catch continue) != encoded_length) continue;
+        const packet_length = try add(header_length, candidate);
+        if (packet_length >= target_packet_length and packet_length < best_packet_length) {
+            best_packet_length = packet_length;
+            best_value = candidate;
+        }
+    }
+    const length_value = best_value orelse return error.PacketTooLarge;
+    return length_value - unpadded_length_value;
+}
+
 fn validateConnectionId(id: []const u8) !void {
     if (id.len > header.maximum_connection_id_length) return error.InvalidConnectionIdLength;
 }
@@ -270,6 +277,43 @@ test "server Initial header, exact length, padding, and protection round trip" {
     try std.testing.expectEqual(@as(u64, @intCast(result.packet.len - result.packet_number_offset)), parsed.payload_length.?);
     try std.testing.expectEqual(result.packet.len, parsed.packet_end);
     try expectRoundTrip(result, .initial, 0x1234, payload, 0);
+}
+
+test "Initial padding stabilizes across the Length varint boundary" {
+    const payload: [46]u8 = @splat(0x01); // PN + payload + tag has a 1-byte varint length of 63.
+    var exact_storage: [76]u8 = undefined;
+    const exact = try writeInitial(&exact_storage, test_keys, .{
+        .destination_id = "d",
+        .source_id = "s",
+        .packet_number = 0,
+        .packet_number_length = 1,
+        .payload = &payload,
+        .minimum_datagram_size = 76,
+    });
+    try std.testing.expectEqual(@as(usize, 76), exact.packet.len);
+
+    var short_storage: [75]u8 = @splat(0xaa);
+    const before = short_storage;
+    try std.testing.expectError(error.InsufficientCapacity, writeInitial(&short_storage, test_keys, .{
+        .destination_id = "d",
+        .source_id = "s",
+        .packet_number = 0,
+        .packet_number_length = 1,
+        .payload = &payload,
+        .minimum_datagram_size = 75,
+    }));
+    try std.testing.expectEqualSlices(u8, &before, &short_storage);
+
+    var rounded_storage: [76]u8 = undefined;
+    const rounded = try writeInitial(&rounded_storage, test_keys, .{
+        .destination_id = "d",
+        .source_id = "s",
+        .packet_number = 0,
+        .packet_number_length = 1,
+        .payload = &payload,
+        .minimum_datagram_size = 75,
+    });
+    try std.testing.expectEqual(@as(usize, 76), rounded.packet.len);
 }
 
 test "Handshake and 1-RTT headers protect and unprotect" {
