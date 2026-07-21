@@ -12,6 +12,7 @@ const congestion = @import("quic/recovery/congestion.zig");
 const loss = @import("quic/recovery/loss.zig");
 const packet_space = @import("quic/recovery/packet_space.zig");
 const rtt = @import("quic/recovery/rtt.zig");
+const stream = @import("quic/stream/root.zig");
 
 const corpus = &.{
     "\x00",
@@ -56,6 +57,8 @@ fn fuzzQuic(_: std.Io, smith: *std.testing.Smith) !void {
     fuzzInitialProtection(input);
     fuzzAckTracker(input);
     fuzzLossDetection(input);
+    fuzzStreamReceive(input);
+    fuzzStreamSend(input);
     if (input.len >= 6) {
         const encoded_length: u3 = @intCast(input[0] % 4 + 1);
         const truncated = try packet_number.decodeTruncated(input[1 .. 1 + encoded_length]);
@@ -112,6 +115,59 @@ fn fuzzLossDetection(input: []const u8) void {
     controller.onPacketsLost(outcome.lost.slice(), outcome.acknowledged.slice(), 500 * rtt.millisecond, &estimator, 25 * rtt.millisecond);
     controller.onPacketsAcknowledged(outcome.acknowledged.slice(), false);
     _ = detector.timer(estimator, 25 * rtt.millisecond, true, if (input.len > 2) input[2] % 8 else 0);
+}
+
+fn fuzzStreamReceive(input: []const u8) void {
+    const payload = input[0..@min(input.len, 128)];
+    var bytes: [128]u8 = undefined;
+    var range_storage: [128]stream.range_set.Range = undefined;
+    var receiver = stream.Receiver.init(&bytes, &range_storage, payload.len) catch unreachable;
+    if (payload.len == 0) {
+        _ = receiver.receive(0, "", true) catch @panic("empty stream FIN was rejected");
+        return;
+    }
+
+    for (payload, 0..) |selector, index| {
+        const offset = selector % payload.len;
+        const remaining = payload.len - offset;
+        const length = @min(remaining, 1 + index % 16);
+        _ = receiver.receive(offset, payload[offset..][0..length], offset + length == payload.len) catch |err| switch (err) {
+            error.FinalSizeError => {},
+            else => @panic("valid stream fragment was rejected"),
+        };
+        const readable = receiver.readable();
+        const read_offset: usize = @intCast(receiver.read_offset);
+        std.testing.expectEqualSlices(u8, payload[read_offset..][0..readable.len], readable) catch @panic("reassembled stream data mismatch");
+        if (readable.len != 0 and selector & 1 != 0) {
+            const consumed = @min(readable.len, 1 + selector % readable.len);
+            receiver.consume(consumed) catch @panic("readable stream data could not be consumed");
+        }
+    }
+}
+
+fn fuzzStreamSend(input: []const u8) void {
+    const payload = input[0..@min(input.len, 128)];
+    var bytes: [128]u8 = undefined;
+    var ack_storage: [128]stream.range_set.Range = undefined;
+    var lost_storage: [128]stream.range_set.Range = undefined;
+    var sender = stream.Sender.init(&bytes, &ack_storage, &lost_storage);
+    _ = sender.write(payload) catch @panic("bounded stream payload did not fit");
+    sender.finish() catch @panic("stream could not be finished");
+
+    var iteration: usize = 0;
+    while (sender.state != .data_received and iteration < 512) : (iteration += 1) {
+        const selector = if (input.len == 0) @as(u8, 0) else input[iteration % input.len];
+        const maximum_length: usize = 1 + selector % 32;
+        const transmission = sender.nextTransmission(maximum_length, payload.len, payload.len) catch @panic("valid transmission failed") orelse continue;
+        const offset: usize = @intCast(transmission.offset);
+        std.testing.expectEqualSlices(u8, payload[offset..][0..transmission.data.len], transmission.data) catch @panic("stream transmission data mismatch");
+        if (selector & 3 == 0 and iteration < 256) {
+            sender.onLost(transmission.offset, transmission.data.len, transmission.fin) catch @panic("valid loss range was rejected");
+        } else {
+            sender.onAcknowledged(transmission.offset, transmission.data.len, transmission.fin) catch @panic("valid ACK range was rejected");
+        }
+    }
+    std.testing.expectEqual(stream.send.State.data_received, sender.state) catch @panic("stream send schedule did not terminate");
 }
 
 fn fuzzTransportParameters(input: []const u8, role: transport_parameters.Role) !void {
