@@ -72,9 +72,8 @@ The HTTP package is split by responsibility:
 - `src/http/transport/`: listeners, accepted connections, and lifecycle;
 - `src/http/routing/`, `handlers/`, `extractors/`, and `middleware/`: the shared application pipeline.
 
-See [`IDEA.md`](IDEA.md) for architecture and ownership,
-[`docs/http-streaming.md`](docs/http-streaming.md) for request/response body
-[`docs/http-files.md`](docs/http-files.md) for file transfer and cache
+See [`docs/http-streaming.md`](docs/http-streaming.md) for request/response body
+streaming, [`docs/http-files.md`](docs/http-files.md) for file transfer and cache
 semantics, [`docs/http-protocol.md`](docs/http-protocol.md) for HTTP/1.x wire
 behavior, and [`docs/http2.md`](docs/http2.md) for HTTP/2 architecture, options,
 and validation.
