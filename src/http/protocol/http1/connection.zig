@@ -5,15 +5,12 @@ const std = @import("std");
 const Headers = @import("../../message/headers.zig").Headers;
 const context_module = @import("../../context.zig");
 const HttpContext = context_module.Context;
-const request_module = @import("../../message/request.zig");
-const Request = request_module.Request;
-const Method = request_module.Method;
+const Request = @import("../../message/request.zig").Request;
 const RequestBody = @import("../../message/request_body.zig").RequestBody;
 const response_module = @import("../../message/response.zig");
 const Response = response_module.Response;
 const Stream = response_module.Stream;
 const Takeover = response_module.Takeover;
-const extractor_errors = @import("../../extractors/errors.zig");
 const Exchange = @import("../../exchange.zig").Exchange;
 const exchange_adapter = @import("exchange.zig");
 const protocol_error = @import("response/protocol_error.zig");
@@ -26,6 +23,15 @@ const response_writer = @import("response/writer.zig");
 const Io = std.Io;
 const net = Io.net;
 const options_module = @import("connection/options.zig");
+const policy = @import("connection/policy.zig");
+const wireVersion = policy.wireVersion;
+const requestHasFramedBody = policy.requestHasFramedBody;
+const framingContentLength = policy.framingContentLength;
+const effectiveBodyLimit = policy.effectiveBodyLimit;
+const bodyExceedsKnownLimit = policy.bodyExceedsKnownLimit;
+const requestLimitReached = policy.requestLimitReached;
+const requestBodyComplete = policy.requestBodyComplete;
+const dispatchFailure = policy.dispatchFailure;
 
 // -----------------------------------------------------------------------------
 // Public API
@@ -438,100 +444,4 @@ fn respondGeneratedError(
     suppress_body: bool,
 ) !void {
     try protocol_error.write(io, output, automatic_date, version, status, body, keep_alive, suppress_body);
-}
-
-fn wireVersion(version: request_module.Version) std.http.Version {
-    return switch (version) {
-        .http_1_0 => .@"HTTP/1.0",
-        .http_1_1 => .@"HTTP/1.1",
-        .http_2, .http_3 => unreachable,
-    };
-}
-
-fn requestHasFramedBody(framing: head_module.Framing) bool {
-    return framing != .none;
-}
-
-fn framingContentLength(framing: head_module.Framing) ?u64 {
-    return switch (framing) {
-        .content_length => |length| length,
-        .none, .chunked => null,
-    };
-}
-
-fn effectiveBodyLimit(
-    comptime Dispatcher: type,
-    method: Method,
-    path: []const u8,
-    global_maximum: usize,
-) usize {
-    if (comptime @hasDecl(Dispatcher, "bodyLimit")) {
-        if (Dispatcher.bodyLimit(method, path)) |route_maximum| {
-            return @min(global_maximum, route_maximum);
-        }
-    }
-    return global_maximum;
-}
-
-fn bodyExceedsKnownLimit(content_length: ?u64, maximum: usize) bool {
-    const length = content_length orelse return false;
-    return length > maximum;
-}
-
-fn requestLimitReached(maximum: ?usize, count: usize) bool {
-    return if (maximum) |limit| count >= limit else false;
-}
-
-fn requestBodyComplete(body: RequestBody) bool {
-    return switch (body.status()) {
-        .absent, .buffered, .consumed => true,
-        .pending, .streaming, .failed => false,
-    };
-}
-
-const DispatchFailure = struct {
-    status: std.http.Status,
-    body: []const u8,
-};
-
-fn dispatchFailure(err: anyerror, policy: HandlerErrorPolicy) ?DispatchFailure {
-    if (err == error.StreamTooLong or
-        err == error.EncodedBodyTooLarge or
-        err == error.TooManyChunks)
-    {
-        return .{ .status = .payload_too_large, .body = "request body too large" };
-    }
-    if (err == error.HttpExpectationFailed) {
-        return .{ .status = .expectation_failed, .body = "expectation failed" };
-    }
-    if (err == error.RequestBodyTimeout) {
-        return .{ .status = .request_timeout, .body = "request body timeout" };
-    }
-    if (err == error.TrailersTooLarge or err == error.TooManyTrailers) {
-        return .{ .status = .request_header_fields_too_large, .body = "request trailers too large" };
-    }
-    if (err == error.InvalidTrailer or err == error.ForbiddenTrailer) {
-        return .{ .status = .bad_request, .body = "invalid request trailers" };
-    }
-    if (err == error.InvalidContentEncodingBody) {
-        return .{ .status = .bad_request, .body = "invalid content-encoded request body" };
-    }
-    if (err == error.InvalidChunkSize or
-        err == error.InvalidChunkExtension or
-        err == error.InvalidChunkTerminator or
-        err == error.TruncatedChunk or
-        err == error.TruncatedBody)
-    {
-        return .{ .status = .bad_request, .body = "invalid request body framing" };
-    }
-    if (extractor_errors.status(err)) |status| {
-        return .{ .status = status, .body = "bad request" };
-    }
-    return switch (policy) {
-        .internal_server_error => .{
-            .status = .internal_server_error,
-            .body = "internal server error",
-        },
-        .propagate => null,
-    };
 }
