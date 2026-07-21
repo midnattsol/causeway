@@ -30,5 +30,6 @@ pub const Options = connection.Options;
 // -----------------------------------------------------------------------------
 
 test {
+    _ = @import("connection/test.zig");
     std.testing.refAllDecls(@This());
 }
