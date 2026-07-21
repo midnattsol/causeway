@@ -116,9 +116,20 @@ pub const Encoder = struct {
     }
 
     pub fn processDecoderStream(self: *Encoder, input: []const u8) error{QpackDecoderStreamError}!void {
+        const consumed = try self.processDecoderStreamPrefix(input);
+        if (consumed != input.len) return error.QpackDecoderStreamError;
+    }
+
+    /// Applies all complete decoder instructions and leaves a trailing partial
+    /// instruction for the caller to retain across QUIC chunks.
+    pub fn processDecoderStreamPrefix(self: *Encoder, input: []const u8) error{QpackDecoderStreamError}!usize {
         var cursor: usize = 0;
         while (cursor < input.len) {
-            const instruction = instructions.parseDecoder(input, &cursor) catch return error.QpackDecoderStreamError;
+            const start = cursor;
+            const instruction = instructions.parseDecoder(input, &cursor) catch |err| switch (err) {
+                error.TruncatedInstruction, error.TruncatedInteger => return start,
+                else => return error.QpackDecoderStreamError,
+            };
             switch (instruction) {
                 .insert_count_increment => |increment| {
                     if (increment == 0 or increment > self.dynamic.insert_count - self.dynamic.known_received_count) return error.QpackDecoderStreamError;
@@ -139,6 +150,7 @@ pub const Encoder = struct {
                 },
             }
         }
+        return cursor;
     }
 
     fn release(self: *Encoder, section: *Section) !void {
@@ -195,7 +207,47 @@ pub const Decoder = struct {
     }
 
     pub fn processEncoderStream(self: *Decoder, input: []const u8, name_scratch: []u8, value_scratch: []u8) error{QpackEncoderStreamError}!void {
-        instructions.processEncoder(input, &self.dynamic, name_scratch, value_scratch) catch return error.QpackEncoderStreamError;
+        const consumed = try self.processEncoderStreamPrefix(input, name_scratch, value_scratch);
+        if (consumed != input.len) return error.QpackEncoderStreamError;
+    }
+
+    /// Applies complete encoder instructions and returns the consumed prefix.
+    pub fn processEncoderStreamPrefix(self: *Decoder, input: []const u8, name_scratch: []u8, value_scratch: []u8) error{QpackEncoderStreamError}!usize {
+        var cursor: usize = 0;
+        while (cursor < input.len) {
+            const start = cursor;
+            const instruction = instructions.parseEncoder(input, &cursor, name_scratch, value_scratch) catch |err| switch (err) {
+                error.TruncatedInstruction, error.TruncatedInteger, error.TruncatedString, error.InvalidString => return start,
+                else => return error.QpackEncoderStreamError,
+            };
+            switch (instruction) {
+                .set_capacity => |capacity| self.dynamic.setCapacity(@intCast(capacity)) catch return error.QpackEncoderStreamError,
+                .insert_literal => |item| _ = self.dynamic.insert(item.name, item.value) catch return error.QpackEncoderStreamError,
+                .insert_name_reference => |item| {
+                    var name: []const u8 = undefined;
+                    if (item.static_table) {
+                        name = (static.get(item.index) orelse return error.QpackEncoderStreamError).name;
+                    } else {
+                        const absolute = self.dynamic.absoluteFromEncoderRelative(item.index) orelse return error.QpackEncoderStreamError;
+                        const source = self.dynamic.getAbsolute(absolute) orelse return error.QpackEncoderStreamError;
+                        if (source.name.len > name_scratch.len) return error.QpackEncoderStreamError;
+                        @memcpy(name_scratch[0..source.name.len], source.name);
+                        name = name_scratch[0..source.name.len];
+                    }
+                    _ = self.dynamic.insert(name, item.value) catch return error.QpackEncoderStreamError;
+                },
+                .duplicate => |relative| {
+                    const absolute = self.dynamic.absoluteFromEncoderRelative(relative) orelse return error.QpackEncoderStreamError;
+                    _ = self.dynamic.duplicate(absolute, name_scratch, value_scratch) catch return error.QpackEncoderStreamError;
+                },
+            }
+        }
+        return cursor;
+    }
+
+    pub fn sectionRequiredInsertCount(self: *Decoder, input: []const u8) !u62 {
+        var cursor: usize = 0;
+        return (try field_wire.parsePrefix(input, &cursor, self.dynamic.maximum_capacity, self.dynamic.insert_count)).required_insert_count;
     }
 
     /// Calls `emit(context, field)` in wire order. Every field borrows the input,
