@@ -1,6 +1,7 @@
 //! Bounded SPSC request-body pipe for HTTP/2 DATA frames.
 
 const std = @import("std");
+const Headers = @import("../../message/headers.zig").Headers;
 const Io = std.Io;
 
 pub const CreditSink = struct {
@@ -24,6 +25,7 @@ pub const Pipe = struct {
     tail: std.atomic.Value(usize) = .init(0),
     state: std.atomic.Value(State) = .init(.open),
     failure_value: ?anyerror = null,
+    trailer_fields: Headers = .empty,
     data_ready: Io.Event = .unset,
     reader_storage: [1]u8 = undefined,
     reader: Io.Reader = .{
@@ -53,6 +55,12 @@ pub const Pipe = struct {
         self.data_ready.set(self.io);
     }
 
+    /// Publishes request trailers before the producer closes the body.
+    pub fn setTrailers(self: *Pipe, fields: Headers) !void {
+        if (self.state.load(.acquire) != .open) return error.BodyPipeClosed;
+        self.trailer_fields = fields;
+    }
+
     pub fn finish(self: *Pipe) void {
         if (self.state.cmpxchgStrong(.open, .finished, .release, .monotonic) == null) {
             self.data_ready.set(self.io);
@@ -69,6 +77,11 @@ pub const Pipe = struct {
     pub fn activate(self: *Pipe, _: std.mem.Allocator) !*Io.Reader {
         if (self.reader.buffer.len == 0) self.reader.buffer = &self.reader_storage;
         return &self.reader;
+    }
+
+    pub fn trailers(self: *Pipe, _: std.mem.Allocator) !Headers {
+        if (self.state.load(.acquire) == .open) return error.BodyNotConsumed;
+        return self.trailer_fields;
     }
 
     pub fn failure(self: *Pipe) ?anyerror {

@@ -42,6 +42,8 @@ pub const Stream = struct {
     sent_headers: bool = false,
     receive_window: Window = .{},
     send_window: Window = .{},
+    /// Controller-owned application state; stream tasks never mutate this pointer.
+    context: ?*anyopaque = null,
 
     pub fn receiveHeaders(self: *Stream, end_stream: bool) !HeaderKind {
         const kind: HeaderKind = if (self.received_headers) .trailers else .initial;

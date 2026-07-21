@@ -2,6 +2,7 @@
 
 const std = @import("std");
 
+pub const connection = @import("connection.zig");
 pub const errors = @import("error.zig");
 pub const frame = @import("frame.zig");
 pub const frame_queue = @import("frame_queue.zig");
@@ -17,6 +18,10 @@ pub const response_head = @import("response_head.zig");
 pub const settings = @import("settings.zig");
 pub const stream = @import("stream.zig");
 pub const stream_registry = @import("stream_registry.zig");
+
+pub const Handler = connection.Handler;
+pub const HandlerWithLocals = connection.HandlerWithLocals;
+pub const Options = connection.Options;
 
 // -----------------------------------------------------------------------------
 // Tests
