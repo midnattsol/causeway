@@ -12,6 +12,7 @@ pub const crypto_stream = @import("crypto_stream.zig");
 pub const negotiation = @import("negotiation.zig");
 pub const key_schedule = @import("key_schedule.zig");
 pub const packet_keys = @import("packet_keys.zig");
+pub const server = @import("server.zig");
 
 pub const Handshake = wire.Handshake;
 pub const ClientHello = wire.ClientHello;
@@ -26,6 +27,7 @@ pub const encodeCertificate = encoder.encodeCertificate;
 pub const encodeCertificateVerify = encoder.encodeCertificateVerify;
 pub const encodeFinished = encoder.encodeFinished;
 pub const ServerCredentials = credentials.ServerCredentials;
+pub const Server = server.Server;
 
 // -----------------------------------------------------------------------------
 // Tests
