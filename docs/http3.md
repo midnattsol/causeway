@@ -54,13 +54,15 @@ const Http3Server = causeway.http.http3.Server(
 
 The endpoint and each QUIC/HTTP3 session have a single polling owner. That owner is the only code that mutates connection state, QPACK state, stream registries, packet-number spaces, recovery state, or UDP output. HTTP handlers and response producers run as asynchronous `std.Io` tasks. Multiple request handlers can therefore execute concurrently, but they communicate with the owner through bounded body pipes and a bounded control queue; they do not write UDP packets or mutate the connection directly.
 
+`quic.stream.Registry` is a separate generic, fixed-capacity public primitive for direct QUIC consumers that need stream-ID allocation and peer-limit validation around their own values. The server connection intentionally uses its specialized application-stream state machine instead: it must couple receive/send lifecycle, flow control, retransmission ranges, and closed-stream tombstones rather than duplicate those invariants in a second registry.
+
 The endpoint uses fixed-capacity connection slots and fixed receive/send batches. QUIC packet, CRYPTO, stream, range, recovery, CID, and path storage is caller-owned and bounded by compile-time limits. HTTP/3 allocates request-scoped arenas and body pipes through the server allocator, but their sizes and counts are bounded by `Config` and the active request limit.
 
 ## QUIC handshake and packet protection
 
 The QUIC TLS state machine implements a TLS 1.3 server handshake for RFC 9001 and requires ALPN `h3` plus QUIC transport parameters. It derives Initial, Handshake, and application keys and supports AES-128-GCM and ChaCha20-Poly1305 packet/header protection according to the negotiated cipher suite.
 
-The connection enforces server anti-amplification limits until the peer address is validated. Initial and Handshake packet-number spaces and keys are discarded as the handshake advances. Application key updates are supported after handshake confirmation and acknowledgment of a packet in the current sending generation; receive-side key phase promotion retains the previous generation for reordered packets.
+The connection enforces server anti-amplification limits until the peer address is validated. Initial and Handshake packet-number spaces and keys are discarded as the handshake advances. Application key updates are supported after handshake confirmation and acknowledgment of a packet in the current sending generation; receive-side key phase promotion retains the previous generation for reordered packets. Parsers accept every valid QUIC variable-length integer encoding, including non-minimal widths; writers always emit the shortest representation.
 
 0-RTT is not supported. The packet parser recognizes the long-header 0-RTT type, but the server does not accept or dispatch early application data and exposes no session resumption/early-data API.
 
@@ -73,10 +75,17 @@ The bounded RFC 9002 implementation includes:
 - packet-threshold and time-threshold loss detection;
 - loss and PTO deadlines;
 - retransmission metadata for CRYPTO, application streams, CIDs, and path controls;
-- NewReno slow start, congestion avoidance, recovery, and persistent-congestion handling;
+- NewReno slow start, congestion avoidance, recovery, and persistent-congestion handling across callbacks and packet-number spaces, considering only packets sent after the first RTT sample;
+- per-sent-packet application-limited tracking (empty or flow-control-limited application data, never a pacing-only stall), so those ACKs do not grow the congestion window;
 - deterministic pacing tied to the congestion window and smoothed RTT.
 
-`Connection.nextDeadline(now)` and `Server.nextDeadline(now)` expose the next transport, pacing, HTTP response, or shutdown deadline so an outer event loop can select an appropriate poll timeout.
+`Connection.nextDeadline(now)` and `Server.nextDeadline(now)` expose the next transport, pacing, HTTP response, or shutdown deadline so an outer event loop can select an appropriate poll timeout. Causeway currently implements only the QUIC server role; RFC 9002 Appendix A.9's pre-address-validation anti-deadlock PTO fallback is a client requirement and is therefore not present in this server state machine.
+
+## Explicit Congestion Notification
+
+ECN is a compile-time endpoint feature. Direct QUIC users select `EndpointWithFeatures(..., .{ .ecn = true })`; HTTP/3 users select `ServerWithFeatures(..., .{ .ecn = true })` (or `ServerWithLocalsAndFeatures`). The ordinary `Endpoint`, `Server`, and `ServerWithLocals` compile the original Not-ECT path. When enabled, Causeway marks outgoing QUIC datagrams ECT(0), reads ECT(0), ECT(1), and CE from received UDP ancillary data, keeps bounded counters per packet-number space and endpoint path, emits `ACK_ECN`, validates peer counters according to RFC 9000 §13.4.2, disables marking on a path after validation failure or loss of all marked probes, and feeds validated CE increases into NewReno as congestion events. Retry, Version Negotiation, and stateless-reset output is not ECN-marked.
+
+On Zig 0.17 master, `std.Io.net.IncomingMessage.control` and `OutgoingMessage.control` expose ancillary bytes and the Linux `std.Io` backend passes them to `recvmsg(2)` and `sendmsg(2)`. `std.Io` does not expose a public socket-option operation, so Causeway uses `std.posix.setsockopt` on Linux to request `IP_RECVTOS` or `IPV6_RECVTCLASS`. Selecting ECN is strict: endpoint initialization returns `error.EcnUnsupported` or `error.EcnSetupFailed` instead of pretending ECN is active. Ancillary buffers are bounded stack storage for each receive/send batch, not persistent per-packet allocation. The transport metadata API (`Connection.receiveDatagramWithMetadata`) remains backend-independent and is covered with injection tests.
 
 ## Connection IDs, Retry, stateless reset, and paths
 

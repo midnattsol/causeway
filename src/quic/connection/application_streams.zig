@@ -380,6 +380,24 @@ pub fn Application(
             return false;
         }
 
+        /// True when another application-data packet cannot be produced because
+        /// there is no queued stream data or peer flow-control credit. Transport
+        /// pacing and congestion-window availability are intentionally absent.
+        pub fn isDataLimited(self: *const Self) bool {
+            if (!self.parameters_applied) return true;
+            for (self.slots) |slot| {
+                if (!slot.occupied or slot.sender == null) continue;
+                const sender = slot.sender.?;
+                if (sender.lost.count != 0 or sender.fin_lost) return false;
+                if (sender.sent_offset < sender.write_offset and
+                    sender.sent_offset < slot.send_flow.?.maximum_stream_data and
+                    self.send_connection.allowance() != 0) return false;
+                if (sender.final_size != null and !sender.fin_sent and
+                    sender.sent_offset <= slot.send_flow.?.maximum_stream_data) return false;
+            }
+            return true;
+        }
+
         pub fn prepare(self: *Self, maximum_data_length: usize) !?Prepared {
             try self.requireParameters();
             if (try self.prepareRetransmission(maximum_data_length)) |prepared| return prepared;
@@ -793,6 +811,37 @@ fn testPeer() transport_parameters.Values {
         .initial_max_streams_bidi = 1,
         .initial_max_streams_uni = 1,
     };
+}
+
+test "application data limitation distinguishes queued credit from empty and flow blocked" {
+    const A = TestApplication(4, 16);
+    var receive_bytes: [4][16]u8 = undefined;
+    var receive_ranges: [4][8]stream.range_set.Range = undefined;
+    var send_bytes: [4][16]u8 = undefined;
+    var ack_ranges: [4][8]stream.range_set.Range = undefined;
+    var lost_ranges: [4][8]stream.range_set.Range = undefined;
+    var application = A.init(&receive_bytes, &receive_ranges, &send_bytes, &ack_ranges, &lost_ranges);
+    var local = testLocal();
+    local.initial_max_streams_bidi = 0;
+    local.initial_max_streams_uni = 0;
+    try application.applyTransportParameters(local, testPeer());
+    try std.testing.expect(application.isDataLimited());
+    const id = try application.open(.unidirectional);
+    _ = try application.write(id, "abcd");
+    try std.testing.expect(!application.isDataLimited());
+    _ = try application.prepare(1);
+    try std.testing.expect(!application.isDataLimited());
+    _ = try application.prepare(16);
+    try std.testing.expect(application.isDataLimited());
+
+    var blocked = A.init(&receive_bytes, &receive_ranges, &send_bytes, &ack_ranges, &lost_ranges);
+    var peer = testPeer();
+    peer.initial_max_data = 0;
+    peer.initial_max_stream_data_uni = 0;
+    try blocked.applyTransportParameters(local, peer);
+    const blocked_id = try blocked.open(.unidirectional);
+    _ = try blocked.write(blocked_id, "x");
+    try std.testing.expect(blocked.isDataLimited());
 }
 
 test "application streams enforce peer and local stream limits" {

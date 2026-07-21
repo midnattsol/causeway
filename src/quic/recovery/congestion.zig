@@ -4,109 +4,210 @@ const std = @import("std");
 const loss = @import("loss.zig");
 const rtt = @import("rtt.zig");
 
-pub const NewReno = struct {
-    max_datagram_size: u64,
-    bytes_in_flight: u64 = 0,
-    congestion_window: u64,
-    slow_start_threshold: u64 = std.math.maxInt(u64),
-    recovery_start_time: ?u64 = null,
+pub const NewReno = NewRenoWithCapacity(192);
 
-    pub fn init(max_datagram_size: u64) !NewReno {
-        if (max_datagram_size < 1200) return error.InvalidMaxDatagramSize;
-        return .{
-            .max_datagram_size = max_datagram_size,
-            .congestion_window = initialWindow(max_datagram_size),
-        };
-    }
+pub fn NewRenoWithCapacity(comptime history_capacity: usize) type {
+    if (history_capacity == 0) @compileError("recovery history capacity must be nonzero");
+    return struct {
+        const Self = @This();
+        max_datagram_size: u64,
+        bytes_in_flight: u64 = 0,
+        congestion_window: u64,
+        slow_start_threshold: u64 = std.math.maxInt(u64),
+        recovery_start_time: ?u64 = null,
+        history: RecoveryHistory(history_capacity) = .{},
 
-    pub fn minimumWindow(self: NewReno) u64 {
-        return self.max_datagram_size *| 2;
-    }
+        pub fn init(max_datagram_size: u64) !Self {
+            if (max_datagram_size < 1200) return error.InvalidMaxDatagramSize;
+            return .{
+                .max_datagram_size = max_datagram_size,
+                .congestion_window = initialWindow(max_datagram_size),
+            };
+        }
 
-    pub fn canSend(self: NewReno, packet_size: usize, probe: bool) bool {
-        if (probe) return true;
-        const size = std.math.cast(u64, packet_size) orelse return false;
-        return size <= self.congestion_window -| self.bytes_in_flight;
-    }
+        pub fn minimumWindow(self: Self) u64 {
+            return self.max_datagram_size *| 2;
+        }
 
-    pub fn onPacketSent(self: *NewReno, packet: loss.SentPacket) void {
-        if (!packet.in_flight) return;
-        self.bytes_in_flight +|= packet.sent_bytes;
-    }
+        pub fn canSend(self: Self, packet_size: usize, probe: bool) bool {
+            if (probe) return true;
+            const size = std.math.cast(u64, packet_size) orelse return false;
+            return size <= self.congestion_window -| self.bytes_in_flight;
+        }
 
-    pub fn onPacketsLost(
-        self: *NewReno,
-        lost_packets: []const loss.SentPacket,
-        acknowledged_in_event: []const loss.SentPacket,
-        now: u64,
-        estimator: *rtt.Estimator,
-        peer_max_ack_delay: u64,
-    ) void {
-        var newest_lost_in_flight: ?u64 = null;
-        var oldest_persistent: ?u64 = null;
-        var newest_persistent: ?u64 = null;
-        const first_sample_time = estimator.first_sample_time;
+        pub fn onPacketSent(self: *Self, packet: loss.SentPacket) void {
+            if (!packet.in_flight) return;
+            self.bytes_in_flight +|= packet.sent_bytes;
+            self.history.sent(packet);
+        }
 
-        for (lost_packets) |packet| {
-            if (packet.in_flight) {
+        pub fn onPacketsLost(
+            self: *Self,
+            lost_packets: []const loss.SentPacket,
+            acknowledged_in_event: []const loss.SentPacket,
+            now: u64,
+            estimator: *rtt.Estimator,
+            peer_max_ack_delay: u64,
+        ) void {
+            var newest_lost_in_flight: ?u64 = null;
+            for (acknowledged_in_event) |packet| self.history.acknowledged(packet);
+            for (lost_packets) |packet| {
+                self.history.lost(packet);
+                if (packet.in_flight) {
+                    self.bytes_in_flight -|= packet.sent_bytes;
+                    newest_lost_in_flight = if (newest_lost_in_flight) |sent| @max(sent, packet.time_sent) else packet.time_sent;
+                }
+            }
+            if (newest_lost_in_flight) |sent_time| self.onCongestionEvent(sent_time, now);
+
+            if (self.history.persistent(estimator.persistentCongestionPeriod(peer_max_ack_delay))) {
+                self.congestion_window = self.minimumWindow();
+                self.recovery_start_time = null;
+                estimator.minimum = estimator.latest;
+                self.history.resetAfterPersistentCongestion();
+            }
+            self.history.compact();
+        }
+
+        pub fn onPacketsAcknowledged(
+            self: *Self,
+            packets: []const loss.SentPacket,
+            application_limited: bool,
+        ) void {
+            for (packets) |packet| {
+                if (!packet.in_flight) continue;
                 self.bytes_in_flight -|= packet.sent_bytes;
-                newest_lost_in_flight = if (newest_lost_in_flight) |sent| @max(sent, packet.time_sent) else packet.time_sent;
-            }
-            if (packet.ack_eliciting and first_sample_time != null and packet.time_sent > first_sample_time.?) {
-                oldest_persistent = if (oldest_persistent) |sent| @min(sent, packet.time_sent) else packet.time_sent;
-                newest_persistent = if (newest_persistent) |sent| @max(sent, packet.time_sent) else packet.time_sent;
-            }
-        }
-        if (newest_lost_in_flight) |sent_time| self.onCongestionEvent(sent_time, now);
-
-        if (oldest_persistent != null and newest_persistent != null and oldest_persistent.? != newest_persistent.? and
-            newest_persistent.? - oldest_persistent.? >= estimator.persistentCongestionPeriod(peer_max_ack_delay) and
-            !hasAcknowledgedBetween(acknowledged_in_event, oldest_persistent.?, newest_persistent.?))
-        {
-            self.congestion_window = self.minimumWindow();
-            self.recovery_start_time = null;
-            estimator.minimum = estimator.latest;
-        }
-    }
-
-    pub fn onPacketsAcknowledged(
-        self: *NewReno,
-        packets: []const loss.SentPacket,
-        application_limited: bool,
-    ) void {
-        for (packets) |packet| {
-            if (!packet.in_flight) continue;
-            self.bytes_in_flight -|= packet.sent_bytes;
-            if (application_limited or self.inRecovery(packet.time_sent)) continue;
-            if (self.congestion_window < self.slow_start_threshold) {
-                self.congestion_window +|= packet.sent_bytes;
-            } else {
-                const acknowledged = std.math.cast(u64, packet.sent_bytes) orelse std.math.maxInt(u64);
-                const product = std.math.mul(u64, self.max_datagram_size, acknowledged) catch std.math.maxInt(u64);
-                self.congestion_window +|= product / self.congestion_window;
+                self.history.acknowledged(packet);
+                if (application_limited or packet.application_limited or self.inRecovery(packet.time_sent)) continue;
+                if (self.congestion_window < self.slow_start_threshold) {
+                    self.congestion_window +|= packet.sent_bytes;
+                } else {
+                    const acknowledged = std.math.cast(u64, packet.sent_bytes) orelse std.math.maxInt(u64);
+                    const product = std.math.mul(u64, self.max_datagram_size, acknowledged) catch std.math.maxInt(u64);
+                    self.congestion_window +|= product / self.congestion_window;
+                }
             }
         }
-    }
 
-    pub fn onEcnCongestion(self: *NewReno, largest_acked_sent_time: u64, now: u64) void {
-        self.onCongestionEvent(largest_acked_sent_time, now);
-    }
+        pub fn onEcnCongestion(self: *Self, largest_acked_sent_time: u64, now: u64) void {
+            self.onCongestionEvent(largest_acked_sent_time, now);
+        }
 
-    pub fn resetForPath(self: *NewReno, max_datagram_size: u64) !void {
-        self.* = try init(max_datagram_size);
-    }
+        pub fn resetForPath(self: *Self, max_datagram_size: u64) !void {
+            self.* = try init(max_datagram_size);
+        }
 
-    fn onCongestionEvent(self: *NewReno, sent_time: u64, now: u64) void {
-        if (self.inRecovery(sent_time)) return;
-        self.recovery_start_time = now;
-        self.slow_start_threshold = @max(self.congestion_window / 2, self.minimumWindow());
-        self.congestion_window = self.slow_start_threshold;
-    }
+        fn onCongestionEvent(self: *Self, sent_time: u64, now: u64) void {
+            if (self.inRecovery(sent_time)) return;
+            self.recovery_start_time = now;
+            self.slow_start_threshold = @max(self.congestion_window / 2, self.minimumWindow());
+            self.congestion_window = self.slow_start_threshold;
+        }
 
-    fn inRecovery(self: NewReno, sent_time: u64) bool {
-        return if (self.recovery_start_time) |started| sent_time <= started else false;
-    }
-};
+        fn inRecovery(self: Self, sent_time: u64) bool {
+            return if (self.recovery_start_time) |started| sent_time <= started else false;
+        }
+    };
+}
+
+fn RecoveryHistory(comptime capacity: usize) type {
+    return struct {
+        const Self = @This();
+        const Status = enum { outstanding, acknowledged, lost };
+        const Entry = struct {
+            space: @import("packet_space.zig").Id,
+            packet_number: u64,
+            time_sent: u64,
+            status: Status = .outstanding,
+        };
+        const Span = struct { oldest: u64, newest: u64 };
+
+        entries: [capacity]Entry = undefined,
+        count: usize = 0,
+        lost_prefix: ?Span = null,
+        reliable: bool = true,
+
+        fn sent(self: *Self, packet: loss.SentPacket) void {
+            if (!packet.ack_eliciting or !packet.in_flight or !packet.persistent_congestion_eligible) return;
+            self.compact();
+            if (self.count == capacity) {
+                // A fixed-capacity implementation must never infer persistent
+                // congestion after losing timeline information. The next ACK is
+                // a safe boundary at which tracking can resume.
+                self.reliable = false;
+                return;
+            }
+            self.entries[self.count] = .{
+                .space = packet.space,
+                .packet_number = packet.packet_number,
+                .time_sent = packet.time_sent,
+            };
+            self.count += 1;
+        }
+
+        fn acknowledged(self: *Self, packet: loss.SentPacket) void {
+            if (!packet.ack_eliciting or !packet.in_flight or !packet.persistent_congestion_eligible) return;
+            if (!self.reliable) {
+                self.* = .{};
+                return;
+            }
+            self.mark(packet, .acknowledged);
+        }
+
+        fn lost(self: *Self, packet: loss.SentPacket) void {
+            if (!packet.ack_eliciting or !packet.in_flight or !packet.persistent_congestion_eligible or !self.reliable) return;
+            self.mark(packet, .lost);
+        }
+
+        fn mark(self: *Self, packet: loss.SentPacket, status: Status) void {
+            for (self.entries[0..self.count]) |*entry| {
+                if (entry.space == packet.space and entry.packet_number == packet.packet_number) {
+                    entry.status = status;
+                    return;
+                }
+            }
+        }
+
+        fn persistent(self: Self, period: u64) bool {
+            if (!self.reliable) return false;
+            var run: ?Span = self.lost_prefix;
+            for (self.entries[0..self.count]) |entry| switch (entry.status) {
+                .lost => if (run) |*span| {
+                    span.oldest = @min(span.oldest, entry.time_sent);
+                    span.newest = @max(span.newest, entry.time_sent);
+                } else {
+                    run = .{ .oldest = entry.time_sent, .newest = entry.time_sent };
+                },
+                .acknowledged, .outstanding => run = null,
+            };
+            const span = run orelse return false;
+            return span.newest != span.oldest and span.newest - span.oldest >= period;
+        }
+
+        fn compact(self: *Self) void {
+            while (self.count != 0 and self.entries[0].status != .outstanding) {
+                const entry = self.entries[0];
+                switch (entry.status) {
+                    .acknowledged => self.lost_prefix = null,
+                    .lost => if (self.lost_prefix) |*span| {
+                        span.oldest = @min(span.oldest, entry.time_sent);
+                        span.newest = @max(span.newest, entry.time_sent);
+                    } else {
+                        self.lost_prefix = .{ .oldest = entry.time_sent, .newest = entry.time_sent };
+                    },
+                    .outstanding => unreachable,
+                }
+                var index: usize = 0;
+                while (index + 1 < self.count) : (index += 1) self.entries[index] = self.entries[index + 1];
+                self.count -= 1;
+            }
+        }
+
+        fn resetAfterPersistentCongestion(self: *Self) void {
+            self.* = .{};
+        }
+    };
+}
 
 pub const Pacer = struct {
     budget: u64,
@@ -163,13 +264,6 @@ fn initialWindow(max_datagram_size: u64) u64 {
     return @min(max_datagram_size *| 10, @max(14_720, max_datagram_size *| 2));
 }
 
-fn hasAcknowledgedBetween(packets: []const loss.SentPacket, oldest: u64, newest: u64) bool {
-    for (packets) |packet| {
-        if (packet.time_sent > oldest and packet.time_sent < newest) return true;
-    }
-    return false;
-}
-
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -202,13 +296,90 @@ test "persistent congestion collapses NewReno to two datagrams" {
     estimator.update(10 * rtt.millisecond, 0, 0, true, 1);
     const period = estimator.persistentCongestionPeriod(0);
     const lost_packets = [_]loss.SentPacket{
-        .{ .packet_number = 1, .time_sent = 2, .sent_bytes = 1200, .ack_eliciting = true, .in_flight = true },
-        .{ .packet_number = 2, .time_sent = 2 + period, .sent_bytes = 1200, .ack_eliciting = true, .in_flight = true },
+        .{ .packet_number = 1, .time_sent = 2, .sent_bytes = 1200, .ack_eliciting = true, .in_flight = true, .persistent_congestion_eligible = true },
+        .{ .packet_number = 2, .time_sent = 2 + period, .sent_bytes = 1200, .ack_eliciting = true, .in_flight = true, .persistent_congestion_eligible = true },
     };
     controller.onPacketSent(lost_packets[0]);
     controller.onPacketSent(lost_packets[1]);
     controller.onPacketsLost(&lost_packets, &.{}, 2 + period, &estimator, 0);
     try std.testing.expectEqual(@as(u64, 2400), controller.congestion_window);
+}
+
+test "NewReno does not grow for an application-limited packet" {
+    var controller = try NewReno.init(1200);
+    const initial = controller.congestion_window;
+    const packet: loss.SentPacket = .{
+        .packet_number = 0,
+        .time_sent = 10,
+        .sent_bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .application_limited = true,
+    };
+    controller.onPacketSent(packet);
+    controller.onPacketsAcknowledged(&.{packet}, false);
+    try std.testing.expectEqual(initial, controller.congestion_window);
+    try std.testing.expectEqual(@as(u64, 0), controller.bytes_in_flight);
+}
+
+test "persistent congestion spans callbacks and packet-number spaces" {
+    var controller = try NewReno.init(1200);
+    var estimator: rtt.Estimator = .{};
+    estimator.update(10 * rtt.millisecond, 0, 0, true, 1);
+    const period = estimator.persistentCongestionPeriod(0);
+    const first: loss.SentPacket = .{ .packet_number = 7, .space = .handshake, .time_sent = 2, .sent_bytes = 1200, .ack_eliciting = true, .in_flight = true, .persistent_congestion_eligible = true };
+    const last: loss.SentPacket = .{ .packet_number = 0, .space = .application, .time_sent = 2 + period, .sent_bytes = 1200, .ack_eliciting = true, .in_flight = true, .persistent_congestion_eligible = true };
+    controller.onPacketSent(first);
+    controller.onPacketSent(last);
+    controller.onPacketsLost(&.{first}, &.{}, 10, &estimator, 0);
+    try std.testing.expect(controller.congestion_window > controller.minimumWindow());
+    controller.onPacketsLost(&.{last}, &.{}, 2 + period, &estimator, 0);
+    try std.testing.expectEqual(controller.minimumWindow(), controller.congestion_window);
+}
+
+test "acknowledged packet between historical losses prevents persistent congestion" {
+    var controller = try NewReno.init(1200);
+    var estimator: rtt.Estimator = .{};
+    estimator.update(10 * rtt.millisecond, 0, 0, true, 1);
+    const period = estimator.persistentCongestionPeriod(0);
+    const first: loss.SentPacket = .{ .packet_number = 1, .space = .initial, .time_sent = 2, .sent_bytes = 1200, .ack_eliciting = true, .in_flight = true, .persistent_congestion_eligible = true };
+    const middle: loss.SentPacket = .{ .packet_number = 2, .space = .handshake, .time_sent = 2 + period / 2, .sent_bytes = 1200, .ack_eliciting = true, .in_flight = true, .persistent_congestion_eligible = true };
+    const last: loss.SentPacket = .{ .packet_number = 3, .space = .application, .time_sent = 2 + period, .sent_bytes = 1200, .ack_eliciting = true, .in_flight = true, .persistent_congestion_eligible = true };
+    controller.onPacketSent(first);
+    controller.onPacketSent(middle);
+    controller.onPacketSent(last);
+    controller.onPacketsLost(&.{first}, &.{}, 10, &estimator, 0);
+    controller.onPacketsAcknowledged(&.{middle}, false);
+    controller.onPacketsLost(&.{last}, &.{middle}, 2 + period, &estimator, 0);
+    try std.testing.expect(controller.congestion_window > controller.minimumWindow());
+}
+
+test "packets sent before the first RTT sample cannot form persistent congestion" {
+    var controller = try NewReno.init(1200);
+    var estimator: rtt.Estimator = .{};
+    const early: loss.SentPacket = .{ .packet_number = 1, .time_sent = 1, .sent_bytes = 1200, .ack_eliciting = true, .in_flight = true };
+    controller.onPacketSent(early);
+    estimator.update(10 * rtt.millisecond, 0, 0, true, 2);
+    const period = estimator.persistentCongestionPeriod(0);
+    const late: loss.SentPacket = .{ .packet_number = 2, .time_sent = 1 + period, .sent_bytes = 1200, .ack_eliciting = true, .in_flight = true, .persistent_congestion_eligible = true };
+    controller.onPacketSent(late);
+    controller.onPacketsLost(&.{ early, late }, &.{}, 1 + period, &estimator, 0);
+    try std.testing.expect(controller.congestion_window > controller.minimumWindow());
+}
+
+test "bounded recovery history never infers congestion after overflow" {
+    var controller = try NewRenoWithCapacity(2).init(1200);
+    var estimator: rtt.Estimator = .{};
+    estimator.update(10 * rtt.millisecond, 0, 0, true, 1);
+    const period = estimator.persistentCongestionPeriod(0);
+    const packets = [_]loss.SentPacket{
+        .{ .packet_number = 1, .time_sent = 2, .sent_bytes = 1200, .ack_eliciting = true, .in_flight = true, .persistent_congestion_eligible = true },
+        .{ .packet_number = 2, .time_sent = 2 + period, .sent_bytes = 1200, .ack_eliciting = true, .in_flight = true, .persistent_congestion_eligible = true },
+        .{ .packet_number = 3, .time_sent = 3 + period, .sent_bytes = 1200, .ack_eliciting = true, .in_flight = true, .persistent_congestion_eligible = true },
+    };
+    for (packets) |packet| controller.onPacketSent(packet);
+    controller.onPacketsLost(&packets, &.{}, 3 + period, &estimator, 0);
+    try std.testing.expect(controller.congestion_window > controller.minimumWindow());
 }
 
 test "pacer accrues bounded credit and computes deterministic wake time" {

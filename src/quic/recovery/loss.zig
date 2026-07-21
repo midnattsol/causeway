@@ -13,6 +13,15 @@ pub const SentPacket = struct {
     sent_bytes: usize,
     ack_eliciting: bool,
     in_flight: bool,
+    /// Captured when the packet is sent. Pacing and congestion-window stalls
+    /// are not application limitation; unavailable data or flow credit is.
+    application_limited: bool = false,
+    /// Persistent-congestion eligibility is fixed at send time. RFC 9002 only
+    /// considers packets sent after the first RTT sample has been obtained.
+    persistent_congestion_eligible: bool = false,
+    space: packet_space.Id = .application,
+    ecn: enum { not_ect, ect0 } = .not_ect,
+    path_id: u8 = 0,
 };
 
 pub const Timer = struct {

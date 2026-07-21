@@ -64,9 +64,15 @@ pub fn buildPath(self: anytype, output: []u8, value: frame.Frame, control_key: u
         .sent_bytes = cursor.offset,
         .ack_eliciting = true,
         .in_flight = true,
+        .application_limited = true,
+        .persistent_congestion_eligible = self.rtt.first_sample_time != null,
+        .space = .application,
+        .ecn = if (self.datagram_ecn == .ect0) .ect0 else .not_ect,
+        .path_id = self.send_path_id,
     };
     try self.detector(level).onPacketSent(sent);
     self.congestion.onPacketSent(sent);
+    self.ecn.onPacketSent(sent);
     self.pacer.onPacketSent(cursor.offset, true);
     try rememberApplication(self, packet_number, self.application_send_generation, .none);
     try rememberPathControl(self, packet_number, control_key);
@@ -85,7 +91,7 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
     var connection_id_frame: ?frame.Frame = null;
 
     if (self.ack_pending[index]) {
-        const ack_frame = self.spaces[index].received.ackFrame(0, null, &ack_ranges) catch null;
+        const ack_frame = self.spaces[index].received.ackFrame(0, self.ecn.receivedCounts(types.levelId(level)), &ack_ranges) catch null;
         if (ack_frame) |value| {
             const encoded = try frame.writer.encode(payload_storage[payload_length..], value);
             payload_length += encoded.len;
@@ -182,9 +188,15 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
         .sent_bytes = sent_bytes,
         .ack_eliciting = ack_eliciting,
         .in_flight = congestion_controlled,
+        .application_limited = level == .application and self.application.isDataLimited(),
+        .persistent_congestion_eligible = self.rtt.first_sample_time != null,
+        .space = types.levelId(level),
+        .ecn = if (self.datagram_ecn == .ect0) .ect0 else .not_ect,
+        .path_id = self.send_path_id,
     };
     try self.detectors[index].onPacketSent(sent);
     self.congestion.onPacketSent(sent);
+    self.ecn.onPacketSent(sent);
     self.pacer.onPacketSent(sent_bytes, congestion_controlled);
     if (transmission) |tx| try rememberCrypto(self, level, packet_number, tx.offset, tx.data.len);
     if (level == .application) {
@@ -312,6 +324,7 @@ pub fn timeout(self: anytype, now: u64) void {
         if (detector.loss_time != null and now >= detector.loss_time.?) {
             const lost = detector.detectLost(now, self.rtt);
             self.congestion.onPacketsLost(lost.slice(), &.{}, now, &self.rtt, self.peer_max_ack_delay);
+            self.ecn.onPacketsLost(lost.slice());
             for (lost.slice()) |packet| markLost(self, level, packet.packet_number);
             loss_found = loss_found or lost.count != 0;
         }

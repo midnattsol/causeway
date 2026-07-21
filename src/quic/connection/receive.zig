@@ -53,6 +53,7 @@ pub fn datagram(self: anytype, bytes: []u8, now: u64) !void {
             }
             const recorded = try self.space(level).recordReceived(clear.packet_number);
             if (recorded == .inserted) {
+                self.ecn.onPacketReceived(self.receive_metadata.path_id, types.levelId(level), self.receive_metadata.ecn);
                 if (level == .handshake) self.address_validated = true;
                 const destination_sequence = self.localConnectionIdSequence(invariant.destination_id) orelse 0;
                 const ack_eliciting = dispatchFrames(self, level, destination_sequence, clear.payload, now) catch |err| {
@@ -252,6 +253,10 @@ fn onAck(self: anytype, level: types.Level, ack: frame.Ack, now: u64) !void {
     self.spaces[index].recordAcknowledgedByPeer(ack.largest) catch |err| return err;
     self.congestion.onPacketsAcknowledged(outcome.acknowledged.slice(), false);
     self.congestion.onPacketsLost(outcome.lost.slice(), outcome.acknowledged.slice(), now, &self.rtt, self.peer_max_ack_delay);
+    self.ecn.onPacketsLost(outcome.lost.slice());
+    const ecn_result = self.ecn.onAck(types.levelId(level), ack.largest, ack.ecn, outcome.acknowledged.slice());
+    if (ecn_result.congestion_experienced)
+        self.congestion.onEcnCongestion(ecn_result.largest_acked_sent_time.?, now);
     for (outcome.acknowledged.slice()) |packet| {
         try markCrypto(self, level, packet.packet_number, true);
         if (level == .application) {

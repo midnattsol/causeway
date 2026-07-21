@@ -7,6 +7,7 @@ const packet_space = @import("../recovery/packet_space.zig");
 const loss = @import("../recovery/loss.zig");
 const rtt = @import("../recovery/rtt.zig");
 const congestion = @import("../recovery/congestion.zig");
+const ecn = @import("ecn.zig");
 const crypto_stream = @import("../tls/crypto_stream.zig");
 const tls_server = @import("../tls/server.zig");
 const packet_keys = @import("../tls/packet_keys.zig");
@@ -28,6 +29,11 @@ pub const CloseCode = types.CloseCode;
 pub const StreamEvent = application_streams.Event;
 pub const StreamId = stream.Id;
 pub const StreamDirection = stream.Direction;
+pub const EcnCodepoint = ecn.Codepoint;
+pub const DatagramMetadata = struct {
+    path_id: u8 = 0,
+    ecn: EcnCodepoint = .not_ect,
+};
 
 pub const Limits = struct {
     crypto_receive_bytes: usize = 4096,
@@ -81,12 +87,14 @@ pub const Init = struct {
     server_reset_token: [16]u8 = @splat(0),
     tls: tls_server.Config,
     now: u64,
+    ecn_enabled: bool = false,
 };
 
 pub fn Connection(comptime limits: Limits) type {
     if (limits.max_datagram_size < 1200) @compileError("QUIC max_datagram_size must be at least 1200");
     if (limits.active_connection_ids < 2) @compileError("QUIC active_connection_ids must be at least two");
     if (limits.path_events == 0 or limits.paths == 0) @compileError("QUIC path capacities must be nonzero");
+    if (limits.paths > std.math.maxInt(u8) + 1) @compileError("QUIC path capacity exceeds metadata path ID range");
     return struct {
         const Self = @This();
         pub const StreamId = stream.Id;
@@ -142,8 +150,12 @@ pub fn Connection(comptime limits: Limits) type {
         sent_path_controls: [limits.sent_packets]types.PathControlMeta = @splat(.{}),
         application: ApplicationStreams,
         rtt: rtt.Estimator = .{},
-        congestion: congestion.NewReno,
+        congestion: congestion.NewRenoWithCapacity(limits.sent_packets * 3),
         pacer: congestion.Pacer,
+        ecn: ecn.State(limits.paths),
+        send_path_id: u8 = 0,
+        datagram_ecn: EcnCodepoint = .not_ect,
+        receive_metadata: DatagramMetadata = .{},
         peer_max_ack_delay: u64 = 25 * rtt.millisecond,
         peer_ack_delay_exponent: u8 = 3,
         pto_count: u8 = 0,
@@ -186,8 +198,9 @@ pub fn Connection(comptime limits: Limits) type {
                     &storage.stream_ack_ranges,
                     &storage.stream_lost_ranges,
                 ),
-                .congestion = try congestion.NewReno.init(limits.max_datagram_size),
+                .congestion = try congestion.NewRenoWithCapacity(limits.sent_packets * 3).init(limits.max_datagram_size),
                 .pacer = congestion.Pacer.init(options.now, limits.max_datagram_size * 10),
+                .ecn = ecn.State(limits.paths).init(options.ecn_enabled),
             };
             @memcpy(result.original_destination_id[0..options.original_destination_id.len], options.original_destination_id);
             @memcpy(result.initial_destination_id[0..initial_destination_id.len], initial_destination_id);
@@ -204,15 +217,39 @@ pub fn Connection(comptime limits: Limits) type {
         }
 
         pub fn receiveDatagram(self: *Self, datagram: []u8, now: u64) !void {
+            return self.receiveDatagramWithMetadata(datagram, now, .{});
+        }
+
+        pub fn receiveDatagramWithMetadata(self: *Self, datagram: []u8, now: u64, metadata: DatagramMetadata) !void {
+            self.receive_metadata = metadata;
             return receive.datagram(self, datagram, now);
         }
 
         pub fn buildDatagram(self: *Self, output: []u8, now: u64) ![]u8 {
+            return self.buildDatagramOnPath(output, now, 0);
+        }
+
+        pub fn buildDatagramOnPath(self: *Self, output: []u8, now: u64, path_id: u8) ![]u8 {
+            self.send_path_id = path_id;
+            self.datagram_ecn = self.ecn.marking(path_id);
             return schedule.build(self, output, now);
         }
 
         pub fn buildPathDatagram(self: *Self, output: []u8, value: @import("../frame/root.zig").Frame, control_key: u64, now: u64) ![]u8 {
+            return self.buildPathDatagramOnPath(output, value, control_key, now, 0);
+        }
+
+        pub fn buildPathDatagramOnPath(self: *Self, output: []u8, value: @import("../frame/root.zig").Frame, control_key: u64, now: u64, path_id: u8) ![]u8 {
+            self.send_path_id = path_id;
+            self.datagram_ecn = self.ecn.marking(path_id);
             return schedule.buildPath(self, output, value, control_key, now);
+        }
+
+        /// Metadata for the most recently built non-empty datagram. Endpoints
+        /// consume it immediately after `buildDatagramOnPath` or
+        /// `buildPathDatagramOnPath` succeeds.
+        pub fn outgoingMetadata(self: *const Self) DatagramMetadata {
+            return .{ .path_id = self.send_path_id, .ecn = self.datagram_ecn };
         }
 
         pub fn nextLostPathControl(self: *Self) ?u64 {

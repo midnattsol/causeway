@@ -5,6 +5,7 @@
 //! sessions point at those connections.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const quic = @import("../../../quic/root.zig");
 const options_module = @import("connection/options.zig");
 const session_module = @import("connection/session.zig");
@@ -14,6 +15,10 @@ const Response = @import("../../message/response.zig").Response;
 const Io = std.Io;
 const net = Io.net;
 
+pub const Features = struct {
+    ecn: bool = false,
+};
+
 pub fn Server(
     comptime State: type,
     comptime Dispatcher: type,
@@ -22,7 +27,19 @@ pub fn Server(
     comptime endpoint_batch_size: usize,
     comptime http3_config: options_module.Config,
 ) type {
-    return ServerType(State, null, Dispatcher, connection_limits, endpoint_capacity, endpoint_batch_size, http3_config);
+    return ServerType(State, null, Dispatcher, connection_limits, endpoint_capacity, endpoint_batch_size, http3_config, .{});
+}
+
+pub fn ServerWithFeatures(
+    comptime State: type,
+    comptime Dispatcher: type,
+    comptime connection_limits: quic.connection.Limits,
+    comptime endpoint_capacity: usize,
+    comptime endpoint_batch_size: usize,
+    comptime http3_config: options_module.Config,
+    comptime features: Features,
+) type {
+    return ServerType(State, null, Dispatcher, connection_limits, endpoint_capacity, endpoint_batch_size, http3_config, features);
 }
 
 pub fn ServerWithLocals(
@@ -34,7 +51,20 @@ pub fn ServerWithLocals(
     comptime endpoint_batch_size: usize,
     comptime http3_config: options_module.Config,
 ) type {
-    return ServerType(State, Locals, Dispatcher, connection_limits, endpoint_capacity, endpoint_batch_size, http3_config);
+    return ServerType(State, Locals, Dispatcher, connection_limits, endpoint_capacity, endpoint_batch_size, http3_config, .{});
+}
+
+pub fn ServerWithLocalsAndFeatures(
+    comptime State: type,
+    comptime Locals: type,
+    comptime Dispatcher: type,
+    comptime connection_limits: quic.connection.Limits,
+    comptime endpoint_capacity: usize,
+    comptime endpoint_batch_size: usize,
+    comptime http3_config: options_module.Config,
+    comptime features: Features,
+) type {
+    return ServerType(State, Locals, Dispatcher, connection_limits, endpoint_capacity, endpoint_batch_size, http3_config, features);
 }
 
 fn ServerType(
@@ -45,8 +75,9 @@ fn ServerType(
     comptime endpoint_capacity: usize,
     comptime endpoint_batch_size: usize,
     comptime http3_config: options_module.Config,
+    comptime features: Features,
 ) type {
-    const EndpointType = quic.endpoint.Endpoint(connection_limits, endpoint_capacity, endpoint_batch_size);
+    const EndpointType = quic.endpoint.EndpointWithFeatures(connection_limits, endpoint_capacity, endpoint_batch_size, .{ .ecn = features.ecn });
     const Connection = EndpointType.Connection;
     const SessionType = if (Locals) |LocalState|
         session_module.SessionWithLocals(State, LocalState, Dispatcher, Connection, http3_config)
@@ -277,6 +308,7 @@ const TestDispatcher = struct {
     }
 };
 const TestServer = Server(TestState, TestDispatcher, test_limits, 1, 2, test_config);
+const TestEcnServer = ServerWithFeatures(TestState, TestDispatcher, test_limits, 1, 2, test_config, .{ .ecn = true });
 
 fn testCredentials() quic.tls.ServerCredentials {
     const pair = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x71)) catch unreachable;
@@ -331,6 +363,24 @@ fn makeApplicationReady(connection: *TestServer.QuicEndpoint.Connection) !void {
     );
     connection.application_local = connection.initial_local;
     connection.application_remote = connection.initial_remote;
+}
+
+test "HTTP/3 server features specialize the QUIC endpoint" {
+    try std.testing.expect(!TestServer.QuicEndpoint.configured_features.ecn);
+    try std.testing.expect(TestEcnServer.QuicEndpoint.configured_features.ecn);
+}
+
+test "HTTP/3 ECN server configures Linux UDP ancillary metadata" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const credentials = testCredentials();
+    var state: TestState = .{};
+    var server: TestEcnServer = undefined;
+    const listen: net.IpAddress = .{ .ip4 = .loopback(0) };
+    try server.bind(std.testing.io, &listen, .{
+        .credentials = &credentials,
+        .transport_parameters = .{},
+    }, std.testing.allocator, &state);
+    defer server.deinit(std.testing.io);
 }
 
 test "HTTP/3 server gates sessions and safely reaps and reuses endpoint slots" {

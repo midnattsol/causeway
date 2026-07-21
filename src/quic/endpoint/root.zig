@@ -8,6 +8,7 @@ const transport_parameters = @import("../crypto/transport_parameters.zig");
 const retry = @import("../packet/retry.zig");
 const retry_token = @import("token.zig");
 const stateless_reset = @import("stateless_reset.zig");
+pub const ecn = @import("ecn.zig");
 
 const Io = std.Io;
 const net = Io.net;
@@ -51,7 +52,20 @@ pub const Policy = struct {
     path_validation_attempts: u8 = 3,
 };
 
+pub const Features = struct {
+    ecn: bool = false,
+};
+
 pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity: usize, comptime batch_size: usize) type {
+    return EndpointWithFeatures(connection_limits, capacity, batch_size, .{});
+}
+
+pub fn EndpointWithFeatures(
+    comptime connection_limits: connection.Limits,
+    comptime capacity: usize,
+    comptime batch_size: usize,
+    comptime features: Features,
+) type {
     if (capacity == 0) @compileError("QUIC endpoint capacity must be nonzero");
     if (batch_size == 0) @compileError("QUIC endpoint batch_size must be nonzero");
 
@@ -61,6 +75,7 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
         const Storage = connection.Storage(connection_limits);
         const PathManager = connection.path.Manager(connection_limits.paths);
         pub const capacity_value = capacity;
+        pub const configured_features = features;
         pub const transcript_bytes = connection_limits.tls_transcript_bytes;
 
         const PendingStateless = struct {
@@ -114,6 +129,12 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
             if (policy.stateless_reset_secret != null and (policy.stateless_reset_burst == 0 or policy.stateless_reset_interval == 0))
                 return error.InvalidStatelessResetPolicy;
             self.* = .{ .socket = socket, .policy = policy };
+            if (features.ecn) switch (ecn.enableReceive(socket.handle, std.meta.activeTag(socket.address))) {
+                .enabled => {},
+                .unsupported => return error.EcnUnsupported,
+                .setup_failed => return error.EcnSetupFailed,
+                .not_requested => unreachable,
+            };
         }
 
         /// Binds and initializes this endpoint. On initialization failure the socket is closed.
@@ -141,6 +162,10 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
         /// Performs one bounded receive/process/send iteration.
         pub fn poll(self: *Self, io: Io, timeout: Io.Timeout, now: u64) !usize {
             self.receive_messages = @splat(net.IncomingMessage.init);
+            var receive_control: if (features.ecn) [batch_size]ecn.ControlBuffer else [0]ecn.ControlBuffer align(@alignOf(usize)) = undefined;
+            if (features.ecn) {
+                for (&self.receive_messages, &receive_control) |*message, *control| message.control = control;
+            }
             const receive_error, const count = self.socket.receiveManyTimeout(
                 io,
                 &self.receive_messages,
@@ -165,12 +190,23 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
             self.pending_stateless_count = 0;
             for (messages[0..@min(messages.len, batch_size)]) |message| {
                 if (message.flags.trunc or message.data.len == 0) continue;
+                const codepoint: ecn.Codepoint = if (features.ecn and !message.flags.ctrunc)
+                    ecn.decode(message.control) orelse .not_ect
+                else
+                    .not_ect;
                 const invariant = header.parse(message.data, self.policy.connection_id_length) catch continue;
                 if (self.find(invariant.destination_id)) |slot| {
+                    const known_path = if (features.ecn) slot.paths.find(message.from) != null else false;
                     var challenge: [8]u8 = undefined;
                     self.fillEntropy(io, &challenge);
                     const path_index = slot.paths.observe(message.from, message.data.len, challenge) catch continue;
-                    slot.connection.receiveDatagram(message.data, now) catch {};
+                    if (features.ecn) {
+                        const path_id: u8 = @intCast(path_index);
+                        if (!known_path) slot.connection.ecn.resetPath(path_id);
+                        slot.connection.receiveDatagramWithMetadata(message.data, now, .{ .path_id = path_id, .ecn = codepoint }) catch {};
+                    } else {
+                        slot.connection.receiveDatagram(message.data, now) catch {};
+                    }
                     if (slot.connection.address_validated) slot.paths.validateInitial();
                     self.routePathFrames(slot, path_index);
                     self.replenishConnectionIds(io, slot);
@@ -257,11 +293,15 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
                         .transcript_scratch = &slot.transcript,
                     },
                     .now = now,
+                    .ecn_enabled = features.ecn,
                 }) catch continue;
                 slot.generation +%= 1;
                 if (slot.generation == 0) slot.generation = 1;
                 slot.occupied = true;
-                slot.connection.receiveDatagram(message.data, now) catch {};
+                if (features.ecn)
+                    slot.connection.receiveDatagramWithMetadata(message.data, now, .{ .ecn = codepoint }) catch {}
+                else
+                    slot.connection.receiveDatagram(message.data, now) catch {};
                 if (slot.connection.space(.initial).received.largest() == null) {
                     slot.occupied = false;
                 } else if (token_contents != null) {
@@ -462,12 +502,14 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
         }
 
         fn flush(self: *Self, io: Io, now: u64) !usize {
+            var send_control: if (features.ecn) [batch_size]ecn.ControlBuffer else [0]ecn.ControlBuffer align(@alignOf(usize)) = undefined;
             var count: usize = self.pending_stateless_count;
             for (self.pending_stateless[0..count], 0..) |*pending, index| {
                 self.send_messages[index] = .{
                     .address = &pending.address,
                     .data_ptr = self.send_storage[index][0..pending.length].ptr,
                     .data_len = pending.length,
+                    .control = &.{},
                 };
             }
             for (&self.slots) |*slot| {
@@ -479,12 +521,22 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
                     const allowance: usize = @intCast(@min(slot.paths.allowance(control.path_index), std.math.maxInt(usize)));
                     const capacity_for_path = @min(self.send_storage[count].len, allowance);
                     if (capacity_for_path != 0) {
-                        const output = slot.connection.buildPathDatagram(self.send_storage[count][0..capacity_for_path], control.value, control.key, now) catch continue;
+                        const path_id: u8 = @intCast(control.path_index);
+                        const output = if (features.ecn)
+                            slot.connection.buildPathDatagramOnPath(self.send_storage[count][0..capacity_for_path], control.value, control.key, now, path_id) catch continue
+                        else
+                            slot.connection.buildPathDatagram(self.send_storage[count][0..capacity_for_path], control.value, control.key, now) catch continue;
                         if (output.len != 0) {
+                            const address = slot.paths.address(control.path_index);
                             self.send_messages[count] = .{
-                                .address = slot.paths.address(control.path_index),
+                                .address = address,
                                 .data_ptr = output.ptr,
                                 .data_len = output.len,
+                                .control = if (features.ecn) blk: {
+                                    const metadata = slot.connection.outgoingMetadata();
+                                    std.debug.assert(metadata.path_id == path_id);
+                                    break :blk ecn.encode(&send_control[count], std.meta.activeTag(address.*), metadata.ecn);
+                                } else &.{},
                             };
                             slot.paths.recordSent(control.path_index, output.len);
                             slot.paths.markControlSent(control, now);
@@ -496,12 +548,22 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
 
                 const active_index = slot.paths.active_index;
                 const allowance: usize = @intCast(@min(slot.paths.allowance(active_index), std.math.maxInt(usize)));
-                const output = slot.connection.buildDatagram(self.send_storage[count][0..@min(self.send_storage[count].len, allowance)], now) catch continue;
+                const path_id: u8 = @intCast(active_index);
+                const output = if (features.ecn)
+                    slot.connection.buildDatagramOnPath(self.send_storage[count][0..@min(self.send_storage[count].len, allowance)], now, path_id) catch continue
+                else
+                    slot.connection.buildDatagram(self.send_storage[count][0..@min(self.send_storage[count].len, allowance)], now) catch continue;
                 if (output.len == 0) continue;
+                const address = slot.paths.activeAddress();
                 self.send_messages[count] = .{
-                    .address = slot.paths.activeAddress(),
+                    .address = address,
                     .data_ptr = output.ptr,
                     .data_len = output.len,
+                    .control = if (features.ecn) blk: {
+                        const metadata = slot.connection.outgoingMetadata();
+                        std.debug.assert(metadata.path_id == path_id);
+                        break :blk ecn.encode(&send_control[count], std.meta.activeTag(address.*), metadata.ecn);
+                    } else &.{},
                 };
                 slot.paths.recordSent(active_index, output.len);
                 count += 1;
