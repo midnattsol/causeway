@@ -146,6 +146,19 @@ pub fn build(b: *std.Build) void {
     });
     const run_http2_benchmark = b.addRunArtifact(http2_benchmark);
 
+    const http3_benchmark = b.addExecutable(.{
+        .name = "http3-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/http3.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "causeway", .module = causeway },
+            },
+        }),
+    });
+    const run_http3_benchmark = b.addRunArtifact(http3_benchmark);
+
     const integration_tests = b.addTest(.{
         .name = "integration tests",
         .root_module = b.createModule(.{
@@ -192,6 +205,9 @@ pub fn build(b: *std.Build) void {
 
     const http2_benchmark_step = b.step("http2-bench", "Benchmark HTTP/2 frame and HPACK hot paths");
     http2_benchmark_step.dependOn(&run_http2_benchmark.step);
+
+    const http3_benchmark_step = b.step("http3-bench", "Benchmark HTTP/3, QPACK, QUIC crypto, and stream scheduling hot paths");
+    http3_benchmark_step.dependOn(&run_http3_benchmark.step);
 
     const integration_test_step = b.step("integration-test", "Run HTTP integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
