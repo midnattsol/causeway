@@ -8,6 +8,7 @@ const std = @import("std");
 pub const wire = @import("wire.zig");
 pub const encoder = @import("encoder.zig");
 pub const credentials = @import("credentials.zig");
+pub const crypto_stream = @import("crypto_stream.zig");
 pub const negotiation = @import("negotiation.zig");
 pub const key_schedule = @import("key_schedule.zig");
 pub const packet_keys = @import("packet_keys.zig");
