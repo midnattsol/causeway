@@ -4,6 +4,7 @@ const std = @import("std");
 
 pub const varint = @import("varint.zig");
 pub const crypto = @import("crypto/root.zig");
+pub const datagram = @import("datagram/root.zig");
 pub const connection = @import("connection/root.zig");
 pub const endpoint = @import("endpoint/root.zig");
 pub const frame = @import("frame/root.zig");

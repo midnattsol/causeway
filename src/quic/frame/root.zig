@@ -18,7 +18,15 @@ pub const StreamLimit = types.StreamLimit;
 pub const StreamBlocked = types.StreamBlocked;
 pub const ConnectionId = types.ConnectionId;
 pub const ConnectionClose = types.ConnectionClose;
+pub const PacketKind = types.PacketKind;
 pub const Frame = types.Frame;
+pub const datagram_type = types.datagram_type;
+pub const datagram_len_type = types.datagram_len_type;
+pub const datagram_is_ack_eliciting = types.datagram_is_ack_eliciting;
+pub const datagram_is_congestion_controlled = types.datagram_is_congestion_controlled;
+pub const datagram_is_retransmittable = types.datagram_is_retransmittable;
+pub const isDatagramType = types.isDatagramType;
+pub const datagramAllowedIn = types.datagramAllowedIn;
 
 pub const Iterator = struct {
     payload: []const u8,
@@ -69,6 +77,12 @@ pub fn parseOne(payload: []const u8, cursor: *usize) !Frame {
         0x1c => .{ .connection_close = try parseConnectionClose(payload, cursor, true) },
         0x1d => .{ .connection_close = try parseConnectionClose(payload, cursor, false) },
         0x1e => .handshake_done,
+        datagram_type => blk: {
+            const data = payload[cursor.*..];
+            cursor.* = payload.len;
+            break :blk .{ .datagram = data };
+        },
+        datagram_len_type => .{ .datagram_len = try readLengthPrefixed(payload, cursor) },
         else => error.UnknownFrameType,
     };
 }
@@ -215,6 +229,8 @@ test "canonical frame encoding reparses idempotently" {
         "\x02\x0a\x00\x01\x02\x01\x01",
         "\x08\x04body",
         "\x1c\x01\x06\x04oops",
+        "\x30payload",
+        "\x31\x07payload",
     };
     for (inputs) |input| {
         var input_cursor: usize = 0;
@@ -227,6 +243,42 @@ test "canonical frame encoding reparses idempotently" {
         var second: [128]u8 = undefined;
         try std.testing.expectEqualSlices(u8, canonical, try writer.encode(&second, reparsed));
     }
+}
+
+test "QUIC DATAGRAM frames parse borrowed payloads and non-minimal lengths" {
+    var bytes = [_]u8{ 0x31, 0x40, 0x03, 'o', 'n', 'e', 0x01 };
+    var cursor: usize = 0;
+    const explicit = (try parseOne(&bytes, &cursor)).datagram_len;
+    try std.testing.expectEqualStrings("one", explicit);
+    try std.testing.expectEqual(@as(usize, 6), cursor);
+    bytes[3] = 'O';
+    try std.testing.expectEqualStrings("One", explicit);
+
+    const trailing = (try parseOne(&bytes, &cursor)).ping;
+    _ = trailing;
+
+    cursor = 0;
+    const implicit = (try parseOne("\x30rest\x01", &cursor)).datagram;
+    try std.testing.expectEqualStrings("rest\x01", implicit);
+    try std.testing.expectEqual(@as(usize, 6), cursor);
+
+    cursor = 0;
+    const non_minimal_type = (try parseOne("\x40\x31\x03two", &cursor)).datagram_len;
+    try std.testing.expectEqualStrings("two", non_minimal_type);
+    try std.testing.expectEqual(@as(usize, 6), cursor);
+}
+
+test "QUIC DATAGRAM frame metadata follows RFC 9221" {
+    try std.testing.expect(isDatagramType(0x30));
+    try std.testing.expect(isDatagramType(0x31));
+    try std.testing.expect(!isDatagramType(0x32));
+    try std.testing.expect(!datagramAllowedIn(.initial));
+    try std.testing.expect(datagramAllowedIn(.zero_rtt));
+    try std.testing.expect(!datagramAllowedIn(.handshake));
+    try std.testing.expect(datagramAllowedIn(.one_rtt));
+    try std.testing.expect(datagram_is_ack_eliciting);
+    try std.testing.expect(datagram_is_congestion_controlled);
+    try std.testing.expect(!datagram_is_retransmittable);
 }
 
 test "QUIC connection IDs and close reasons remain borrowed" {

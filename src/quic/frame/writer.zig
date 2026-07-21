@@ -64,6 +64,11 @@ const Writer = struct {
             .path_response => |data| try self.typedBytes(0x1b, &data),
             .connection_close => |close| try self.connectionClose(close),
             .handshake_done => try self.integer(0x1e),
+            .datagram => |data| try self.typedBytes(types.datagram_type, data),
+            .datagram_len => |data| {
+                try self.integer(types.datagram_len_type);
+                try self.lengthPrefixed(data);
+            },
         }
     }
 
@@ -201,6 +206,17 @@ test "frame writer canonicalizes stream and ACK encodings" {
     try std.testing.expectEqualStrings("\x02\x0a\x00\x01\x02\x01\x01", encoded_ack);
 }
 
+test "frame writer emits canonical DATAGRAM variants" {
+    var output: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("\x30payload", try encode(&output, .{ .datagram = "payload" }));
+    try std.testing.expectEqualStrings("\x31\x07payload", try encode(&output, .{ .datagram_len = "payload" }));
+
+    const payload = @as([64]u8, @splat(0xa5));
+    const encoded = try encode(&output, .{ .datagram_len = &payload });
+    try std.testing.expectEqualSlices(u8, &.{ 0x31, 0x40, 0x40 }, encoded[0..3]);
+    try std.testing.expectEqual(@as(usize, 67), encoded.len);
+}
+
 test "frame writer round trips every frame family" {
     const reset_token = "0123456789abcdef".*;
     const cases = [_]types.Frame{
@@ -226,6 +242,8 @@ test "frame writer round trips every frame family" {
         .{ .connection_close = .{ .error_code = 1, .frame_type = 6, .reason = "closed" } },
         .{ .connection_close = .{ .error_code = 2, .frame_type = null, .reason = "app" } },
         .handshake_done,
+        .{ .datagram = "remainder" },
+        .{ .datagram_len = "bounded" },
     };
 
     for (cases) |case| {

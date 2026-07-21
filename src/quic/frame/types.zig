@@ -57,6 +57,23 @@ pub const ConnectionClose = struct {
     reason: []const u8,
 };
 
+pub const datagram_type: u64 = 0x30;
+pub const datagram_len_type: u64 = 0x31;
+pub const datagram_is_ack_eliciting = true;
+pub const datagram_is_congestion_controlled = true;
+pub const datagram_is_retransmittable = false;
+
+pub const PacketKind = enum { initial, zero_rtt, handshake, one_rtt };
+
+pub fn isDatagramType(frame_type: u64) bool {
+    return frame_type == datagram_type or frame_type == datagram_len_type;
+}
+
+/// RFC 9221 DATAGRAM frames are only legal in 0-RTT and 1-RTT packets.
+pub fn datagramAllowedIn(kind: PacketKind) bool {
+    return kind == .zero_rtt or kind == .one_rtt;
+}
+
 pub const Frame = union(enum) {
     padding: usize,
     ping,
@@ -80,4 +97,8 @@ pub const Frame = union(enum) {
     path_response: [8]u8,
     connection_close: ConnectionClose,
     handshake_done,
+    /// DATAGRAM (type 0x30): consumes the remainder of the packet payload.
+    datagram: []const u8,
+    /// DATAGRAM_LEN (type 0x31): carries an explicit payload length.
+    datagram_len: []const u8,
 };
