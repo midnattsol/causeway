@@ -1,7 +1,7 @@
 //! End-to-end tests for the public HTTP/1 connection handler.
 
 const std = @import("std");
-const connection = @import("connection.zig");
+const connection = @import("connection/root.zig");
 const Headers = @import("../../message/headers.zig").Headers;
 const HttpContext = @import("../../context.zig").Context;
 const request_module = @import("../../message/request.zig");

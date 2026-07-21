@@ -1,8 +1,8 @@
 //! HTTP/1.x implementation of request-scoped exchange capabilities.
 
 const std = @import("std");
-const Headers = @import("../../message/headers.zig").Headers;
-const response_head = @import("response/head.zig");
+const Headers = @import("../../../message/headers.zig").Headers;
+const response_head = @import("../response/head.zig");
 const Io = std.Io;
 
 pub const Adapter = struct {
