@@ -1,7 +1,7 @@
 //! HTTP/2 frame serialization over a generic Zig writer.
 
 const std = @import("std");
-const frame = @import("frame.zig");
+const frame = @import("root.zig");
 const Io = std.Io;
 
 pub const Encoder = struct {
@@ -76,7 +76,7 @@ pub const Encoder = struct {
         try self.write(.ping, if (ack) frame.Flag.ack else 0, 0, data);
     }
 
-    pub fn writeRstStream(self: *Encoder, stream_id: u32, code: @import("error.zig").Code) !void {
+    pub fn writeRstStream(self: *Encoder, stream_id: u32, code: @import("../error.zig").Code) !void {
         var payload: [4]u8 = undefined;
         frame.writeU32(&payload, @intFromEnum(code));
         try self.write(.rst_stream, 0, stream_id, &payload);
@@ -85,7 +85,7 @@ pub const Encoder = struct {
     pub fn writeGoaway(
         self: *Encoder,
         last_stream_id: u32,
-        code: @import("error.zig").Code,
+        code: @import("../error.zig").Code,
         debug_data: []const u8,
     ) !void {
         if (last_stream_id > 0x7fff_ffff) return error.InvalidStreamId;

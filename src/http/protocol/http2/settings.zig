@@ -1,7 +1,7 @@
 //! HTTP/2 SETTINGS parsing and peer capability state.
 
 const std = @import("std");
-const frame = @import("frame.zig");
+const frame = @import("frame/root.zig");
 
 pub const Id = enum(u16) {
     header_table_size = 0x1,

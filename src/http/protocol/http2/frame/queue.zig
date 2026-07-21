@@ -1,7 +1,7 @@
 //! Lock-free bounded SPSC queue between the socket reader and controller.
 
 const std = @import("std");
-const frame = @import("frame.zig");
+const frame = @import("root.zig");
 const Io = std.Io;
 
 pub const WakeSink = struct {

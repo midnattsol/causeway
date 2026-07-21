@@ -1,7 +1,7 @@
 //! Buffered, allocation-free HTTP/2 frame decoding.
 
 const std = @import("std");
-const frame = @import("frame.zig");
+const frame = @import("root.zig");
 const Io = std.Io;
 
 pub const Decoder = struct {

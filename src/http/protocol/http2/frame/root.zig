@@ -1,7 +1,7 @@
 //! Allocation-free HTTP/2 frame header and payload parsing.
 
 const std = @import("std");
-const ErrorCode = @import("error.zig").Code;
+const ErrorCode = @import("../error.zig").Code;
 
 pub const client_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 pub const header_size = 9;

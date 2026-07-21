@@ -1,7 +1,7 @@
 const std = @import("std");
 const connection = @import("http/protocol/http2/connection.zig");
 const errors = @import("http/protocol/http2/error.zig");
-const frame = @import("http/protocol/http2/frame.zig");
+const frame = @import("http/protocol/http2/frame/root.zig");
 const Response = @import("http/message/response.zig").Response;
 
 const State = struct { requests: usize = 0 };

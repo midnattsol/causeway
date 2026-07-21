@@ -4,10 +4,10 @@ const std = @import("std");
 
 pub const connection = @import("connection.zig");
 pub const errors = @import("error.zig");
-pub const frame = @import("frame.zig");
-pub const frame_queue = @import("frame_queue.zig");
-pub const frame_reader = @import("frame_reader.zig");
-pub const frame_writer = @import("frame_writer.zig");
+pub const frame = @import("frame/root.zig");
+pub const frame_queue = @import("frame/queue.zig");
+pub const frame_reader = @import("frame/reader.zig");
+pub const frame_writer = @import("frame/writer.zig");
 pub const header_block = @import("header_block.zig");
 pub const header_semantics = @import("header_semantics.zig");
 pub const hpack = @import("hpack/root.zig");
