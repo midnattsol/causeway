@@ -1,5 +1,5 @@
 const std = @import("std");
-const connection = @import("http/protocol/http2/connection.zig");
+const connection = @import("http/protocol/http2/connection/root.zig");
 const frame = @import("http/protocol/http2/frame/root.zig");
 const Response = @import("http/message/response.zig").Response;
 const frame_reader = @import("http/protocol/http2/frame/reader.zig");

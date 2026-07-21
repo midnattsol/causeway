@@ -2,7 +2,7 @@
 
 const std = @import("std");
 
-pub const connection = @import("connection.zig");
+pub const connection = @import("connection/root.zig");
 pub const errors = @import("error.zig");
 pub const frame = @import("frame/root.zig");
 pub const frame_queue = @import("frame/queue.zig");
