@@ -5,6 +5,9 @@ const connection = @import("../connection/root.zig");
 const header = @import("../packet/header.zig");
 const tls_server = @import("../tls/server.zig");
 const transport_parameters = @import("../crypto/transport_parameters.zig");
+const retry = @import("../packet/retry.zig");
+const retry_token = @import("token.zig");
+const stateless_reset = @import("stateless_reset.zig");
 
 const Io = std.Io;
 const net = Io.net;
@@ -18,6 +21,8 @@ pub const Entropy = struct {
     }
 };
 
+pub const RetryMode = enum { disabled, always };
+
 pub const Policy = struct {
     /// Credentials and slices retained by transport parameters must outlive the endpoint.
     credentials: *const tls_server.ServerCredentials,
@@ -26,6 +31,16 @@ pub const Policy = struct {
     connection_id_length: u8 = 16,
     /// Optional deterministic entropy source for tests. Production defaults to `io.random`.
     entropy: ?Entropy = null,
+    retry_mode: RetryMode = .disabled,
+    /// Copied into endpoint-owned policy storage. Required when Retry is enabled.
+    retry_token_secret: ?[retry_token.secret_length]u8 = null,
+    /// Retry-token validity in the same monotonic units supplied as `now`.
+    retry_token_lifetime: u64 = 10 * 60 * 1_000_000_000,
+    /// Enables outgoing stateless reset and deterministic per-CID reset tokens.
+    stateless_reset_secret: ?[32]u8 = null,
+    /// Global reset-response cap per interval, in addition to `batch_size`.
+    stateless_reset_burst: u16 = 64,
+    stateless_reset_interval: u64 = 1_000_000_000,
     /// NAT rebinding (same IP, new port) remains permitted when active migration is disabled.
     allow_nat_rebinding: bool = true,
     /// Unsafe by default: normally even rebinding is validated before becoming active.
@@ -48,6 +63,17 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
         pub const capacity_value = capacity;
         pub const transcript_bytes = connection_limits.tls_transcript_bytes;
 
+        const PendingStateless = struct {
+            address: net.IpAddress = undefined,
+            length: usize = 0,
+        };
+
+        const ReplayEntry = struct {
+            occupied: bool = false,
+            nonce: [retry_token.nonce_length]u8 = undefined,
+            expires_at: u64 = 0,
+        };
+
         pub const Slot = struct {
             storage: Storage = .{},
             transcript: [transcript_bytes]u8 = undefined,
@@ -67,6 +93,12 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
         receive_storage: [batch_size * connection_limits.max_datagram_size]u8 = undefined,
         send_messages: [batch_size]net.OutgoingMessage = undefined,
         send_storage: [batch_size][connection_limits.max_datagram_size]u8 = undefined,
+        pending_stateless: [batch_size]PendingStateless = @splat(.{}),
+        pending_stateless_count: usize = 0,
+        replay_cache: [capacity * 2]ReplayEntry = @splat(.{}),
+        replay_cursor: usize = 0,
+        reset_window_started_at: u64 = 0,
+        reset_window_count: u16 = 0,
         shutting_down: bool = false,
 
         /// Initializes around an already-bound datagram socket. `self` must remain at a stable address.
@@ -77,6 +109,10 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
                 return error.ActiveConnectionIdLimitExceedsCapacity;
             if (policy.path_validation_attempts == 0 or policy.path_validation_interval == 0)
                 return error.InvalidPathValidationPolicy;
+            if (policy.retry_mode != .disabled and (policy.retry_token_secret == null or policy.retry_token_lifetime == 0))
+                return error.InvalidRetryPolicy;
+            if (policy.stateless_reset_secret != null and (policy.stateless_reset_burst == 0 or policy.stateless_reset_interval == 0))
+                return error.InvalidStatelessResetPolicy;
             self.* = .{ .socket = socket, .policy = policy };
         }
 
@@ -123,8 +159,10 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
         }
 
         /// Demultiplexes a received batch without allocation or I/O except entropy generation.
-        /// Truncated and malformed datagrams, pool exhaustion, and unknown non-Initial packets are dropped.
+        /// Truncated/malformed datagrams and pool exhaustion are dropped; eligible
+        /// unknown packets may queue bounded Retry or stateless-reset responses.
         pub fn processBatch(self: *Self, io: Io, messages: []net.IncomingMessage, now: u64) void {
+            self.pending_stateless_count = 0;
             for (messages[0..@min(messages.len, batch_size)]) |message| {
                 if (message.flags.trunc or message.data.len == 0) continue;
                 const invariant = header.parse(message.data, self.policy.connection_id_length) catch continue;
@@ -143,9 +181,33 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
                         slot.connection.onStatelessReset(now);
                         continue;
                     }
+                    self.queueStatelessReset(io, message, invariant.destination_id, now);
+                    continue;
                 }
                 if (self.shutting_down or message.data.len < 1200 or invariant.packet_type != .initial or
                     invariant.version != header.version_1 or invariant.destination_id.len < 8) continue;
+
+                var token_contents: ?retry_token.Contents = null;
+                if (self.policy.retry_mode == .always) {
+                    token_contents = retry_token.open(
+                        invariant.token,
+                        self.policy.retry_token_secret.?,
+                        message.from,
+                        now,
+                        self.policy.retry_token_lifetime,
+                        invariant.version.?,
+                    ) catch {
+                        self.queueRetry(io, message, invariant, now);
+                        continue;
+                    };
+                    if (!std.mem.eql(u8, invariant.destination_id, token_contents.?.retrySourceId()) or
+                        self.tokenWasReplayed(invariant.token, now))
+                    {
+                        self.queueRetry(io, message, invariant, now);
+                        continue;
+                    }
+                }
+
                 const slot = self.freeSlot() orelse continue;
                 var entropy_bytes: [100]u8 = undefined;
                 const cid_len: usize = self.policy.connection_id_length;
@@ -167,21 +229,26 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
                 });
                 _ = slot.paths.observe(message.from, message.data.len, @splat(0)) catch unreachable;
                 var parameter_values = self.policy.transport_parameters;
-                parameter_values.original_destination_connection_id = invariant.destination_id;
+                const original_destination_id = if (token_contents) |*contents| contents.originalDestinationId() else invariant.destination_id;
+                parameter_values.original_destination_connection_id = original_destination_id;
                 parameter_values.initial_source_connection_id = entropy_bytes[0..cid_len];
-                parameter_values.retry_source_connection_id = null;
-                const reset_token: *const [16]u8 = @ptrCast(entropy_bytes[84..100]);
-                parameter_values.stateless_reset_token = reset_token;
+                parameter_values.retry_source_connection_id = if (token_contents) |*contents| contents.retrySourceId() else null;
+                const reset_token_value: [16]u8 = if (self.policy.stateless_reset_secret) |secret|
+                    stateless_reset.deriveToken(secret, entropy_bytes[0..cid_len])
+                else
+                    entropy_bytes[84..100].*;
+                parameter_values.stateless_reset_token = &reset_token_value;
                 const encoded_parameters = transport_parameters.encode(
                     &slot.encoded_transport_parameters,
                     parameter_values,
                     .server,
                 ) catch continue;
                 slot.connection = Connection.init(&slot.storage, .{
-                    .original_destination_id = invariant.destination_id,
+                    .original_destination_id = original_destination_id,
+                    .initial_destination_id = invariant.destination_id,
                     .client_source_id = invariant.source_id,
                     .server_connection_id = entropy_bytes[0..cid_len],
-                    .server_reset_token = reset_token.*,
+                    .server_reset_token = reset_token_value,
                     .tls = .{
                         .credentials = self.policy.credentials,
                         .server_random = entropy_bytes[20..52].*,
@@ -195,7 +262,13 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
                 if (slot.generation == 0) slot.generation = 1;
                 slot.occupied = true;
                 slot.connection.receiveDatagram(message.data, now) catch {};
-                if (slot.connection.space(.initial).received.largest() == null) slot.occupied = false;
+                if (slot.connection.space(.initial).received.largest() == null) {
+                    slot.occupied = false;
+                } else if (token_contents != null) {
+                    slot.connection.validateAddress();
+                    slot.paths.validateInitial();
+                    self.rememberToken(invariant.token, now);
+                }
             }
         }
 
@@ -277,6 +350,92 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
             return self.policy.path_validation_interval orelse slot.connection.pathValidationInterval();
         }
 
+        fn queueRetry(self: *Self, io: Io, message: net.IncomingMessage, invariant: header.Header, now: u64) void {
+            if (self.pending_stateless_count == batch_size) return;
+            var entropy: [retry_token.nonce_length + header.maximum_connection_id_length + 1]u8 = undefined;
+            self.fillEntropy(io, &entropy);
+            const cid_length: usize = self.policy.connection_id_length;
+            const retry_source_id = entropy[retry_token.nonce_length..][0..cid_length];
+            var token_storage: [retry_token.maximum_token_length]u8 = undefined;
+            const token = retry_token.seal(
+                &token_storage,
+                self.policy.retry_token_secret.?,
+                entropy[0..retry_token.nonce_length].*,
+                message.from,
+                now,
+                header.version_1,
+                invariant.destination_id,
+                retry_source_id,
+            ) catch return;
+            const index = self.pending_stateless_count;
+            const packet = retry.write(&self.send_storage[index], .{
+                .destination_id = invariant.source_id,
+                .source_id = retry_source_id,
+                .original_destination_id = invariant.destination_id,
+                .token = token,
+                .random_bits = entropy[entropy.len - 1],
+            }) catch return;
+            // Retry is never permitted to violate the anti-amplification budget.
+            if (packet.len > message.data.len *| 3) return;
+            self.pending_stateless[index] = .{ .address = message.from, .length = packet.len };
+            self.pending_stateless_count += 1;
+        }
+
+        fn queueStatelessReset(self: *Self, io: Io, message: net.IncomingMessage, destination_id: []const u8, now: u64) void {
+            const secret = self.policy.stateless_reset_secret orelse return;
+            if (self.pending_stateless_count == batch_size or message.data.len <= stateless_reset.minimum_packet_length or
+                !self.allowStatelessReset(now)) return;
+            const token = stateless_reset.deriveToken(secret, destination_id);
+            if (stateless_reset.looksLikeReset(message.data, token)) return;
+            const index = self.pending_stateless_count;
+            const maximum_length = @min(self.send_storage[index].len, message.data.len - 1);
+            self.fillEntropy(io, self.send_storage[index][0..maximum_length]);
+            const packet = stateless_reset.write(
+                &self.send_storage[index],
+                message.data.len,
+                self.send_storage[index][0..maximum_length],
+                token,
+            ) catch return;
+            self.pending_stateless[index] = .{ .address = message.from, .length = packet.len };
+            self.pending_stateless_count += 1;
+            self.reset_window_count += 1;
+        }
+
+        fn allowStatelessReset(self: *Self, now: u64) bool {
+            if (now < self.reset_window_started_at or now - self.reset_window_started_at >= self.policy.stateless_reset_interval) {
+                self.reset_window_started_at = now;
+                self.reset_window_count = 0;
+            }
+            return self.reset_window_count < self.policy.stateless_reset_burst;
+        }
+
+        fn tokenWasReplayed(self: *const Self, token: []const u8, now: u64) bool {
+            if (token.len < retry_token.nonce_length) return true;
+            const nonce: [retry_token.nonce_length]u8 = token[0..retry_token.nonce_length].*;
+            for (self.replay_cache) |entry| {
+                if (entry.occupied and entry.expires_at >= now and
+                    std.crypto.timing_safe.eql([retry_token.nonce_length]u8, entry.nonce, nonce)) return true;
+            }
+            return false;
+        }
+
+        fn rememberToken(self: *Self, token: []const u8, now: u64) void {
+            if (token.len < retry_token.nonce_length) return;
+            var selected = self.replay_cursor;
+            for (self.replay_cache, 0..) |entry, index| {
+                if (!entry.occupied or entry.expires_at < now) {
+                    selected = index;
+                    break;
+                }
+            }
+            self.replay_cache[selected] = .{
+                .occupied = true,
+                .nonce = token[0..retry_token.nonce_length].*,
+                .expires_at = now +| self.policy.retry_token_lifetime,
+            };
+            self.replay_cursor = (selected + 1) % self.replay_cache.len;
+        }
+
         fn replenishConnectionIds(self: *Self, io: Io, slot: *Slot) void {
             while (slot.connection.needsLocalConnectionId()) {
                 var entropy_bytes: [36]u8 = undefined;
@@ -285,7 +444,10 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
                     self.fillEntropy(io, &entropy_bytes);
                     const id = entropy_bytes[0..self.policy.connection_id_length];
                     if (self.find(id) != null) continue;
-                    const token: [16]u8 = entropy_bytes[20..36].*;
+                    const token: [16]u8 = if (self.policy.stateless_reset_secret) |secret|
+                        stateless_reset.deriveToken(secret, id)
+                    else
+                        entropy_bytes[20..36].*;
                     _ = slot.connection.issueLocalConnectionId(id, token) catch continue;
                     issued = true;
                     break;
@@ -300,7 +462,14 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
         }
 
         fn flush(self: *Self, io: Io, now: u64) !usize {
-            var count: usize = 0;
+            var count: usize = self.pending_stateless_count;
+            for (self.pending_stateless[0..count], 0..) |*pending, index| {
+                self.send_messages[index] = .{
+                    .address = &pending.address,
+                    .data_ptr = self.send_storage[index][0..pending.length].ptr,
+                    .data_len = pending.length,
+                };
+            }
             for (&self.slots) |*slot| {
                 if (!slot.occupied or count == batch_size) continue;
                 self.replenishConnectionIds(io, slot);
@@ -338,6 +507,7 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
                 count += 1;
             }
             if (count != 0) try self.socket.sendMany(io, self.send_messages[0..count], .{});
+            self.pending_stateless_count = 0;
             return count;
         }
 
@@ -429,6 +599,176 @@ test "endpoint bounds its pool, demuxes by server CID, enforces peer, and reaps"
     endpoint.slots[0].connection.state = .closed;
     endpoint.reap();
     try std.testing.expectEqual(@as(usize, 0), endpoint.activeCount());
+}
+
+test "Retry admission allocates only after valid token and restores transport parameters" {
+    const crypto_initial = @import("../crypto/initial.zig");
+    const protection = @import("../packet/protection.zig");
+    const packet_writer = @import("../packet/writer.zig");
+    const limits: connection.Limits = .{
+        .crypto_receive_bytes = 64,
+        .crypto_send_bytes = 64,
+        .tls_output_bytes = 128,
+        .max_datagram_size = 1200,
+    };
+    const E = Endpoint(limits, 1, 2);
+    const credentials = testCredentials();
+    const token_secret: [32]u8 = @splat(0x41);
+    const reset_secret: [32]u8 = @splat(0x52);
+    var endpoint: E = undefined;
+    try endpoint.init(undefined, .{
+        .credentials = &credentials,
+        .connection_id_length = 8,
+        .entropy = .{ .context = null, .fillFn = deterministicEntropy },
+        .retry_mode = .always,
+        .retry_token_secret = token_secret,
+        .retry_token_lifetime = 100,
+        .stateless_reset_secret = reset_secret,
+    });
+
+    const peer: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 4433 } };
+    var first_storage: [1200]u8 = undefined;
+    const first_keys: protection.Keys = .{ .aes_128_gcm = crypto_initial.derive("original").client.keys };
+    const first = try packet_writer.writeInitial(&first_storage, first_keys, .{
+        .destination_id = "original",
+        .source_id = "client",
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = "\x01",
+        .minimum_datagram_size = 1200,
+    });
+    var first_messages = [_]net.IncomingMessage{incoming(peer, first.packet)};
+    endpoint.processBatch(std.testing.io, &first_messages, 10);
+    try std.testing.expectEqual(@as(usize, 0), endpoint.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), endpoint.pending_stateless_count);
+
+    const retry_packet = endpoint.send_storage[0][0..endpoint.pending_stateless[0].length];
+    var retry_scratch: [256]u8 = undefined;
+    const parsed_retry = try retry.validate(retry_packet, "original", "client", &retry_scratch);
+    var retry_id: [20]u8 = undefined;
+    @memcpy(retry_id[0..parsed_retry.source_id.len], parsed_retry.source_id);
+    const retry_id_length = parsed_retry.source_id.len;
+    var retry_token_storage: [retry_token.maximum_token_length]u8 = undefined;
+    @memcpy(retry_token_storage[0..parsed_retry.token.len], parsed_retry.token);
+    const retry_token_length = parsed_retry.token.len;
+
+    var second_storage: [1200]u8 = undefined;
+    const second_keys: protection.Keys = .{ .aes_128_gcm = crypto_initial.derive(retry_id[0..retry_id_length]).client.keys };
+    const second = try packet_writer.writeInitial(&second_storage, second_keys, .{
+        .destination_id = retry_id[0..retry_id_length],
+        .source_id = "client",
+        .token = retry_token_storage[0..retry_token_length],
+        .packet_number = 1,
+        .packet_number_length = 2,
+        .payload = "\x01",
+        .minimum_datagram_size = 1200,
+    });
+    var second_messages = [_]net.IncomingMessage{incoming(peer, second.packet)};
+    endpoint.processBatch(std.testing.io, &second_messages, 20);
+    try std.testing.expectEqual(@as(usize, 1), endpoint.activeCount());
+    try std.testing.expect(endpoint.slots[0].connection.address_validated);
+    try std.testing.expect(endpoint.slots[0].paths.entries[0].validated);
+    const parameters = try transport_parameters.parse(endpoint.slots[0].connection.tls.local_transport_parameters, .server);
+    try std.testing.expectEqualStrings("original", parameters.original_destination_connection_id.?);
+    try std.testing.expectEqualStrings(retry_id[0..retry_id_length], parameters.retry_source_connection_id.?);
+    try std.testing.expectEqualSlices(
+        u8,
+        &stateless_reset.deriveToken(reset_secret, endpoint.slots[0].connection.serverConnectionId()),
+        parameters.stateless_reset_token.?,
+    );
+    try std.testing.expectEqualSlices(u8, parameters.stateless_reset_token.?, &endpoint.slots[0].connection.cids.local[0].reset_token);
+
+    // Replaying an admitted token does not allocate or replace connection state.
+    const generation = endpoint.slots[0].generation;
+    endpoint.processBatch(std.testing.io, &second_messages, 21);
+    try std.testing.expectEqual(generation, endpoint.slots[0].generation);
+    try std.testing.expectEqual(@as(usize, 1), endpoint.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), endpoint.pending_stateless_count);
+}
+
+test "invalid Retry token and wrong address never allocate a slot" {
+    const crypto_initial = @import("../crypto/initial.zig");
+    const protection = @import("../packet/protection.zig");
+    const packet_writer = @import("../packet/writer.zig");
+    const limits: connection.Limits = .{ .crypto_receive_bytes = 64, .crypto_send_bytes = 64, .tls_output_bytes = 128 };
+    const E = Endpoint(limits, 1, 1);
+    const credentials = testCredentials();
+    var endpoint: E = undefined;
+    try endpoint.init(undefined, .{
+        .credentials = &credentials,
+        .connection_id_length = 8,
+        .retry_mode = .always,
+        .retry_token_secret = @splat(0x61),
+        .retry_token_lifetime = 100,
+        .entropy = .{ .context = null, .fillFn = deterministicEntropy },
+    });
+    const original_peer: net.IpAddress = .{ .ip4 = .loopback(4433) };
+    const wrong_peer: net.IpAddress = .{ .ip4 = .loopback(4434) };
+    var token_storage: [retry_token.maximum_token_length]u8 = undefined;
+    const token = try retry_token.seal(&token_storage, @splat(0x61), @splat(7), original_peer, 10, header.version_1, "original", "retry-id");
+    var datagram: [1200]u8 = undefined;
+    const keys: protection.Keys = .{ .aes_128_gcm = crypto_initial.derive("retry-id").client.keys };
+    const packet = try packet_writer.writeInitial(&datagram, keys, .{
+        .destination_id = "retry-id",
+        .source_id = "client",
+        .token = token,
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = "\x01",
+        .minimum_datagram_size = 1200,
+    });
+    var messages = [_]net.IncomingMessage{incoming(wrong_peer, packet.packet)};
+    endpoint.processBatch(std.testing.io, &messages, 20);
+    try std.testing.expectEqual(@as(usize, 0), endpoint.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), endpoint.pending_stateless_count);
+}
+
+test "unknown plausible short packet queues bounded stateless reset" {
+    const limits: connection.Limits = .{ .tls_output_bytes = 128 };
+    const E = Endpoint(limits, 1, 2);
+    const credentials = testCredentials();
+    const secret: [32]u8 = @splat(0x73);
+    var endpoint: E = undefined;
+    try endpoint.init(undefined, .{
+        .credentials = &credentials,
+        .connection_id_length = 8,
+        .stateless_reset_secret = secret,
+        .stateless_reset_burst = 1,
+        .stateless_reset_interval = 10,
+        .entropy = .{ .context = null, .fillFn = deterministicEntropy },
+    });
+    const peer: net.IpAddress = .{ .ip4 = .loopback(4433) };
+    var unknown: [48]u8 = @splat(0xa5);
+    unknown[0] = 0x40;
+    unknown[1..9].* = "unknown!".*;
+    var messages = [_]net.IncomingMessage{incoming(peer, &unknown)};
+    endpoint.processBatch(std.testing.io, &messages, 0);
+    try std.testing.expectEqual(@as(usize, 1), endpoint.pending_stateless_count);
+    const reset = endpoint.send_storage[0][0..endpoint.pending_stateless[0].length];
+    try std.testing.expect(reset.len < unknown.len);
+    try std.testing.expectEqual(@as(usize, unknown.len - 1), reset.len);
+    const expected = stateless_reset.deriveToken(secret, "unknown!");
+    try std.testing.expectEqualSlices(u8, &expected, reset[reset.len - 16 ..]);
+
+    var rate_limited = unknown;
+    rate_limited[rate_limited.len - 1] ^= 1;
+    var rate_messages = [_]net.IncomingMessage{incoming(peer, &rate_limited)};
+    endpoint.processBatch(std.testing.io, &rate_messages, 1);
+    try std.testing.expectEqual(@as(usize, 0), endpoint.pending_stateless_count);
+    endpoint.processBatch(std.testing.io, &rate_messages, 10);
+    try std.testing.expectEqual(@as(usize, 1), endpoint.pending_stateless_count);
+
+    var reset_looking = unknown;
+    reset_looking[reset_looking.len - 16 ..].* = expected;
+    var reset_messages = [_]net.IncomingMessage{incoming(peer, &reset_looking)};
+    endpoint.processBatch(std.testing.io, &reset_messages, 1);
+    try std.testing.expectEqual(@as(usize, 0), endpoint.pending_stateless_count);
+
+    var too_short: [21]u8 = @splat(0);
+    too_short[0] = 0x40;
+    var short_messages = [_]net.IncomingMessage{incoming(peer, &too_short)};
+    endpoint.processBatch(std.testing.io, &short_messages, 2);
+    try std.testing.expectEqual(@as(usize, 0), endpoint.pending_stateless_count);
 }
 
 test "endpoint demuxes all active local CIDs and entropy replaces retired IDs" {

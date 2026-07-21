@@ -23,6 +23,7 @@ pub const LongOptions = struct {
 pub const InitialOptions = struct {
     destination_id: []const u8,
     source_id: []const u8,
+    token: []const u8 = &.{},
     packet_number: u64,
     packet_number_length: u3,
     payload: []const u8,
@@ -100,11 +101,11 @@ fn writeInitialAt(buffer: []u8, keys: protection.Keys, options: InitialOptions, 
         .packet_number_length = options.packet_number_length,
         .payload = options.payload,
     };
-    return writeLongPadded(buffer, keys, common, .initial, datagram_prefix_length, options.minimum_datagram_size);
+    return writeLongPadded(buffer, keys, common, .initial, datagram_prefix_length, options.minimum_datagram_size, options.token);
 }
 
 fn writeLong(buffer: []u8, keys: protection.Keys, options: LongOptions, packet_type: header.Type, datagram_prefix_length: usize) !Packet {
-    return writeLongPadded(buffer, keys, options, packet_type, datagram_prefix_length, null);
+    return writeLongPadded(buffer, keys, options, packet_type, datagram_prefix_length, null, &.{});
 }
 
 fn writeLongPadded(
@@ -114,6 +115,7 @@ fn writeLongPadded(
     packet_type: header.Type,
     datagram_prefix_length: usize,
     minimum_datagram_size: ?usize,
+    initial_token: []const u8,
 ) !Packet {
     if (packet_type != .initial and packet_type != .handshake) return error.InvalidPacketType;
     try validateConnectionId(options.destination_id);
@@ -122,8 +124,12 @@ fn writeLongPadded(
     var encoded_number: [4]u8 = undefined;
     const packet_number = try number.encode(&encoded_number, options.packet_number, options.packet_number_length);
     const invariant_length = try add(7, try add(options.destination_id.len, options.source_id.len));
-    const token_length: usize = if (packet_type == .initial) 1 else 0;
-    const base_header_length = try add(invariant_length, token_length);
+    var encoded_token_length: [8]u8 = undefined;
+    const token_length_bytes = if (packet_type == .initial)
+        try varint.encode(&encoded_token_length, @intCast(initial_token.len))
+    else
+        encoded_token_length[0..0];
+    const base_header_length = try add(invariant_length, try add(token_length_bytes.len, initial_token.len));
     const unpadded_length_value = try add(packet_number.len, try add(options.payload.len, protection.authentication_tag_length));
     var padding_length: usize = 0;
 
@@ -166,8 +172,10 @@ fn writeLongPadded(
     cursor = writeConnectionId(buffer, cursor, options.destination_id);
     cursor = writeConnectionId(buffer, cursor, options.source_id);
     if (packet_type == .initial) {
-        buffer[cursor] = 0; // Server Initial packets have an empty Token field.
-        cursor += 1;
+        @memcpy(buffer[cursor..][0..token_length_bytes.len], token_length_bytes);
+        cursor += token_length_bytes.len;
+        @memcpy(buffer[cursor..][0..initial_token.len], initial_token);
+        cursor += initial_token.len;
     }
     @memcpy(buffer[cursor..][0..length_bytes.len], length_bytes);
     cursor += length_bytes.len;

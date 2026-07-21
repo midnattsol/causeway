@@ -44,6 +44,9 @@ pub fn main(init: std.process.Init) !void {
     try server.bind(init.io, &address, .{
         .credentials = &credentials,
         .connection_id_length = 16,
+        .retry_mode = .always,
+        .retry_token_secret = @splat(0x41),
+        .stateless_reset_secret = @splat(0x52),
         .transport_parameters = .{
             .max_idle_timeout = 30_000,
             .initial_max_data = 16 * 1024 * 1024,

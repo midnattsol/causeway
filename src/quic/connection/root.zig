@@ -70,6 +70,9 @@ pub fn Storage(comptime limits: Limits) type {
 
 pub const Init = struct {
     original_destination_id: []const u8,
+    /// The DCID used for Initial key derivation. This differs from the ODCID
+    /// after a server Retry.
+    initial_destination_id: ?[]const u8 = null,
     client_source_id: []const u8,
     server_connection_id: []const u8,
     server_reset_token: [16]u8 = @splat(0),
@@ -102,6 +105,8 @@ pub fn Connection(comptime limits: Limits) type {
         close_reason_length: usize = 0,
         original_destination_id: [20]u8 = undefined,
         original_destination_id_len: u8,
+        initial_destination_id: [20]u8 = undefined,
+        initial_destination_id_len: u8,
         client_id: [20]u8 = undefined,
         client_id_len: u8,
         server_id: [20]u8 = undefined,
@@ -145,12 +150,15 @@ pub fn Connection(comptime limits: Limits) type {
         close_started: ?u64 = null,
 
         pub fn init(storage: *Storage(limits), options: Init) !Self {
-            if (options.original_destination_id.len > 20 or options.client_source_id.len > 20 or options.server_connection_id.len > 20)
+            const initial_destination_id = options.initial_destination_id orelse options.original_destination_id;
+            if (options.original_destination_id.len > 20 or initial_destination_id.len > 20 or
+                options.client_source_id.len > 20 or options.server_connection_id.len > 20)
                 return error.InvalidConnectionIdLength;
             if (options.server_connection_id.len == 0) return error.InvalidConnectionIdLength;
-            const secrets = crypto_initial.derive(options.original_destination_id);
+            const secrets = crypto_initial.derive(initial_destination_id);
             var result: Self = .{
                 .original_destination_id_len = @intCast(options.original_destination_id.len),
+                .initial_destination_id_len = @intCast(initial_destination_id.len),
                 .client_id_len = @intCast(options.client_source_id.len),
                 .server_id_len = @intCast(options.server_connection_id.len),
                 .cids = try ConnectionIds.init(options.server_connection_id, options.server_reset_token, options.client_source_id),
@@ -177,6 +185,7 @@ pub fn Connection(comptime limits: Limits) type {
                 .pacer = congestion.Pacer.init(options.now, limits.max_datagram_size * 10),
             };
             @memcpy(result.original_destination_id[0..options.original_destination_id.len], options.original_destination_id);
+            @memcpy(result.initial_destination_id[0..initial_destination_id.len], initial_destination_id);
             @memcpy(result.client_id[0..options.client_source_id.len], options.client_source_id);
             @memcpy(result.server_id[0..options.server_connection_id.len], options.server_connection_id);
             return result;
@@ -266,6 +275,9 @@ pub fn Connection(comptime limits: Limits) type {
 
         pub fn originalDestinationId(self: *const Self) []const u8 {
             return self.original_destination_id[0..self.original_destination_id_len];
+        }
+        pub fn initialDestinationId(self: *const Self) []const u8 {
+            return self.initial_destination_id[0..self.initial_destination_id_len];
         }
         pub fn initialClientConnectionId(self: *const Self) []const u8 {
             return self.client_id[0..self.client_id_len];

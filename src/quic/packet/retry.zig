@@ -13,6 +13,49 @@ pub const integrity_nonce = [_]u8{
     0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
 };
 
+pub const WriteOptions = struct {
+    destination_id: []const u8,
+    source_id: []const u8,
+    original_destination_id: []const u8,
+    token: []const u8,
+    /// Unpredictable low bits make Retry packets less linkable while preserving
+    /// the QUIC v1 long-header/fixed/type bits.
+    random_bits: u8 = 0,
+};
+
+/// Writes a canonical QUIC v1 Retry packet and its RFC 9001 integrity tag.
+pub fn write(buffer: []u8, options: WriteOptions) ![]u8 {
+    if (options.destination_id.len > header.maximum_connection_id_length or
+        options.source_id.len == 0 or options.source_id.len > header.maximum_connection_id_length or
+        options.original_destination_id.len > header.maximum_connection_id_length)
+        return error.InvalidConnectionIdLength;
+    if (options.token.len == 0) return error.EmptyRetryToken;
+    const without_tag_length = 7 + options.destination_id.len + options.source_id.len + options.token.len;
+    const packet_length = std.math.add(usize, without_tag_length, header.retry_integrity_tag_length) catch return error.PacketTooLarge;
+    if (buffer.len < packet_length) return error.InsufficientCapacity;
+
+    var cursor: usize = 0;
+    buffer[cursor] = 0xf0 | (options.random_bits & 0x0f);
+    cursor += 1;
+    std.mem.writeInt(u32, buffer[cursor..][0..4], header.version_1, .big);
+    cursor += 4;
+    buffer[cursor] = @intCast(options.destination_id.len);
+    cursor += 1;
+    @memcpy(buffer[cursor..][0..options.destination_id.len], options.destination_id);
+    cursor += options.destination_id.len;
+    buffer[cursor] = @intCast(options.source_id.len);
+    cursor += 1;
+    @memcpy(buffer[cursor..][0..options.source_id.len], options.source_id);
+    cursor += options.source_id.len;
+    @memcpy(buffer[cursor..][0..options.token.len], options.token);
+    cursor += options.token.len;
+
+    var scratch: [256]u8 = undefined;
+    const tag = try computeTag(options.original_destination_id, buffer[0..cursor], &scratch);
+    buffer[cursor..][0..header.retry_integrity_tag_length].* = tag;
+    return buffer[0..packet_length];
+}
+
 /// Computes the Retry Integrity Tag. The caller-provided scratch buffer keeps
 /// the operation allocation-free and must fit the ODCID prefix plus Retry bytes.
 pub fn computeTag(

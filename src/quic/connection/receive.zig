@@ -78,7 +78,7 @@ fn packetLevel(packet_type: header.Type) ?types.Level {
 
 fn validDestination(self: anytype, id: []const u8, level: types.Level) bool {
     if (self.acceptsLocalConnectionId(id)) return true;
-    return level == .initial and std.mem.eql(u8, id, self.originalDestinationId());
+    return level == .initial and std.mem.eql(u8, id, self.initialDestinationId());
 }
 
 fn dispatchFrames(self: anytype, level: types.Level, destination_sequence: u64, payload: []const u8, now: u64) !bool {
