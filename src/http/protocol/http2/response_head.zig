@@ -34,7 +34,7 @@ pub fn validate(headers: Headers) !void {
             if (byte == ':' or byte <= ' ' or byte == 0x7f) return error.InvalidResponseHeader;
         }
         for (field.value) |byte| {
-            if (byte == 0 or byte == '\r' or byte == '\n') return error.InvalidResponseHeader;
+            if ((byte < ' ' and byte != '\t') or byte == 0x7f) return error.InvalidResponseHeader;
         }
         if (isConnectionSpecific(field.name)) return error.ConnectionSpecificHeader;
         if (std.ascii.eqlIgnoreCase(field.name, "te") and

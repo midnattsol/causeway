@@ -23,6 +23,7 @@ const response_head = @import("response_head.zig");
 const settings = @import("settings.zig");
 const stream_module = @import("stream.zig");
 const stream_registry = @import("stream_registry.zig");
+const trailer_policy = @import("trailers.zig");
 const Io = std.Io;
 const net = Io.net;
 
@@ -40,6 +41,10 @@ pub const Options = struct {
     header_table_size: usize = 4096,
     request_body_buffer_size: usize = 65_535,
     max_body_size: usize = 1024 * 1024,
+    max_request_trailer_count: usize = 32,
+    max_request_trailer_size: usize = 8 * 1024,
+    max_response_trailer_count: usize = 32,
+    max_response_trailer_size: usize = 8 * 1024,
     response_body_buffer_size: usize = 64 * 1024,
     response_writer_buffer_size: usize = 8 * 1024,
     read_buffer_size: usize = 16 * 1024,
@@ -117,6 +122,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             response: ?Response = null,
             output: ?*outbound_body.Pipe = null,
             response_started: Io.Event = .unset,
+            response_headers_sent: bool = false,
             task_done: bool = false,
             output_done: bool = false,
             bytes_offset: usize = 0,
@@ -428,6 +434,11 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 if (self.sessions.get(stream_id)) |session| {
                     var block = self.decoder.decode(session.arena.allocator(), bytes) catch |err| return self.connectionFailure(.compression_error, err);
                     const trailers = header_semantics.validateTrailers(block.items) catch |err| return self.streamFailure(stream_id, .protocol_error, err);
+                    trailer_policy.validateIncoming(
+                        trailers,
+                        self.owner.options.max_request_trailer_count,
+                        self.owner.options.max_request_trailer_size,
+                    ) catch |err| return self.streamFailure(stream_id, .protocol_error, err);
                     try session.input.setTrailers(trailers);
                     self.verifyBodyEnd(session) catch |err| return self.streamFailure(stream_id, .protocol_error, err);
                     session.input.finish();
@@ -536,6 +547,11 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
             fn startResponse(self: *Controller, session: *Session) !void {
                 const response = &session.response.?;
+                if (response.body == .stream) try trailer_policy.validateNames(
+                    response.body.stream.trailer_names,
+                    self.owner.options.max_response_trailer_count,
+                    self.owner.options.max_response_trailer_size,
+                );
                 const no_body = session.request.method.is(.HEAD) or response.status.class() == .informational or
                     response.status == .no_content or response.status == .not_modified;
                 const bytes = response.body.asBytes();
@@ -549,6 +565,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 } else if (self.registry.get(session.id)) |stream| {
                     _ = try stream.sendHeaders(false);
                 }
+                session.response_headers_sent = true;
             }
 
             fn writeResponseHead(self: *Controller, session: *Session, status: std.http.Status, headers: Headers, end_stream: bool) !void {
@@ -561,7 +578,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
 
             fn outputReady(self: *Controller, session: *Session) bool {
-                if (session.response == null or session.output_done) return false;
+                if (session.response == null or !session.response_headers_sent or session.output_done) return false;
                 const stream = self.registry.get(session.id) orelse return false;
                 const has_window = stream.send_window.value > 0 and self.connection_send_window.value > 0;
                 return switch (session.response.?.body) {
@@ -652,10 +669,17 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 return true;
             }
 
-            fn writeTrailers(self: *Controller, session: *Session, trailers: Headers) !void {
-                try response_head.validate(trailers);
+            fn writeTrailers(self: *Controller, session: *Session, trailer_fields: Headers) !void {
+                const stream_body = session.response.?.body.stream;
+                try trailer_policy.validateOutgoing(
+                    stream_body.trailer_names,
+                    trailer_fields,
+                    self.owner.options.max_response_trailer_count,
+                    self.owner.options.max_response_trailer_size,
+                );
+                try response_head.validate(trailer_fields);
                 var output = Io.Writer.fixed(self.header_output);
-                try self.encoder.encodeLowercase(&output, trailers.items, self.header_name_scratch);
+                try self.encoder.encodeLowercase(&output, trailer_fields.items, self.header_name_scratch);
                 try output.flush();
                 try self.writer.writeHeaderBlock(session.id, output.buffered(), true);
                 if (self.registry.get(session.id)) |stream| _ = try stream.sendHeaders(true);
@@ -908,6 +932,44 @@ test "HTTP/2 keeps valid multiplexed streams alive after a malformed request" {
     try std.testing.expect(serverOutputContains(output.written(), .headers, 3));
 }
 
+test "HTTP/2 request and response trailers survive stream boundaries" {
+    const AppState = struct { request_digest: [3]u8 = undefined };
+    const Producer = struct {
+        pub fn produce(_: *@This(), writer: *Io.Writer) !void {
+            try writer.writeAll("x");
+        }
+        pub fn trailers(_: *@This()) Headers {
+            return .{ .items = &.{.{ .name = "digest", .value = "response" }} };
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            _ = try context.request.body.readAll();
+            @memcpy(&context.execution.state.request_digest, (try context.request.body.trailers()).get("digest").?);
+            const body = try response_module.Stream.init(context.execution.allocator, Producer{}, .{
+                .trailer_names = &.{"digest"},
+            });
+            return Response.streaming(.ok, .empty, body);
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(4));
+    const bytes = frame.client_preface ++
+        "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++
+        "\x00\x00\x07\x01\x04\x00\x00\x00\x01\x83\x87\x84\x0f\x0d\x01\x34" ++
+        "\x00\x00\x04\x00\x00\x00\x00\x00\x01body" ++
+        "\x00\x00\x0c\x01\x05\x00\x00\x00\x01\x00\x06digest\x03abc";
+    var input: Io.Reader = .fixed(bytes);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: AppState = .{};
+    var handler = Handler(AppState, Dispatcher).init(std.testing.allocator, &state, .{});
+    try handler.serve(&input, &output.writer, threaded.io());
+    try std.testing.expectEqualStrings("abc", &state.request_digest);
+    try std.testing.expectEqual(@as(usize, 2), serverFrameCount(output.written(), .headers, 1));
+}
+
 test "HTTP/2 response stream backpressures only its producer" {
     const AppState = struct {};
     const Producer = struct {
@@ -967,6 +1029,59 @@ test "HTTP/2 dispatch reads a DATA-backed request body concurrently" {
     try std.testing.expect(serverOutputContains(output.written(), .data, 1));
 }
 
+test "HTTP/2 graceful drain sends GOAWAY and waits for active dispatch" {
+    const AppState = struct { started: Io.Event = .unset, release: Io.Event = .unset };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            context.execution.state.started.set(context.execution.io);
+            try context.execution.state.release.wait(context.execution.io);
+            return .{ .status = .ok };
+        }
+    };
+    const Trigger = struct {
+        fn run(io: Io, draining: *std.atomic.Value(bool), drain: *Io.Event, started: *Io.Event, release: *Io.Event) !void {
+            try started.wait(io);
+            draining.store(true, .release);
+            drain.set(io);
+            try Io.sleep(io, .fromMilliseconds(1), .awake);
+            release.set(io);
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(5));
+    const io = threaded.io();
+    const bytes = frame.client_preface ++
+        "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++
+        "\x00\x00\x03\x01\x05\x00\x00\x00\x01\x82\x87\x84";
+    var input: Io.Reader = .fixed(bytes);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var draining: std.atomic.Value(bool) = .init(false);
+    var drain_event: Io.Event = .unset;
+    var state: AppState = .{};
+    var trigger = Io.async(io, Trigger.run, .{ io, &draining, &drain_event, &state.started, &state.release });
+    var handler = Handler(AppState, Dispatcher).init(std.testing.allocator, &state, .{});
+    try handler.serveControlled(&input, &output.writer, .{ .draining = &draining, .drain_event = &drain_event }, io);
+    try trigger.await(io);
+    try std.testing.expect(serverOutputContains(output.written(), .goaway, 0));
+    try std.testing.expect(serverOutputContains(output.written(), .headers, 1));
+}
+
+fn serverFrameCount(bytes: []const u8, frame_type: frame.Type, stream_id: u32) usize {
+    var cursor: usize = 0;
+    var count: usize = 0;
+    while (bytes.len - cursor >= frame.header_size) {
+        const header_bytes: *const [frame.header_size]u8 = @ptrCast(bytes[cursor..][0..frame.header_size]);
+        const header = frame.Header.parse(header_bytes);
+        cursor += frame.header_size;
+        if (header.length > bytes.len - cursor) return count;
+        if (header.frame_type == frame_type and header.stream_id == stream_id) count += 1;
+        cursor += header.length;
+    }
+    return count;
+}
+
 fn serverDataLength(bytes: []const u8, stream_id: u32) usize {
     var cursor: usize = 0;
     var total: usize = 0;
@@ -1002,6 +1117,8 @@ fn validateOptions(options: Options) !void {
     if (options.max_header_name_size == 0 or options.max_header_string_size == 0) return error.InvalidHeaderLimits;
     if (options.header_table_size > std.math.maxInt(u32)) return error.InvalidHeaderTableSize;
     if (options.request_body_buffer_size < 65_535 or options.request_body_buffer_size > 0x7fff_ffff) return error.InvalidBodyBufferSize;
+    if (options.max_request_trailer_count == 0 or options.max_request_trailer_size == 0 or
+        options.max_response_trailer_count == 0 or options.max_response_trailer_size == 0) return error.InvalidTrailerLimits;
     if (options.response_body_buffer_size == 0 or options.response_writer_buffer_size == 0) return error.InvalidBodyBufferSize;
     if (options.read_buffer_size == 0 or options.write_buffer_size == 0 or options.control_queue_capacity == 0) return error.InvalidBufferSize;
 }

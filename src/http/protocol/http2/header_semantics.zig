@@ -143,7 +143,7 @@ fn validateName(name: []const u8) !void {
 
 fn validateValue(value: []const u8) !void {
     for (value) |byte| {
-        if (byte == 0 or byte == '\r' or byte == '\n') return error.InvalidHeaderValue;
+        if ((byte < ' ' and byte != '\t') or byte == 0x7f) return error.InvalidHeaderValue;
     }
 }
 

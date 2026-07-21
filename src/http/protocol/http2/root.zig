@@ -18,6 +18,7 @@ pub const response_head = @import("response_head.zig");
 pub const settings = @import("settings.zig");
 pub const stream = @import("stream.zig");
 pub const stream_registry = @import("stream_registry.zig");
+pub const trailers = @import("trailers.zig");
 
 pub const Handler = connection.Handler;
 pub const HandlerWithLocals = connection.HandlerWithLocals;
