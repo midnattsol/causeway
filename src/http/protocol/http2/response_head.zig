@@ -29,10 +29,7 @@ pub fn encode(
 
 pub fn validate(headers: Headers) !void {
     for (headers.items) |field| {
-        if (field.name.len == 0 or field.name[0] == ':') return error.InvalidResponseHeader;
-        for (field.name) |byte| {
-            if (byte == ':' or byte <= ' ' or byte == 0x7f) return error.InvalidResponseHeader;
-        }
+        if (field.name.len == 0 or field.name[0] == ':' or !isToken(field.name)) return error.InvalidResponseHeader;
         for (field.value) |byte| {
             if ((byte < ' ' and byte != '\t') or byte == 0x7f) return error.InvalidResponseHeader;
         }
@@ -40,6 +37,17 @@ pub fn validate(headers: Headers) !void {
         if (std.ascii.eqlIgnoreCase(field.name, "te") and
             !std.ascii.eqlIgnoreCase(std.mem.trim(u8, field.value, " \t"), "trailers")) return error.InvalidTeHeader;
     }
+}
+
+fn isToken(name: []const u8) bool {
+    for (name) |byte| {
+        if (std.ascii.isAlphanumeric(byte)) continue;
+        switch (byte) {
+            '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+            else => return false,
+        }
+    }
+    return true;
 }
 
 fn isConnectionSpecific(name: []const u8) bool {

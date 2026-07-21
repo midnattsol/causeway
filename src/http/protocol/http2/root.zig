@@ -15,6 +15,7 @@ pub const inbound_body = @import("inbound_body.zig");
 pub const outbound_body = @import("outbound_body.zig");
 pub const request = @import("request.zig");
 pub const response_head = @import("response_head.zig");
+pub const response_semantics = @import("response_semantics.zig");
 pub const settings = @import("settings.zig");
 pub const stream = @import("stream.zig");
 pub const stream_registry = @import("stream_registry.zig");

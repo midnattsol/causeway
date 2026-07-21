@@ -24,6 +24,7 @@ pub const Registry = struct {
     pub fn open(self: *Registry, id: u32, receive_window: i64, send_window: i64) !*Stream {
         if (id == 0 or id & 1 == 0 or id > 0x7fff_ffff) return error.ProtocolError;
         if (id <= self.highest_opened) return error.StreamIdNotIncreasing;
+        self.highest_opened = id;
         if (self.streams.count() >= self.maximum_active) return error.RefusedStream;
         const result = try self.streams.getOrPut(self.allocator, id);
         if (result.found_existing) return error.ProtocolError;
@@ -32,7 +33,6 @@ pub const Registry = struct {
             .receive_window = .{ .value = receive_window },
             .send_window = .{ .value = send_window },
         };
-        self.highest_opened = id;
         return result.value_ptr;
     }
 
@@ -73,6 +73,7 @@ test "registry enforces client stream IDs and active limit" {
     _ = try registry.open(1, 100, 200);
     _ = try registry.open(3, 100, 200);
     try std.testing.expectError(error.RefusedStream, registry.open(5, 100, 200));
+    try std.testing.expectError(error.StreamIdNotIncreasing, registry.open(5, 100, 200));
     try std.testing.expectError(error.ProtocolError, registry.open(2, 100, 200));
     try std.testing.expectError(error.StreamIdNotIncreasing, registry.open(1, 100, 200));
 }

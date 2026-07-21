@@ -56,8 +56,9 @@ pub fn parseRequest(fields: []const Header, extended_connect_enabled: bool) !Req
     if (method.is(.CONNECT)) {
         if (protocol) |extended_protocol| {
             if (!extended_connect_enabled) return error.ExtendedConnectDisabled;
-            if (extended_protocol.len == 0) return error.InvalidProtocol;
+            if (!isToken(extended_protocol)) return error.InvalidProtocol;
             if (scheme == null or authority == null or path == null) return error.InvalidExtendedConnect;
+            if (!isScheme(scheme.?)) return error.InvalidScheme;
         } else {
             if (authority == null or authority.?.len == 0) return error.MissingAuthority;
             if (scheme != null or path != null) return error.InvalidConnect;
@@ -65,8 +66,11 @@ pub fn parseRequest(fields: []const Header, extended_connect_enabled: bool) !Req
     } else {
         if (protocol != null) return error.InvalidProtocol;
         if (scheme == null) return error.MissingScheme;
+        if (!isScheme(scheme.?)) return error.InvalidScheme;
         if (path == null or path.?.len == 0) return error.MissingPath;
     }
+
+    if (authority) |value| if (value.len == 0) return error.MissingAuthority;
 
     return .{
         .method = method,
@@ -125,6 +129,26 @@ fn scan(fields: []const Header, kind: BlockKind, comptime visitPseudo: anytype, 
         try validateRegular(field, kind);
     }
     return regular_start;
+}
+
+fn isScheme(value: []const u8) bool {
+    if (value.len == 0 or !std.ascii.isAlphabetic(value[0])) return false;
+    for (value[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '+' and byte != '-' and byte != '.') return false;
+    }
+    return true;
+}
+
+fn isToken(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| {
+        if (std.ascii.isAlphanumeric(byte)) continue;
+        switch (byte) {
+            '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+            else => return false,
+        }
+    }
+    return true;
 }
 
 fn validateName(name: []const u8) !void {
