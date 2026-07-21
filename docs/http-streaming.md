@@ -2,11 +2,21 @@
 
 Causeway supports buffered and incremental request bodies, plus fixed and streaming responses. Routing, extractors, handlers, and middleware remain compile-time specialized; only the response stream producer is type-erased at the connection boundary.
 
+## Protocol mappings
+
+The shared `RequestBody` and `Response.Stream` APIs map to different wire mechanisms:
+
+- HTTP/1 reads from and writes to the connection stream; unknown response lengths use chunked transfer coding in HTTP/1.1.
+- HTTP/2 uses bounded per-stream DATA pipes, returns flow-control credit after application consumption, and schedules concurrent response streams through the connection controller.
+- HTTP/3 uses bounded request/response pipes over QUIC streams. Handlers run concurrently as `std.Io` tasks, consumed request bytes return QUIC stream and connection credit, and the single polling owner emits HEADERS/DATA/trailing HEADERS under transport flow control.
+
+HTTP/2 and HTTP/3 can dispatch a handler before the request FIN arrives and can apply backpressure independently per stream. See [`http2.md`](http2.md) and [`http3.md`](http3.md) for their ownership, limits, deadlines, and shutdown models.
+
 ## Request bodies
 
 Every HTTP request carries one shared `RequestBody` handle. Copies of `Request` or `Context` refer to the same request-scoped state.
 
-The body starts lazy: Causeway does not read bytes or send `100 Continue` until an extractor or middleware asks for them.
+The application-facing body starts lazy: Causeway does not expose bytes to an extractor or middleware until requested. HTTP/1 sends `100 Continue` only on the first real body read when applicable; HTTP/2 and HTTP/3 use stream DATA and flow-control backpressure rather than HTTP/1's continue handshake.
 
 ### Buffered body
 
@@ -78,7 +88,7 @@ A handler that deliberately ignores a request body can consume it without alloca
 try context.request.body.discard();
 ```
 
-A completely consumed or explicitly discarded body permits HTTP keep-alive. If a body remains unread or partially consumed, Causeway closes the connection rather than draining an unbounded upload implicitly.
+A completely consumed or explicitly discarded body permits HTTP/1 connection reuse. If an HTTP/1 body remains unread or partially consumed, Causeway closes the connection rather than draining an unbounded upload implicitly. HTTP/2 and HTTP/3 instead cancel or stop the affected stream and return/discard bounded flow credit without requiring an unrelated multiplexed stream to close.
 
 ### Limits and `Expect`
 
@@ -155,7 +165,7 @@ fn stream(context: *const AppContext) !causeway.http.response.Response {
 }
 ```
 
-When `content_length` is omitted, Causeway uses HTTP/1.1 chunked transfer encoding. HTTP/1.0 falls back to a close-delimited stream and disables keep-alive. The producer is invoked once for the whole response, not once per chunk.
+When `content_length` is omitted, HTTP/1.1 uses chunked transfer encoding and HTTP/1.0 falls back to a close-delimited stream. HTTP/2 and HTTP/3 emit DATA frames and end the protocol stream without HTTP/1 transfer codings. The producer is invoked once for the logical response and may block on a bounded per-stream pipe as the protocol owner drains output.
 
 A producer can advertise `Stream.Options.trailer_names` and implement `trailers()` to emit validated fields after a chunked body. Returned fields must have been announced, are bounded by the connection's response-trailer limits, and cannot affect framing, routing, authentication, response control, or content processing. Trailers are forbidden with a known content length and with HTTP/1.0.
 
@@ -244,8 +254,8 @@ Route-local completion callbacks receive an arena-backed context snapshot, inclu
 
 ## Connection and shutdown ownership
 
-Causeway does not support simultaneous full-duplex request and response streaming in HTTP/1.1. A handler consumes or discards the request body before its returned response producer runs.
+Causeway does not support simultaneous full-duplex request and response streaming in HTTP/1.1. A handler consumes or discards the request body before its returned response producer runs. HTTP/2 and HTTP/3 have independent multiplexed request/response pipes and connection-owned schedulers; handlers never write the transport directly.
 
 The request arena, locals, producer state, completion observers, and path-parameter snapshots remain alive until response production, finalization, and completion callbacks finish.
 
-An active stream remains an active server connection. Graceful shutdown stops accepting new connections, waits up to `shutdown_timeout`, then cancels and drains remaining producers. Their finalizers run before the connection task and arena are released.
+For HTTP/1, an active response stream keeps its server connection task active. HTTP/2 and HTTP/3 track active protocol streams inside a connection and drain them with GOAWAY. Graceful shutdown stops admission, waits up to the configured shutdown timeout, then cancels remaining work. Producer finalizers run before request arenas and connection/session storage are released.

@@ -1,6 +1,6 @@
 # HTTP/2 engine
 
-Causeway includes a server-side HTTP/2 engine in `src/http/protocol/http2/`. It owns the wire protocol rather than delegating it to `std.http.Server`: connection preface, frames, HPACK, pseudo-header semantics, stream state, multiplexing, flow control, request/response mapping, trailers, CONNECT, GOAWAY, and graceful drain.
+Causeway includes a server-side HTTP/2 engine in `src/http/protocol/http2/`. It owns the wire protocol rather than delegating it to `std.http.Server`: connection preface, frames, HPACK, pseudo-header semantics, stream state, multiplexing, flow control, request/response mapping, trailers, CONNECT, GOAWAY, and graceful drain. HTTP/3 uses a separate UDP/QUIC compositor documented in [`http3.md`](http3.md).
 
 ## Application composition
 
