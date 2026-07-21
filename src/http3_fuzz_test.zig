@@ -13,6 +13,10 @@ const corpus = &.{
     "\x07\x02\x40\x05",
     "\x3f\xbd\x01",
     "\x00\x00\xd1\xd7",
+    "\x40\x54\x00webtransport",
+    "\x40\x41\x00webtransport",
+    "\x40\x43\x07\x00\x00\x00\x00bye",
+    "\x80\x19\x0b\x4d\x3f\x01\x01",
     // Script seeds: open/feed a control stream, request stream, poll, and shutdown.
     "\x02\x02\x03\x00\x04\x00\x07\x08\x09",
     "\x00\x00\x05\x01\x03\x00\x00\xd1\xd7\x01\x00\x07",
@@ -44,7 +48,19 @@ fn fuzzProtocol(io: std.Io, smith: *std.testing.Smith) !void {
     try fuzzHuffman(input);
     fuzzInstructions(input);
     fuzzFields(input);
+    fuzzWebTransport(input);
     fuzzConnection(io, input);
+}
+
+fn fuzzWebTransport(input: []const u8) void {
+    inline for (.{ http3.webtransport.stream.Kind.unidirectional, .bidirectional }) |kind| {
+        _ = http3.webtransport.stream.parse(input, kind) catch {};
+        var parser = http3.webtransport.stream.Parser.init(kind);
+        _ = parser.feed(input) catch {};
+        _ = parser.finish() catch {};
+    }
+    const raw = http3.capsule.parse(input, .{ .max_capsule_length = 4096 }) catch return;
+    _ = http3.webtransport.capsule.parse(raw.capsule) catch {};
 }
 
 fn fuzzConnection(io: std.Io, input: []const u8) void {
