@@ -1,8 +1,14 @@
-//! Fixed-capacity, externally synchronized QUIC stream registry.
+//! Fixed-capacity, externally synchronized generic QUIC stream registry.
+//!
+//! This primitive owns stream-ID allocation, peer limit validation, and a value
+//! per active ID. It deliberately does not implement wire receive/send state,
+//! flow control, retransmission, or closed-stream tombstones.
 
 const std = @import("std");
 const stream_id = @import("id.zig");
 
+/// Initial stream-count limits for a generic registry. Local limits constrain
+/// IDs opened by this endpoint; peer limits validate IDs opened by its peer.
 pub const Limits = struct {
     local_bidirectional: u64,
     local_unidirectional: u64,
@@ -53,6 +59,10 @@ pub fn Registry(comptime T: type, comptime capacity: usize) type {
             };
             for (&self.slots) |*slot| slot.* = .{};
             return self;
+        }
+
+        pub fn len(self: *const Self) usize {
+            return self.count;
         }
 
         pub fn get(self: *Self, id: stream_id.Id) ?*T {
@@ -151,6 +161,7 @@ test "registry allocates local IDs and enforces stream limits" {
     try std.testing.expectEqual(@as(u64, 0), bidi.value);
     try std.testing.expectEqual(@as(u64, 2), uni.value);
     try std.testing.expectError(error.StreamLimitBlocked, registry.openLocal(.bidirectional, 30));
+    try std.testing.expectEqual(@as(usize, 2), registry.len());
 }
 
 test "registry peer high stream implicitly opens lower streams" {

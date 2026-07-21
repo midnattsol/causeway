@@ -3,6 +3,11 @@
 //! The hot path is allocation-free: send/receive buffers and range storage are
 //! borrowed from the caller, while the registry uses a comptime fixed capacity.
 //! Types are intentionally externally synchronized for one-owner connection loops.
+//!
+//! `Registry` is the public generic ID/allocation registry for applications that
+//! build directly on QUIC. The server connection uses its more specialized
+//! `ApplicationStreams` state machine because wire lifecycle, flow control,
+//! retransmission ranges, and closed-stream tombstones must advance together.
 
 const std = @import("std");
 
@@ -24,6 +29,7 @@ pub const SendStreamFlow = flow.SendStream;
 pub const ReceiveConnectionFlow = flow.ReceiveConnection;
 pub const ReceiveStreamFlow = flow.ReceiveStream;
 pub const Registry = registry.Registry;
+pub const RegistryLimits = registry.Limits;
 
 test {
     std.testing.refAllDecls(@This());
