@@ -4,6 +4,7 @@ const std = @import("std");
 const connection = @import("../connection/root.zig");
 const header = @import("../packet/header.zig");
 const tls_server = @import("../tls/server.zig");
+const transport_parameters = @import("../crypto/transport_parameters.zig");
 
 const Io = std.Io;
 const net = Io.net;
@@ -18,9 +19,9 @@ pub const Entropy = struct {
 };
 
 pub const Policy = struct {
-    /// Credentials and transport parameters must outlive the endpoint.
+    /// Credentials and slices retained by transport parameters must outlive the endpoint.
     credentials: *const tls_server.ServerCredentials,
-    transport_parameters: []const u8,
+    transport_parameters: transport_parameters.Values = .{},
     /// Length of server-issued connection IDs (1...20).
     connection_id_length: u8 = 16,
     /// Optional deterministic entropy source for tests. Production defaults to `io.random`.
@@ -41,6 +42,7 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
         pub const Slot = struct {
             storage: Storage = .{},
             transcript: [transcript_bytes]u8 = undefined,
+            encoded_transport_parameters: [512]u8 = undefined,
             connection: Connection = undefined,
             peer: net.IpAddress = undefined,
             occupied: bool = false,
@@ -134,6 +136,15 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
                 if (!unique_cid) continue;
                 slot.storage = .{};
                 slot.peer = message.from;
+                var parameter_values = self.policy.transport_parameters;
+                parameter_values.original_destination_connection_id = invariant.destination_id;
+                parameter_values.initial_source_connection_id = entropy_bytes[0..cid_len];
+                parameter_values.retry_source_connection_id = null;
+                const encoded_parameters = transport_parameters.encode(
+                    &slot.encoded_transport_parameters,
+                    parameter_values,
+                    .server,
+                ) catch continue;
                 slot.connection = Connection.init(&slot.storage, .{
                     .original_destination_id = invariant.destination_id,
                     .client_source_id = invariant.source_id,
@@ -142,7 +153,7 @@ pub fn Endpoint(comptime connection_limits: connection.Limits, comptime capacity
                         .credentials = self.policy.credentials,
                         .server_random = entropy_bytes[20..52].*,
                         .x25519 = .{ .seed = entropy_bytes[52..84].* },
-                        .transport_parameters = self.policy.transport_parameters,
+                        .transport_parameters = encoded_parameters,
                         .transcript_scratch = &slot.transcript,
                     },
                     .now = now,
@@ -268,7 +279,7 @@ test "endpoint bounds its pool, demuxes by server CID, enforces peer, and reaps"
     var endpoint: E = undefined;
     try endpoint.init(undefined, .{
         .credentials = &credentials,
-        .transport_parameters = "parameters",
+        .transport_parameters = .{},
         .connection_id_length = 8,
         .entropy = .{ .context = null, .fillFn = deterministicEntropy },
     });
@@ -288,6 +299,12 @@ test "endpoint bounds its pool, demuxes by server CID, enforces peer, and reaps"
     endpoint.processBatch(std.testing.io, &messages, 1);
     try std.testing.expectEqual(@as(usize, 1), endpoint.activeCount());
     try std.testing.expectEqualStrings("\x01\x02\x03\x04\x05\x06\x07\x08", endpoint.slots[0].connection.serverConnectionId());
+    const encoded_parameters = try transport_parameters.parse(
+        endpoint.slots[0].connection.tls.local_transport_parameters,
+        .server,
+    );
+    try std.testing.expectEqualStrings("original", encoded_parameters.original_destination_connection_id.?);
+    try std.testing.expectEqualStrings(endpoint.slots[0].connection.serverConnectionId(), encoded_parameters.initial_source_connection_id.?);
 
     var second_datagram = datagram;
     var second = [_]net.IncomingMessage{incoming(.{ .ip4 = .loopback(4434) }, &second_datagram)};
@@ -315,7 +332,7 @@ test "endpoint loopback UDP poll receives an Initial" {
     const listen: net.IpAddress = .{ .ip4 = .loopback(0) };
     try endpoint.bind(std.testing.io, &listen, .{
         .credentials = &credentials,
-        .transport_parameters = "parameters",
+        .transport_parameters = .{},
         .entropy = .{ .context = null, .fillFn = deterministicEntropy },
     });
     defer endpoint.deinit(std.testing.io);
@@ -343,7 +360,7 @@ test "endpoint silently drops short, undersized, malformed, and truncated unknow
     const E = Endpoint(limits, 1, 2);
     const credentials = testCredentials();
     var endpoint: E = undefined;
-    try endpoint.init(undefined, .{ .credentials = &credentials, .transport_parameters = "", .connection_id_length = 4 });
+    try endpoint.init(undefined, .{ .credentials = &credentials, .transport_parameters = .{}, .connection_id_length = 4 });
     const peer: net.IpAddress = .{ .ip4 = .loopback(1) };
     var short = [_]u8{ 0x40, 'a', 'b', 'c', 'd' };
     var malformed = [_]u8{0xc0};

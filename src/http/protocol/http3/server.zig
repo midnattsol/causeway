@@ -312,7 +312,7 @@ test "HTTP/3 server gates sessions and safely reaps and reuses endpoint slots" {
     var server: TestServer = undefined;
     try server.init(undefined, .{
         .credentials = &credentials,
-        .transport_parameters = "",
+        .transport_parameters = .{},
     }, std.testing.allocator, &state);
 
     try installTestConnection(&server, 1, "server-a");
@@ -362,7 +362,7 @@ test "HTTP/3 server loopback poll admits a QUIC Initial" {
     const listen: net.IpAddress = .{ .ip4 = .loopback(0) };
     try server.bind(std.testing.io, &listen, .{
         .credentials = &credentials,
-        .transport_parameters = "parameters",
+        .transport_parameters = .{},
         .connection_id_length = 8,
         .entropy = .{ .context = null, .fillFn = deterministicEntropy },
     }, std.testing.allocator, &state);
