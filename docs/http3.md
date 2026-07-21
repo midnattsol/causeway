@@ -87,6 +87,12 @@ ECN is a compile-time endpoint feature. Direct QUIC users select `EndpointWithFe
 
 On Zig 0.17 master, `std.Io.net.IncomingMessage.control` and `OutgoingMessage.control` expose ancillary bytes and the Linux `std.Io` backend passes them to `recvmsg(2)` and `sendmsg(2)`. `std.Io` does not expose a public socket-option operation, so Causeway uses `std.posix.setsockopt` on Linux to request `IP_RECVTOS` or `IPV6_RECVTCLASS`. Selecting ECN is strict: endpoint initialization returns `error.EcnUnsupported` or `error.EcnSetupFailed` instead of pretending ECN is active. Ancillary buffers are bounded stack storage for each receive/send batch, not persistent per-packet allocation. The transport metadata API (`Connection.receiveDatagramWithMetadata`) remains backend-independent and is covered with injection tests.
 
+## QUIC DATAGRAM
+
+RFC 9221 DATAGRAM support is configured with `connection.Limits.datagram_receive_queue`, `datagram_send_queue`, and `datagram_max_payload`, together with the advertised `max_datagram_frame_size` transport parameter. Zero queue capacities compile a disabled path. `Connection.enqueueDatagram` copies into a bounded FIFO and rejects the newest item when full; received payloads are copied into a bounded connection queue exposed through `nextDatagram` and `consumeDatagram`, while receive overflow drops the newest datagram and increments `droppedDatagrams`.
+
+DATAGRAM frames are ack-eliciting, congestion-controlled, paced, and never retransmitted. Scheduling alternates with sustained stream output, preserves a queued datagram when packet construction or congestion control blocks, and consumes it only after packet bookkeeping succeeds. The negotiated limit applies to the complete encoded DATAGRAM frame, not only its payload. This transport API is the base for HTTP Datagrams; association with CONNECT requests is handled separately by the HTTP/3 layer.
+
 ## Connection IDs, Retry, stateless reset, and paths
 
 The endpoint can be configured with:

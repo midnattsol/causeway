@@ -15,6 +15,7 @@ const types = @import("types.zig");
 const receive = @import("receive.zig");
 const schedule = @import("schedule.zig");
 const application_streams = @import("application_streams.zig");
+const datagrams = @import("datagrams.zig");
 const connection_id = @import("connection_id.zig");
 const path_frames = @import("path_frames.zig");
 const stream = @import("../stream/root.zig");
@@ -58,6 +59,12 @@ pub const Limits = struct {
     path_events: usize = 4,
     /// Endpoint-owned peer-address paths per connection.
     paths: usize = 4,
+    /// Copied inbound application DATAGRAM payloads. Zero disables receive support.
+    datagram_receive_queue: usize = 0,
+    /// Copied outbound application DATAGRAM payloads. Zero disables sending.
+    datagram_send_queue: usize = 0,
+    /// Maximum copied DATAGRAM payload size. May be zero only when both queues are disabled.
+    datagram_max_payload: usize = 0,
 };
 
 pub fn Storage(comptime limits: Limits) type {
@@ -92,6 +99,8 @@ pub const Init = struct {
 
 pub fn Connection(comptime limits: Limits) type {
     if (limits.max_datagram_size < 1200) @compileError("QUIC max_datagram_size must be at least 1200");
+    if (limits.datagram_send_queue != 0 and limits.datagram_max_payload > 1199)
+        @compileError("QUIC DATAGRAM payload exceeds the connection packet builder capacity");
     if (limits.active_connection_ids < 2) @compileError("QUIC active_connection_ids must be at least two");
     if (limits.path_events == 0 or limits.paths == 0) @compileError("QUIC path capacities must be nonzero");
     if (limits.paths > std.math.maxInt(u8) + 1) @compileError("QUIC path capacity exceeds metadata path ID range");
@@ -110,6 +119,11 @@ pub fn Connection(comptime limits: Limits) type {
         );
         pub const ConnectionIds = connection_id.Lifecycle(limits.active_connection_ids);
         pub const PathEvents = path_frames.Queue(limits.path_events);
+        pub const Datagrams = datagrams.State(
+            limits.datagram_receive_queue,
+            limits.datagram_send_queue,
+            limits.datagram_max_payload,
+        );
 
         state: State = .handshaking,
         close_info: ?TransportError = null,
@@ -125,6 +139,8 @@ pub fn Connection(comptime limits: Limits) type {
         server_id_len: u8,
         cids: ConnectionIds,
         received_path_frames: PathEvents = .{},
+        datagrams: Datagrams = .{},
+        datagram_turn: bool = false,
         bytes_received: u64 = 0,
         bytes_sent: u64 = 0,
         address_validated: bool = false,
@@ -289,6 +305,20 @@ pub fn Connection(comptime limits: Limits) type {
         }
         pub fn nextStreamEvent(self: *Self) ?StreamEvent {
             return self.application.nextEvent();
+        }
+        /// Copies into the fixed outbound queue. Queue-full rejects the newest item.
+        pub fn enqueueDatagram(self: *Self, payload: []const u8) !void {
+            return self.datagrams.enqueue(payload);
+        }
+        /// Returns a connection-owned borrow; copy it before retaining it.
+        pub fn nextDatagram(self: *const Self) ?[]const u8 {
+            return self.datagrams.nextReceived();
+        }
+        pub fn consumeDatagram(self: *Self) !void {
+            return self.datagrams.consumeReceived();
+        }
+        pub fn droppedDatagrams(self: *const Self) u64 {
+            return self.datagrams.dropped_received;
         }
         pub fn streamReadable(self: *Self, id: Self.StreamId) ![]const u8 {
             return self.application.readable(id);
@@ -1238,4 +1268,213 @@ test "probe remains pending until an ack-eliciting probe is emitted" {
     connection.pacer.budget = connection.pacer.maximum_burst;
     try std.testing.expect((try connection.buildDatagram(&output, 0)).len != 0);
     try std.testing.expect(connection.probe_space == null);
+}
+
+test "received DATAGRAM negotiation bounds ownership and overflow policy" {
+    const packet_writer = @import("../packet/writer.zig");
+    const frame = @import("../frame/root.zig");
+    const transport_parameters = @import("../crypto/transport_parameters.zig");
+    const limits: Limits = .{
+        .crypto_receive_bytes = 64,
+        .crypto_send_bytes = 64,
+        .tls_output_bytes = 128,
+        .datagram_receive_queue = 1,
+        .datagram_max_payload = 8,
+    };
+    var storage: Storage(limits) = .{};
+    var transcript: [512]u8 = undefined;
+    const credentials = testCredentials();
+    var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+    const keys: protection.Keys = .{ .aes_128_gcm = .{ .key = @splat(0x31), .iv = @splat(0x42), .hp = @splat(0x53) } };
+    connection.application_remote = keys;
+    connection.state = .active;
+    try connection.datagrams.applyTransportParameters(
+        transport_parameters.Values{ .max_datagram_frame_size = 5 },
+        .{},
+    );
+
+    var frame_storage: [32]u8 = undefined;
+    var packet_storage: [96]u8 = undefined;
+    const first_frame = try frame.writer.encode(&frame_storage, .{ .datagram = "one" });
+    const first = try packet_writer.writeOneRtt(&packet_storage, keys, .{
+        .destination_id = "server",
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = first_frame,
+        .key_phase = false,
+    });
+    try connection.receiveDatagram(first.packet, 1);
+    @memset(first.packet, 0xaa);
+    try std.testing.expectEqualStrings("one", connection.nextDatagram().?);
+
+    const second_frame = try frame.writer.encode(&frame_storage, .{ .datagram = "two" });
+    const second = try packet_writer.writeOneRtt(&packet_storage, keys, .{
+        .destination_id = "server",
+        .packet_number = 1,
+        .packet_number_length = 2,
+        .payload = second_frame,
+        .key_phase = false,
+    });
+    try connection.receiveDatagram(second.packet, 2);
+    try std.testing.expectEqual(@as(u64, 1), connection.droppedDatagrams());
+    try std.testing.expectEqualStrings("one", connection.nextDatagram().?);
+    try connection.consumeDatagram();
+
+    const oversized_frame = try frame.writer.encode(&frame_storage, .{ .datagram = "12345" });
+    const oversized = try packet_writer.writeOneRtt(&packet_storage, keys, .{
+        .destination_id = "server",
+        .packet_number = 2,
+        .packet_number_length = 2,
+        .payload = oversized_frame,
+        .key_phase = false,
+    });
+    try std.testing.expectError(error.DatagramFrameTooLarge, connection.receiveDatagram(oversized.packet, 3));
+    try std.testing.expectEqual(CloseCode.protocol_violation, connection.close_info.?.code);
+    try std.testing.expectEqual(@as(?u64, frame.datagram_type), connection.close_info.?.frame_type);
+}
+
+test "unsupported DATAGRAM is PROTOCOL_VIOLATION and malformed length is FRAME_ENCODING_ERROR" {
+    const packet_writer = @import("../packet/writer.zig");
+    const transport_parameters = @import("../crypto/transport_parameters.zig");
+    const limits: Limits = .{ .crypto_receive_bytes = 64, .crypto_send_bytes = 64, .tls_output_bytes = 128 };
+    const keys: protection.Keys = .{ .aes_128_gcm = .{ .key = @splat(0x31), .iv = @splat(0x42), .hp = @splat(0x53) } };
+    const credentials = testCredentials();
+
+    var disabled_storage: Storage(limits) = .{};
+    var disabled_transcript: [512]u8 = undefined;
+    var disabled = try Connection(limits).init(&disabled_storage, testInit(&credentials, &disabled_transcript));
+    disabled.application_remote = keys;
+    disabled.state = .active;
+    try disabled.datagrams.applyTransportParameters(transport_parameters.Values{}, .{});
+    var packet_storage: [96]u8 = undefined;
+    const unsupported = try packet_writer.writeOneRtt(&packet_storage, keys, .{
+        .destination_id = "server",
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = "\x30x",
+        .key_phase = false,
+    });
+    try std.testing.expectError(error.DatagramNotNegotiated, disabled.receiveDatagram(unsupported.packet, 1));
+    try std.testing.expectEqual(CloseCode.protocol_violation, disabled.close_info.?.code);
+    try std.testing.expectEqual(@as(?u64, 0x30), disabled.close_info.?.frame_type);
+
+    var malformed_storage: Storage(limits) = .{};
+    var malformed_transcript: [512]u8 = undefined;
+    var malformed = try Connection(limits).init(&malformed_storage, testInit(&credentials, &malformed_transcript));
+    malformed.application_remote = keys;
+    malformed.state = .active;
+    const bad = try packet_writer.writeOneRtt(&packet_storage, keys, .{
+        .destination_id = "server",
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = "\x31\x05x",
+        .key_phase = false,
+    });
+    try std.testing.expectError(error.Truncated, malformed.receiveDatagram(bad.packet, 1));
+    try std.testing.expectEqual(CloseCode.frame_encoding_error, malformed.close_info.?.code);
+}
+
+test "outbound DATAGRAM survives transport blocking and loss does not requeue it" {
+    const packet_header = @import("../packet/header.zig");
+    const frame = @import("../frame/root.zig");
+    const transport_parameters = @import("../crypto/transport_parameters.zig");
+    const limits: Limits = .{
+        .crypto_receive_bytes = 64,
+        .crypto_send_bytes = 64,
+        .tls_output_bytes = 128,
+        .datagram_send_queue = 1,
+        .datagram_max_payload = 8,
+    };
+    var storage: Storage(limits) = .{};
+    var transcript: [512]u8 = undefined;
+    const credentials = testCredentials();
+    var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+    const keys: protection.Keys = .{ .aes_128_gcm = .{ .key = @splat(0x31), .iv = @splat(0x42), .hp = @splat(0x53) } };
+    connection.application_local = keys;
+    connection.state = .active;
+    connection.validateAddress();
+    try connection.application.applyTransportParameters(.{}, .{});
+    try connection.datagrams.applyTransportParameters(.{}, transport_parameters.Values{ .max_datagram_frame_size = 9 });
+    try connection.enqueueDatagram("12345678");
+
+    var output: [256]u8 = undefined;
+    connection.congestion.bytes_in_flight = connection.congestion.congestion_window;
+    try std.testing.expectEqual(@as(usize, 0), (try connection.buildDatagram(&output, 0)).len);
+    try std.testing.expectEqual(@as(usize, 1), connection.datagrams.pendingSend());
+    connection.congestion.bytes_in_flight = 0;
+    connection.pacer.budget = 0;
+    try std.testing.expectEqual(@as(usize, 0), (try connection.buildDatagram(&output, 0)).len);
+    try std.testing.expectEqual(@as(usize, 1), connection.datagrams.pendingSend());
+
+    connection.pacer.budget = connection.pacer.maximum_burst;
+    const encoded = try connection.buildDatagram(&output, 0);
+    try std.testing.expect(encoded.len != 0);
+    try std.testing.expectEqual(@as(usize, 0), connection.datagrams.pendingSend());
+    const invariant = try packet_header.parse(encoded, "client".len);
+    const clear = try keys.unprotect(encoded, invariant.packet_number_offset.?, null);
+    var frames: frame.Iterator = .{ .payload = clear.payload };
+    try std.testing.expectEqualStrings("12345678", (try frames.next()).?.datagram);
+    const sent = connection.detectors[@intFromEnum(Level.application)].packets[0];
+    try std.testing.expect(sent.ack_eliciting and sent.in_flight);
+    try std.testing.expectEqual(encoded.len, sent.sent_bytes);
+    try std.testing.expect(std.meta.activeTag(connection.sent_application[0].item) == .none);
+
+    _ = connection.detectors[@intFromEnum(Level.application)].detectLost(std.math.maxInt(u64) / 2, connection.rtt);
+    try std.testing.expectEqual(@as(usize, 0), connection.datagrams.pendingSend());
+    try std.testing.expectEqual(@as(usize, 0), (try connection.buildDatagram(&output, 0)).len);
+}
+
+test "DATAGRAM scheduling alternates with sustained stream data" {
+    const packet_header = @import("../packet/header.zig");
+    const frame = @import("../frame/root.zig");
+    const transport_parameters = @import("../crypto/transport_parameters.zig");
+    const limits: Limits = .{
+        .crypto_receive_bytes = 64,
+        .crypto_send_bytes = 64,
+        .tls_output_bytes = 128,
+        .max_streams = 2,
+        .stream_send_bytes = 3000,
+        .datagram_send_queue = 2,
+        .datagram_max_payload = 8,
+    };
+    var storage: Storage(limits) = .{};
+    var transcript: [512]u8 = undefined;
+    const credentials = testCredentials();
+    var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+    const keys: protection.Keys = .{ .aes_128_gcm = .{ .key = @splat(0x31), .iv = @splat(0x42), .hp = @splat(0x53) } };
+    connection.application_local = keys;
+    connection.state = .active;
+    connection.validateAddress();
+    const flow: u64 = 3000;
+    try connection.application.applyTransportParameters(
+        .{},
+        transport_parameters.Values{
+            .initial_max_data = flow,
+            .initial_max_stream_data_bidi_remote = flow,
+            .initial_max_streams_bidi = 1,
+        },
+    );
+    try connection.datagrams.applyTransportParameters(.{}, .{ .max_datagram_frame_size = 9 });
+    const id = try connection.openBidirectionalStream();
+    const body: [2500]u8 = @splat('s');
+    try std.testing.expectEqual(body.len, try connection.writeStream(id, &body));
+    try connection.enqueueDatagram("first");
+    try connection.enqueueDatagram("second");
+
+    const Kind = enum { stream_frame, datagram_frame };
+    const expected = [_]Kind{ .stream_frame, .datagram_frame, .stream_frame };
+    var largest: ?u64 = null;
+    for (expected) |kind| {
+        var output: [1400]u8 = undefined;
+        const encoded = try connection.buildDatagram(&output, 0);
+        const invariant = try packet_header.parse(encoded, "client".len);
+        const clear = try keys.unprotect(encoded, invariant.packet_number_offset.?, largest);
+        largest = clear.packet_number;
+        var frames: frame.Iterator = .{ .payload = clear.payload };
+        const value = (try frames.next()).?;
+        switch (kind) {
+            .stream_frame => try std.testing.expect(std.meta.activeTag(value) == .stream),
+            .datagram_frame => try std.testing.expect(std.meta.activeTag(value) == .datagram),
+        }
+    }
 }

@@ -88,6 +88,7 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
     var ack_included = false;
     var transmission: ?@import("../tls/crypto_stream.zig").Transmission = null;
     var application_item: @import("application_streams.zig").SentMeta.Item = .none;
+    var datagram_included = false;
     var connection_id_frame: ?frame.Frame = null;
 
     if (self.ack_pending[index]) {
@@ -109,18 +110,6 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
         const encoded = try frame.writer.encode(payload_storage[payload_length..], .handshake_done);
         payload_length += encoded.len;
     }
-    if (level == .application and self.application.parameters_applied) {
-        const maximum_stream_data = payload_storage.len - payload_length -| 32;
-        if (try self.application.prepare(maximum_stream_data)) |prepared| {
-            const encoded = frame.writer.encode(payload_storage[payload_length..], prepared.value) catch |err| {
-                try self.application.onLost(prepared.item);
-                return err;
-            };
-            payload_length += encoded.len;
-            application_item = prepared.item;
-        }
-    }
-
     const sender = &self.cryptoSpace(level).sender;
     const maximum_crypto = payload_storage.len - payload_length -| 24;
     transmission = try sender.nextTransmission(maximum_crypto);
@@ -128,20 +117,50 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
         const encoded = try frame.writer.encode(payload_storage[payload_length..], .{ .crypto = .{ .offset = tx.offset, .data = tx.data } });
         payload_length += encoded.len;
     }
+
+    if (level == .application and self.application.parameters_applied) {
+        const stream_pending = self.application.hasPending();
+        const datagram_pending = self.datagrams.pendingSend() != 0;
+        const prefer_datagram = datagram_pending and (!stream_pending or self.datagram_turn);
+        if (prefer_datagram) {
+            const available = payload_storage.len - payload_length;
+            if (try self.datagrams.send.prepare(available, true)) |prepared| {
+                if (payload_length + prepared.encoded_length < 4) {
+                    const padding = 4 - payload_length - prepared.encoded_length;
+                    @memset(payload_storage[payload_length .. payload_length + padding], 0);
+                    payload_length += padding;
+                }
+                const encoded = try frame.writer.encode(payload_storage[payload_length..], prepared.frame);
+                payload_length += encoded.len;
+                datagram_included = true;
+            }
+        }
+        if (!datagram_included) {
+            const maximum_stream_data = payload_storage.len - payload_length -| 32;
+            if (try self.application.prepare(maximum_stream_data)) |prepared| {
+                const encoded = frame.writer.encode(payload_storage[payload_length..], prepared.value) catch |err| {
+                    try self.application.onLost(prepared.item);
+                    return err;
+                };
+                payload_length += encoded.len;
+                application_item = prepared.item;
+            }
+        }
+    }
     const sending_probe = self.probe_space == level;
-    if (sending_probe and transmission == null) {
+    if (sending_probe and transmission == null and !datagram_included) {
         const encoded = try frame.writer.encode(payload_storage[payload_length..], .ping);
         payload_length += encoded.len;
     }
     if (payload_length == 0) return false;
-    if (payload_length < 4) {
+    if (payload_length < 4 and !datagram_included) {
         @memset(payload_storage[payload_length..4], 0);
         payload_length = 4;
     }
 
     const estimated_size = if (level == .initial) @max(@as(usize, 1200), payload_length + 64) else payload_length + 64;
     const has_application_item = std.meta.activeTag(application_item) != .none;
-    const ack_eliciting = transmission != null or has_application_item or sending_probe or (level == .application and (connection_id_frame != null or self.handshake_done_pending));
+    const ack_eliciting = transmission != null or has_application_item or datagram_included or sending_probe or (level == .application and (connection_id_frame != null or self.handshake_done_pending));
     const congestion_controlled = ack_eliciting;
     if (!self.congestion.canSend(estimated_size, sending_probe) or !self.pacer.canSend(estimated_size, congestion_controlled)) {
         if (transmission) |tx| try sender.onLost(tx.offset, tx.data.len);
@@ -188,7 +207,7 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
         .sent_bytes = sent_bytes,
         .ack_eliciting = ack_eliciting,
         .in_flight = congestion_controlled,
-        .application_limited = level == .application and self.application.isDataLimited(),
+        .application_limited = level == .application and self.application.isDataLimited() and self.datagrams.pendingSend() == @intFromBool(datagram_included),
         .persistent_congestion_eligible = self.rtt.first_sample_time != null,
         .space = types.levelId(level),
         .ecn = if (self.datagram_ecn == .ect0) .ect0 else .not_ect,
@@ -203,7 +222,10 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
         try rememberApplication(self, packet_number, self.application_send_generation, application_item);
         if (connection_id_frame) |sent_frame| try rememberConnectionId(self, packet_number, sent_frame);
     }
+    if (datagram_included) try self.datagrams.send.commit();
     if (has_application_item) self.application.onPacketSent(application_item);
+    if (level == .application and (has_application_item or datagram_included))
+        self.datagram_turn = has_application_item and self.datagrams.pendingSend() != 0;
     if (ack_included) self.ack_pending[index] = false;
     if (level == .application) {
         if (connection_id_frame) |sent_frame| self.cids.markPendingFrameSent(sent_frame);
@@ -380,7 +402,7 @@ fn markLost(self: anytype, level: types.Level, packet_number: u64) void {
 fn hasPending(self: anytype) bool {
     if (self.probe_space != null or self.cids.pendingFrame() != null or self.handshake_done_pending) return true;
     for (self.ack_pending) |pending| if (pending) return true;
-    return self.application.hasPending() or
+    return self.application.hasPending() or self.datagrams.pendingSend() != 0 or
         self.crypto.initial.sender.sent_offset != self.crypto.initial.sender.write_offset or
         self.crypto.handshake.sender.sent_offset != self.crypto.handshake.sender.write_offset or
         self.crypto.application.sender.sent_offset != self.crypto.application.sender.write_offset;

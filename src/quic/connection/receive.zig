@@ -85,93 +85,109 @@ fn validDestination(self: anytype, id: []const u8, level: types.Level) bool {
 fn dispatchFrames(self: anytype, level: types.Level, destination_sequence: u64, payload: []const u8, now: u64) !bool {
     var iterator: frame.Iterator = .{ .payload = payload };
     var ack_eliciting = false;
-    while (try iterator.next()) |value| switch (value) {
-        .padding => {},
-        .ping => ack_eliciting = true,
-        .ack => |ack| try onAck(self, level, ack, now),
-        .crypto => |crypto| {
-            ack_eliciting = true;
-            _ = self.cryptoSpace(level).receiver.receive(crypto.offset, crypto.data) catch |err| switch (err) {
-                error.ReassemblyLimitExceeded, error.InsufficientRangeCapacity => return error.CryptoBufferExceeded,
-                else => return err,
-            };
-            try driveTls(self, level, now);
-        },
-        .connection_close => |close| {
-            if (close.frame_type == null and level != .application) return error.IllegalFrame;
-            self.peerClose(close.error_code, close.frame_type, close.reason, now);
-            return false;
-        },
-        .new_connection_id => |connection_id| {
-            try requireApplication(level);
-            ack_eliciting = true;
-            try self.cids.onNew(connection_id);
-        },
-        .retire_connection_id => |sequence| {
-            try requireApplication(level);
-            ack_eliciting = true;
-            try self.cids.onRetire(sequence, destination_sequence);
-        },
-        .path_challenge => |challenge| {
-            try requireApplication(level);
-            ack_eliciting = true;
-            try self.received_path_frames.push(.{ .kind = .challenge, .data = challenge });
-        },
-        .path_response => |response| {
-            try requireApplication(level);
-            ack_eliciting = true;
-            try self.received_path_frames.push(.{ .kind = .response, .data = response });
-        },
-        .stream => |value_stream| {
-            try requireApplication(level);
-            ack_eliciting = true;
-            try self.application.onStream(value_stream);
-        },
-        .reset_stream => |reset| {
-            try requireApplication(level);
-            ack_eliciting = true;
-            try self.application.onResetStream(reset);
-        },
-        .stop_sending => |stop| {
-            try requireApplication(level);
-            ack_eliciting = true;
-            try self.application.onStopSending(stop);
-        },
-        .max_data => |maximum| {
-            try requireApplication(level);
-            ack_eliciting = true;
-            try self.application.onMaxData(maximum);
-        },
-        .max_stream_data => |maximum| {
-            try requireApplication(level);
-            ack_eliciting = true;
-            try self.application.onMaxStreamData(maximum);
-        },
-        .max_streams_bidi => |maximum| {
-            try requireApplication(level);
-            ack_eliciting = true;
-            try self.application.onMaxStreams(.bidirectional, maximum);
-        },
-        .max_streams_uni => |maximum| {
-            try requireApplication(level);
-            ack_eliciting = true;
-            try self.application.onMaxStreams(.unidirectional, maximum);
-        },
-        .data_blocked => {
-            try requireApplication(level);
-            ack_eliciting = true;
-        },
-        .stream_data_blocked => |blocked| {
-            try requireApplication(level);
-            ack_eliciting = true;
-            try self.application.onStreamDataBlocked(blocked);
-        },
-        .streams_blocked_bidi, .streams_blocked_uni => {
-            try requireApplication(level);
-            ack_eliciting = true;
-        },
-        else => return error.IllegalFrame,
-    };
+    while (iterator.cursor < payload.len) {
+        const frame_start = iterator.cursor;
+        const value = (try iterator.next()).?;
+        switch (value) {
+            .padding => {},
+            .ping => ack_eliciting = true,
+            .ack => |ack| try onAck(self, level, ack, now),
+            .crypto => |crypto| {
+                ack_eliciting = true;
+                _ = self.cryptoSpace(level).receiver.receive(crypto.offset, crypto.data) catch |err| switch (err) {
+                    error.ReassemblyLimitExceeded, error.InsufficientRangeCapacity => return error.CryptoBufferExceeded,
+                    else => return err,
+                };
+                try driveTls(self, level, now);
+            },
+            .connection_close => |close| {
+                if (close.frame_type == null and level != .application) return error.IllegalFrame;
+                self.peerClose(close.error_code, close.frame_type, close.reason, now);
+                return false;
+            },
+            .new_connection_id => |connection_id| {
+                try requireApplication(level);
+                ack_eliciting = true;
+                try self.cids.onNew(connection_id);
+            },
+            .retire_connection_id => |sequence| {
+                try requireApplication(level);
+                ack_eliciting = true;
+                try self.cids.onRetire(sequence, destination_sequence);
+            },
+            .path_challenge => |challenge| {
+                try requireApplication(level);
+                ack_eliciting = true;
+                try self.received_path_frames.push(.{ .kind = .challenge, .data = challenge });
+            },
+            .path_response => |response| {
+                try requireApplication(level);
+                ack_eliciting = true;
+                try self.received_path_frames.push(.{ .kind = .response, .data = response });
+            },
+            .datagram, .datagram_len => |datagram_payload| {
+                try requireApplication(level);
+                ack_eliciting = true;
+                self.datagrams.receive(datagram_payload, iterator.cursor - frame_start) catch |err| {
+                    const frame_type = if (std.meta.activeTag(value) == .datagram)
+                        frame.datagram_type
+                    else
+                        frame.datagram_len_type;
+                    fail(self, types.CloseCode.protocol_violation, frame_type, "invalid DATAGRAM frame", now);
+                    return err;
+                };
+            },
+            .stream => |value_stream| {
+                try requireApplication(level);
+                ack_eliciting = true;
+                try self.application.onStream(value_stream);
+            },
+            .reset_stream => |reset| {
+                try requireApplication(level);
+                ack_eliciting = true;
+                try self.application.onResetStream(reset);
+            },
+            .stop_sending => |stop| {
+                try requireApplication(level);
+                ack_eliciting = true;
+                try self.application.onStopSending(stop);
+            },
+            .max_data => |maximum| {
+                try requireApplication(level);
+                ack_eliciting = true;
+                try self.application.onMaxData(maximum);
+            },
+            .max_stream_data => |maximum| {
+                try requireApplication(level);
+                ack_eliciting = true;
+                try self.application.onMaxStreamData(maximum);
+            },
+            .max_streams_bidi => |maximum| {
+                try requireApplication(level);
+                ack_eliciting = true;
+                try self.application.onMaxStreams(.bidirectional, maximum);
+            },
+            .max_streams_uni => |maximum| {
+                try requireApplication(level);
+                ack_eliciting = true;
+                try self.application.onMaxStreams(.unidirectional, maximum);
+            },
+            .data_blocked => {
+                try requireApplication(level);
+                ack_eliciting = true;
+            },
+            .stream_data_blocked => |blocked| {
+                try requireApplication(level);
+                ack_eliciting = true;
+                try self.application.onStreamDataBlocked(blocked);
+            },
+            .streams_blocked_bidi, .streams_blocked_uni => {
+                try requireApplication(level);
+                ack_eliciting = true;
+            },
+            else => return error.IllegalFrame,
+        }
+    }
     return ack_eliciting;
 }
 
@@ -220,6 +236,10 @@ fn driveTls(self: anytype, level: types.Level, now: u64) !void {
             }
             self.application.applyTransportParameters(local, peer) catch {
                 fail(self, types.CloseCode.transport_parameter_error, null, "unsupported transport parameters", now);
+                return error.TransportParameterError;
+            };
+            self.datagrams.applyTransportParameters(local, peer) catch {
+                fail(self, types.CloseCode.transport_parameter_error, null, "DATAGRAM parameters exceed configured capacity", now);
                 return error.TransportParameterError;
             };
             self.cids.applyLimits(local.active_connection_id_limit, peer.active_connection_id_limit) catch {
@@ -338,7 +358,7 @@ fn mapError(err: anyerror) u64 {
         error.ReassemblyLimitExceeded, error.InsufficientRangeCapacity, error.StreamCapacityExceeded, error.ClosedStreamCapacityExceeded => types.CloseCode.internal_error,
         error.TransportParameterError => types.CloseCode.transport_parameter_error,
         error.ConnectionIdLimitExceeded => types.CloseCode.connection_id_limit_error,
-        error.FrameEncodingError, error.UnknownFrameType, error.Truncated, error.InvalidAckRange, error.InvalidAckRanges => types.CloseCode.frame_encoding_error,
+        error.FrameEncodingError, error.UnknownFrameType, error.Truncated, error.FrameTooLarge, error.InvalidAckRange, error.InvalidAckRanges => types.CloseCode.frame_encoding_error,
         else => types.CloseCode.protocol_violation,
     };
 }
