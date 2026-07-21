@@ -101,7 +101,10 @@ fn ServerType(
         }
 
         pub fn deinit(self: *Self, io: Io) void {
-            self.sessions = @splat(.{});
+            for (&self.sessions) |*slot| {
+                if (slot.initialized) slot.session.deinit();
+                slot.* = .{};
+            }
             self.endpoint.deinit(io);
         }
 
@@ -123,10 +126,18 @@ fn ServerType(
 
         pub fn nextDeadline(self: *const Self, now: u64) ?u64 {
             if (self.hasCloseAfterDrive()) return now;
-            const transport_deadline = self.endpoint.nextDeadline(now);
-            const shutdown_deadline = if (self.shutdown_started) |started| started +| http3_config.shutdown_timeout else null;
-            if (transport_deadline) |transport| if (shutdown_deadline) |shutdown| return @min(transport, shutdown);
-            return transport_deadline orelse shutdown_deadline;
+            var result = self.endpoint.nextDeadline(now);
+            if (self.shutdown_started) |started| {
+                const shutdown = started +| http3_config.shutdown_timeout;
+                result = if (result) |current| @min(current, shutdown) else shutdown;
+            }
+            for (self.sessions) |slot| {
+                if (!slot.initialized) continue;
+                if (slot.session.nextDeadline()) |deadline| {
+                    result = if (result) |current| @min(current, deadline) else deadline;
+                }
+            }
+            return result;
         }
 
         /// Stops admission and queues HTTP/3 GOAWAY on every initialized session.
@@ -139,10 +150,12 @@ fn ServerType(
             self.endpoint.beginShutdown();
             for (&self.endpoint.slots, &self.sessions) |*endpoint_slot, *session_slot| {
                 if (!endpoint_slot.occupied) {
+                    if (session_slot.initialized) session_slot.session.deinit();
                     session_slot.* = .{};
                     continue;
                 }
                 if (session_slot.generation != endpoint_slot.generation) {
+                    if (session_slot.initialized) session_slot.session.deinit();
                     session_slot.* = .{ .generation = endpoint_slot.generation };
                 }
                 if (session_slot.initialized) {
@@ -165,11 +178,13 @@ fn ServerType(
         fn pollSessions(self: *Self, io: Io, now: u64) void {
             for (&self.endpoint.slots, &self.sessions) |*endpoint_slot, *session_slot| {
                 if (!endpoint_slot.occupied) {
+                    if (session_slot.initialized) session_slot.session.deinit();
                     session_slot.* = .{};
                     continue;
                 }
 
                 if (session_slot.generation != endpoint_slot.generation) {
+                    if (session_slot.initialized) session_slot.session.deinit();
                     session_slot.* = .{ .generation = endpoint_slot.generation };
                 }
                 if (!applicationReady(&endpoint_slot.connection)) continue;
@@ -184,11 +199,11 @@ fn ServerType(
                     );
                     session_slot.initialized = true;
                 }
-                _ = session_slot.session.poll(now) catch {};
+                _ = session_slot.session.poll(now) catch continue;
                 if (self.shutting_down) {
-                    session_slot.session.beginShutdown(now) catch {};
+                    session_slot.session.beginShutdown(now) catch continue;
                     if (session_slot.session.drainComplete() and !session_slot.close_after_drive) {
-                        session_slot.session.finishShutdown(now) catch {};
+                        session_slot.session.finishShutdown(now) catch continue;
                         session_slot.close_after_drive = true;
                     }
                 }

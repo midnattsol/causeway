@@ -40,6 +40,13 @@ pub const Pipe = struct {
         return .{ .io = io, .buffer = buffer, .credit = credit };
     }
 
+    /// Returns currently available producer capacity.
+    pub fn writableLen(self: *const Pipe) usize {
+        const tail = self.tail.load(.acquire);
+        const head = self.head.load(.acquire);
+        return self.buffer.len - (tail - head);
+    }
+
     /// Copies one DATA payload into the fixed ring. Flow-control accounting must
     /// guarantee enough space before this controller-only call.
     pub fn push(self: *Pipe, bytes: []const u8) !void {

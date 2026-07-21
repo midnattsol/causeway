@@ -1,4 +1,4 @@
-//! Allocation-free HTTP/3 polling session over QUIC application streams.
+//! Bounded asynchronous HTTP/3 session over QUIC application streams.
 
 const std = @import("std");
 const Io = std.Io;
@@ -17,9 +17,12 @@ const stream = @import("../stream.zig");
 const validation = @import("../validation.zig");
 const errors = @import("../error.zig");
 const qpack = @import("../qpack/root.zig");
+const varint = @import("../../../../quic/varint.zig");
 const semantics = @import("../../http2/headers/semantics.zig");
 const response_semantics = @import("../../http2/headers/response.zig");
 const trailer_policy = @import("../../http2/headers/trailers.zig");
+const inbound_body = @import("../../http2/body/inbound.zig");
+const outbound_body = @import("../../http2/body/outbound.zig");
 const request_adapter = @import("request.zig");
 const response_fields = @import("response.zig");
 const options_module = @import("options.zig");
@@ -47,30 +50,101 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         const StreamId = Connection.StreamId;
         const Context = if (Locals) |LocalState| context_module.ContextWithLocals(State, LocalState) else context_module.Context(State);
         const frame_buffer_size = config.max_frame_size + 16;
-        const response_wire_size = config.max_response_body_size + config.max_response_header_bytes * 2 + 64;
+        const response_control_size = config.max_response_header_bytes * 2 + 64;
+
+        const WireHeader = struct { frame_type: frame.Type, length: usize, encoded: usize };
+
+        const TaskDone = struct { slot: *RequestSlot, err: ?anyerror };
+        const Informational = struct {
+            slot: *RequestSlot,
+            status: std.http.Status,
+            headers: Headers,
+            done: Io.Event = .unset,
+            err: ?anyerror = null,
+        };
+        const Message = union(enum) {
+            response_ready: *RequestSlot,
+            task_done: TaskDone,
+            informational: *Informational,
+        };
+        const MessageQueue = Io.Queue(Message);
 
         const RequestSlot = struct {
+            owner: *Self = undefined,
             occupied: bool = false,
             id: StreamId = undefined,
             state: validation.RequestState = .{ .sender = .client, .allow_push = false },
-            input: [frame_buffer_size]u8 = undefined,
-            input_len: usize = 0,
+
+            frame_storage: [frame_buffer_size]u8 = undefined,
+            frame_len: usize = 0,
+            wire: ?WireHeader = null,
+            payload_staged: usize = 0,
+            payload_seen: usize = 0,
+
             fields: [config.max_header_count]Header = undefined,
             field_count: usize = 0,
             initial_field_count: usize = 0,
             field_bytes: [config.max_header_bytes]u8 = undefined,
             field_bytes_len: usize = 0,
-            body: [config.max_body_size]u8 = undefined,
-            body_len: usize = 0,
-            body_state: RequestBody.State = .initAbsent(),
-            finished: bool = false,
+            head: ?semantics.RequestHead = null,
+
+            arena: ?std.heap.ArenaAllocator = null,
+            input: ?*inbound_body.Pipe = null,
+            body_state: ?*RequestBody.State = null,
+            request: ?Request = null,
+            content_length: ?u64 = null,
+            received_body: u64 = 0,
+            consumed_credit: std.atomic.Value(usize) = .init(0),
+            fin_observed: bool = false,
+            receive_finished: bool = false,
             dispatched: bool = false,
-            output: [response_wire_size]u8 = undefined,
-            output_len: usize = 0,
-            output_sent: usize = 0,
-            output_finished: bool = false,
+            task_done: bool = false,
+            abandoned_input: bool = false,
+
+            response: ?Response = null,
+            output: ?*outbound_body.Pipe = null,
+            response_started: Io.Event = .unset,
+            response_headers_sent: bool = false,
+            suppress_response_body: bool = false,
+            expected_response_length: ?u64 = null,
+            response_bytes_sent: u64 = 0,
+            response_trailers: Headers = .empty,
+            output_done: bool = false,
             output_acked: bool = false,
-            response_body: [config.max_response_body_size]u8 = undefined,
+            completion_notified: bool = false,
+
+            control: [response_control_size]u8 = undefined,
+            control_len: usize = 0,
+            control_sent: usize = 0,
+            bytes_offset: usize = 0,
+            data_header: [16]u8 = undefined,
+            data_header_len: usize = 0,
+            data_header_sent: usize = 0,
+            data_payload_len: usize = 0,
+            data_payload_sent: usize = 0,
+            trailers_queued: bool = false,
+            finish_queued: bool = false,
+
+            fn credit(raw: *anyopaque, amount: usize) void {
+                const self: *RequestSlot = @ptrCast(@alignCast(raw));
+                _ = self.consumed_credit.fetchAdd(amount, .release);
+            }
+
+            fn outputReady(_: *anyopaque) void {}
+
+            fn notifyCompletion(self: *RequestSlot, result: response_module.CompletionResult) void {
+                if (self.completion_notified) return;
+                self.completion_notified = true;
+                if (self.response) |*response| response.complete(result);
+            }
+
+            fn deinit(self: *RequestSlot) void {
+                if (self.input) |input| input.fail(error.ConnectionClosed);
+                if (self.output) |output| output.abort(error.ConnectionClosed);
+                self.notifyCompletion(.{ .failure = error.ConnectionClosed });
+                if (self.arena) |*arena| arena.deinit();
+                self.* = .{};
+            }
         };
 
         const UniSlot = struct {
@@ -97,6 +171,10 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         peer_max_field_section_size: u64 = std.math.maxInt(u64),
         requests: [config.max_requests]RequestSlot = @splat(.{}),
         unidirectional: [config.max_peer_unidirectional_streams]UniSlot = @splat(.{}),
+        tasks: Io.Group = .init,
+        message_storage: [config.control_queue_capacity]Message = undefined,
+        messages: MessageQueue = undefined,
+        messages_initialized: bool = false,
 
         encoder_bytes: [config.qpack_capacity]u8 = undefined,
         encoder_entries: [config.qpack_entries]qpack.table.Entry = undefined,
@@ -117,14 +195,24 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             return .{ .connection = connection, .allocator = allocator, .state = state_value, .io = io };
         }
 
-        /// Initializes large bounded sessions directly in their final storage.
         pub fn initInPlace(self: *Self, connection: *Connection, allocator: std.mem.Allocator, state_value: *State, io: Io) void {
             self.* = .{ .connection = connection, .allocator = allocator, .state = state_value, .io = io };
+            self.messages = .init(&self.message_storage);
+            self.messages_initialized = true;
         }
 
-        /// Opens the three server critical streams and sends their prefixes plus SETTINGS.
+        pub fn deinit(self: *Self) void {
+            self.tasks.cancel(self.io);
+            for (&self.requests) |*slot| if (slot.occupied or slot.arena != null) slot.deinit();
+            self.active = false;
+        }
+
         pub fn activate(self: *Self) !void {
             if (self.active) return;
+            if (!self.messages_initialized) {
+                self.messages = .init(&self.message_storage);
+                self.messages_initialized = true;
+            }
             self.encoder = try qpack.Encoder.init(&self.encoder_bytes, &self.encoder_entries, &self.encoder_sections, config.qpack_capacity, config.qpack_blocked_streams);
             self.decoder = try qpack.Decoder.init(&self.decoder_bytes, &self.decoder_entries, &self.decoder_blocked, config.qpack_capacity, config.qpack_blocked_streams);
             self.local_control = try self.connection.openUnidirectionalStream();
@@ -137,10 +225,6 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             self.active = true;
         }
 
-        /// Drains currently available QUIC events and advances queued response bytes.
-        /// The caller invokes this after QUIC input, stream-credit changes, or output ACKs.
-        /// Every connection-level failure is translated to an HTTP/3 application
-        /// CONNECTION_CLOSE before it is returned.
         pub fn poll(self: *Self, now: u64) !usize {
             return self.pollInner(now) catch |err| {
                 self.closeFor(err, now);
@@ -150,20 +234,27 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         fn pollInner(self: *Self, now: u64) !usize {
             if (!self.active) try self.activate();
-            var progressed: usize = 0;
-            progressed += try self.flushResponses();
+            var progressed = try self.processMessages();
+            self.checkResponseDeadlines();
+            progressed += try self.returnCredits();
             while (self.connection.nextStreamEvent()) |event| {
                 progressed += 1;
                 try self.handleEvent(event, now);
+                progressed += try self.returnCredits();
+                progressed += try self.processMessages();
             }
             try self.retryRequests(now);
-            progressed += try self.flushResponses();
+            progressed += try self.processMessages();
+            var budget = config.output_batch_size;
+            while (budget != 0) : (budget -= 1) {
+                const amount = try self.flushResponses();
+                if (amount == 0) break;
+                progressed += amount;
+            }
+            self.collectRequests();
             return progressed;
         }
 
-        /// Queues the server's initial graceful-shutdown GOAWAY on the control
-        /// stream. The maximum valid client-initiated bidirectional stream ID
-        /// rejects no already-created request and permits a later lower GOAWAY.
         pub fn beginShutdown(self: *Self, now: u64) !void {
             if (self.shutting_down) return;
             self.activate() catch |err| {
@@ -172,17 +263,8 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             };
             var encoded: [16]u8 = undefined;
             const maximum_client_bidi_id = (@as(u64, 1) << 62) - 4;
-            const length = frame.encode(&encoded, .{
-                .frame_type = .goaway,
-                .payload = .{ .goaway = maximum_client_bidi_id },
-            }) catch |err| {
-                self.closeFor(err, now);
-                return err;
-            };
-            self.writeAll(self.local_control, encoded[0..length]) catch |err| {
-                self.closeFor(err, now);
-                return err;
-            };
+            const length = try frame.encode(&encoded, .{ .frame_type = .goaway, .payload = .{ .goaway = maximum_client_bidi_id } });
+            try self.writeAll(self.local_control, encoded[0..length]);
             self.shutting_down = true;
         }
 
@@ -192,27 +274,65 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             return true;
         }
 
-        /// Queues the final GOAWAY after all accepted requests have completed.
         pub fn finishShutdown(self: *Self, now: u64) !void {
             if (self.final_goaway_sent or !self.drainComplete()) return;
             var encoded: [16]u8 = undefined;
             const maximum_client_bidi_id = (@as(u64, 1) << 62) - 4;
-            const first_rejected = if (self.highest_request_id) |highest|
-                @min(highest +| 4, maximum_client_bidi_id)
-            else
-                0;
-            const length = frame.encode(&encoded, .{
-                .frame_type = .goaway,
-                .payload = .{ .goaway = first_rejected },
-            }) catch |err| {
-                self.closeFor(err, now);
-                return err;
-            };
-            self.writeAll(self.local_control, encoded[0..length]) catch |err| {
-                self.closeFor(err, now);
-                return err;
-            };
+            const first_rejected = if (self.highest_request_id) |highest| @min(highest +| 4, maximum_client_bidi_id) else 0;
+            const length = try frame.encode(&encoded, .{ .frame_type = .goaway, .payload = .{ .goaway = first_rejected } });
+            try self.writeAll(self.local_control, encoded[0..length]);
             self.final_goaway_sent = true;
+            _ = now;
+        }
+
+        fn processMessages(self: *Self) !usize {
+            var progressed: usize = 0;
+            var buffer: [16]Message = undefined;
+            while (true) {
+                const count = try self.messages.get(self.io, &buffer, 0);
+                if (count == 0) return progressed;
+                progressed += count;
+                for (buffer[0..count]) |message| switch (message) {
+                    .response_ready => |slot| self.startResponse(slot) catch |err| self.failRequest(slot, .internal_error, err),
+                    .task_done => |done| {
+                        done.slot.task_done = true;
+                        if (done.err) |err| self.failRequest(done.slot, .internal_error, err);
+                        if (!done.slot.receive_finished and !done.slot.abandoned_input) {
+                            done.slot.abandoned_input = true;
+                            if (done.slot.input) |input| input.fail(error.BodyAbandoned);
+                            self.connection.stopSending(done.slot.id, @intFromEnum(errors.Code.request_cancelled)) catch {};
+                        }
+                    },
+                    .informational => |operation| {
+                        self.appendHeaderFrame(operation.slot, operation.status, operation.headers) catch |err| {
+                            operation.err = err;
+                        };
+                        operation.done.set(self.io);
+                    },
+                };
+            }
+        }
+
+        pub fn nextDeadline(self: *const Self) ?u64 {
+            var result: ?u64 = null;
+            for (self.requests) |slot| {
+                if (!slot.occupied or slot.output_done or slot.response == null) continue;
+                const deadline = slot.response.?.write_deadline orelse continue;
+                if (deadline.clock != .awake) continue;
+                const value = std.math.cast(u64, deadline.raw.nanoseconds) orelse continue;
+                result = if (result) |current| @min(current, value) else value;
+            }
+            return result;
+        }
+
+        fn checkResponseDeadlines(self: *Self) void {
+            for (&self.requests) |*slot| {
+                if (!slot.occupied or slot.output_done or slot.response == null) continue;
+                const deadline = slot.response.?.write_deadline orelse continue;
+                if (deadline.clock.now(self.io).nanoseconds >= deadline.raw.nanoseconds) {
+                    self.failRequest(slot, .request_cancelled, error.ResponseTimeout);
+                }
+            }
         }
 
         fn handleEvent(self: *Self, event: anytype, now: u64) !void {
@@ -222,7 +342,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 .receive_finished => |id| try self.receiveFinished(id, now),
                 .send_finished => |id| self.sendFinished(id),
                 .reset => |item| try self.resetReceived(item.id),
-                .stopped => |item| try self.stopped(item.id),
+                .stopped => |item| self.stopped(item.id),
             }
         }
 
@@ -230,17 +350,9 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             if (id.initiator() != .client) return error.InvalidPeerStream;
             if (id.direction() == .bidirectional) {
                 if (self.findRequest(id) != null) return;
-                if (self.shutting_down) {
-                    try self.connection.resetStream(id, @intFromEnum(errors.Code.request_rejected));
-                    try self.connection.stopSending(id, @intFromEnum(errors.Code.request_rejected));
-                    return;
-                }
-                const slot = self.freeRequest() orelse {
-                    try self.connection.resetStream(id, @intFromEnum(errors.Code.request_rejected));
-                    try self.connection.stopSending(id, @intFromEnum(errors.Code.request_rejected));
-                    return;
-                };
-                slot.* = .{ .occupied = true, .id = id };
+                if (self.shutting_down) return self.rejectId(id, .request_rejected);
+                const slot = self.freeRequest() orelse return self.rejectId(id, .request_rejected);
+                slot.* = .{ .owner = self, .occupied = true, .id = id };
                 self.highest_request_id = if (self.highest_request_id) |highest| @max(highest, id.value) else id.value;
             } else {
                 if (self.findUni(id) != null) return;
@@ -250,57 +362,516 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         fn readable(self: *Self, id: StreamId, now: u64) !void {
-            const bytes = try self.connection.streamReadable(id);
-            if (bytes.len == 0) return;
-            if (id.direction() == .bidirectional) {
-                const slot = self.findRequest(id) orelse return error.UnknownRequestStream;
-                try append(&slot.input, &slot.input_len, bytes);
-                try self.connection.consumeStream(id, bytes.len);
-                try self.processRequest(slot, now);
-            } else {
+            if (id.direction() == .unidirectional) {
+                const bytes = try self.connection.streamReadable(id);
+                if (bytes.len == 0) return;
                 const slot = self.findUni(id) orelse return error.UnknownUnidirectionalStream;
                 try append(&slot.input, &slot.input_len, bytes);
                 try self.connection.consumeStream(id, bytes.len);
-                try self.processUni(slot, now);
+                return self.processUni(slot, now);
             }
+            const slot = self.findRequest(id) orelse return error.UnknownRequestStream;
+            self.processRequestBytes(slot, now) catch |err| switch (err) {
+                error.Blocked => return,
+                error.MessageError, error.BodyTooLarge => self.failRequest(slot, if (err == error.MessageError) .message_error else .excessive_load, err),
+                else => return err,
+            };
+        }
+
+        fn processRequestBytes(self: *Self, slot: *RequestSlot, now: u64) !void {
+            _ = now;
+            while (slot.occupied) {
+                if (slot.payload_staged != 0) return;
+                if (slot.wire) |wire| {
+                    if (wire.frame_type == .data and slot.payload_seen == wire.length) {
+                        slot.wire = null;
+                        slot.frame_len = 0;
+                        slot.payload_seen = 0;
+                        continue;
+                    }
+                    if (wire.frame_type != .data and slot.payload_seen == wire.length) {
+                        const parsed = try frame.parse(slot.frame_storage[0..slot.frame_len]);
+                        try self.processRequestFrame(slot, parsed.frame);
+                        slot.wire = null;
+                        slot.frame_len = 0;
+                        slot.payload_seen = 0;
+                        continue;
+                    }
+                }
+                const readable_bytes = try self.connection.streamReadable(slot.id);
+                if (readable_bytes.len == 0) return;
+
+                if (slot.wire == null) {
+                    const amount = try self.consumeFrameHeader(slot, readable_bytes);
+                    if (amount != 0) continue;
+                    if (slot.wire == null) return;
+                }
+
+                const wire = slot.wire.?;
+                if (wire.frame_type == .data) {
+                    if (slot.payload_seen == 0) {
+                        try slot.state.observe(.{ .frame_type = .data, .payload = .{ .data = "" } });
+                        try self.ensureRequest(slot, true);
+                    }
+                    const input = slot.input orelse return error.MessageError;
+                    const available = input.writableLen();
+                    if (available == 0) return;
+                    const body_bytes = try self.connection.streamReadable(slot.id);
+                    if (body_bytes.len == 0) return;
+                    const amount = @min(body_bytes.len, @min(available, wire.length - slot.payload_seen));
+                    const total = std.math.add(u64, slot.received_body, amount) catch return error.BodyTooLarge;
+                    if (total > config.max_body_size) return error.BodyTooLarge;
+                    if (slot.content_length) |expected| if (total > expected) return error.MessageError;
+                    slot.payload_staged = amount;
+                    slot.payload_seen += amount;
+                    slot.received_body = total;
+                    try input.push(body_bytes[0..amount]);
+                    return;
+                }
+
+                const remaining = wire.length - slot.payload_seen;
+                const bytes = try self.connection.streamReadable(slot.id);
+                const amount = @min(remaining, bytes.len);
+                if (amount != 0) {
+                    @memcpy(slot.frame_storage[slot.frame_len .. slot.frame_len + amount], bytes[0..amount]);
+                    slot.frame_len += amount;
+                    slot.payload_seen += amount;
+                    try self.connection.consumeStream(slot.id, amount);
+                }
+                if (slot.payload_seen != wire.length) return;
+            }
+        }
+
+        fn consumeFrameHeader(self: *Self, slot: *RequestSlot, bytes: []const u8) !usize {
+            if (bytes.len == 0 or slot.wire != null) return 0;
+            if (slot.frame_len == 16) return error.FrameTooLarge;
+            // consumeStream slides QUIC's receive storage, so never retain or index
+            // the borrowed readable slice after consuming from it.
+            slot.frame_storage[slot.frame_len] = bytes[0];
+            slot.frame_len += 1;
+            try self.connection.consumeStream(slot.id, 1);
+            slot.wire = try parseWireHeader(slot.frame_storage[0..slot.frame_len]);
+            if (slot.wire) |wire| {
+                if (wire.length > config.max_frame_size) return error.FrameTooLarge;
+                if (wire.frame_type.isForbiddenHttp2()) return error.ForbiddenHttp2Frame;
+            }
+            return 1;
+        }
+
+        fn parseWireHeader(bytes: []const u8) !?WireHeader {
+            const type_value = varint.decode(bytes) catch return null;
+            if (type_value.length != try varint.encodedLength(type_value.value)) return error.NonCanonicalVarint;
+            const length_value = varint.decode(bytes[type_value.length..]) catch return null;
+            if (length_value.length != try varint.encodedLength(length_value.value)) return error.NonCanonicalVarint;
+            return .{
+                .frame_type = @enumFromInt(type_value.value),
+                .length = std.math.cast(usize, length_value.value) orelse return error.FrameTooLarge,
+                .encoded = type_value.length + length_value.length,
+            };
+        }
+
+        fn processRequestFrame(self: *Self, slot: *RequestSlot, value: frame.Frame) !void {
+            const previous_state = slot.state;
+            try slot.state.observe(value);
+            switch (value.payload) {
+                .headers => |block| {
+                    const start = slot.field_count;
+                    const required = self.decoder.?.sectionRequiredInsertCount(block) catch return error.QpackDecompressionFailed;
+                    self.decoder.?.decodeSection(block, @intCast(slot.id.value), &self.qpack_name_scratch, &self.qpack_value_scratch, slot, emitField) catch |err| switch (err) {
+                        error.Blocked => {
+                            slot.state = previous_state;
+                            return error.Blocked;
+                        },
+                        error.TooManyHeaders, error.HeaderStorageExhausted => return error.MessageError,
+                        else => return err,
+                    };
+                    const section_fields = slot.fields[start..slot.field_count];
+                    try enforceFieldSectionSize(section_fields);
+                    if (slot.state.phase == .body) {
+                        const head = semantics.parseRequest(slot.fields[0..slot.field_count], config.enable_extended_connect) catch return error.MessageError;
+                        if (head.content_length) |length| if (length > config.max_body_size) return error.BodyTooLarge;
+                        slot.initial_field_count = slot.field_count;
+                        slot.head = head;
+                        slot.content_length = head.content_length;
+                        if (head.content_length != null) try self.ensureRequest(slot, true);
+                    } else {
+                        const trailers = semantics.validateTrailers(section_fields) catch return error.MessageError;
+                        trailer_policy.validateIncoming(trailers, config.max_header_count, config.max_header_bytes) catch return error.MessageError;
+                        try self.ensureRequest(slot, true);
+                        try slot.input.?.setTrailers(trailers);
+                    }
+                    if (required != 0) {
+                        var storage: [16]u8 = undefined;
+                        var writer: Io.Writer = .fixed(&storage);
+                        try self.decoder.?.writeSectionAcknowledgment(&writer, @intCast(slot.id.value));
+                        try self.writeAll(self.local_decoder, writer.buffered());
+                    }
+                },
+                .data => unreachable,
+                else => {},
+            }
+        }
+
+        fn ensureRequest(self: *Self, slot: *RequestSlot, present: bool) !void {
+            if (slot.dispatched) return;
+            const head = slot.head orelse return error.MessageError;
+            slot.arena = std.heap.ArenaAllocator.init(self.allocator);
+            const allocator = slot.arena.?.allocator();
+            const state_value = try allocator.create(RequestBody.State);
+            if (present) {
+                const storage = try allocator.alloc(u8, config.request_body_buffer_size);
+                const input = try allocator.create(inbound_body.Pipe);
+                input.* = try .init(self.io, storage, .{ .context = slot, .consumed_fn = RequestSlot.credit });
+                slot.input = input;
+                state_value.* = .initPending(.borrowed(input), allocator, config.max_body_size, self.io, config.request_body_timeout);
+            } else {
+                state_value.* = .initAbsent();
+            }
+            slot.body_state = state_value;
+            slot.request = try request_adapter.build(head, .init(state_value));
+            slot.dispatched = true;
+            self.tasks.async(self.io, dispatchTask, .{ self, slot });
         }
 
         fn receiveFinished(self: *Self, id: StreamId, now: u64) !void {
-            if (id.direction() == .bidirectional) {
-                const slot = self.findRequest(id) orelse return;
-                slot.finished = true;
-                try self.processRequest(slot, now);
-                if (slot.occupied and slot.input_len != 0) return error.Truncated;
-                if (slot.occupied and slot.output_acked) slot.occupied = false;
-            } else if (self.findUni(id)) |slot| {
-                try self.processUni(slot, now);
-                if (slot.input_len != 0 or slot.stream_type == null) return error.Truncated;
-                try self.peer_streams.closed(slot.stream_type.?);
-                slot.occupied = false;
+            if (id.direction() == .unidirectional) {
+                if (self.findUni(id)) |slot| {
+                    try self.processUni(slot, now);
+                    if (slot.input_len != 0 or slot.stream_type == null) return error.Truncated;
+                    try self.peer_streams.closed(slot.stream_type.?);
+                    slot.occupied = false;
+                }
+                return;
             }
+            const slot = self.findRequest(id) orelse return;
+            slot.fin_observed = true;
+            try self.finishInputIfReady(slot);
+        }
+
+        fn finishInputIfReady(self: *Self, slot: *RequestSlot) !void {
+            if (!slot.fin_observed or slot.receive_finished) return;
+            if (slot.payload_staged != 0) return;
+            if (slot.wire) |wire| {
+                if (slot.payload_seen == wire.length) return;
+                return error.Truncated;
+            }
+            if (slot.frame_len != 0) return error.Truncated;
+            try slot.state.closed();
+            try self.ensureRequest(slot, false);
+            if (slot.content_length) |expected| if (slot.received_body != expected) {
+                self.failRequest(slot, .message_error, error.ContentLengthMismatch);
+                return;
+            };
+            slot.receive_finished = true;
+            if (slot.input) |input| input.finish();
         }
 
         fn sendFinished(self: *Self, id: StreamId) void {
-            if (self.findRequest(id)) |slot| {
-                slot.output_acked = true;
-                if (slot.finished) slot.occupied = false;
-            }
+            if (self.findRequest(id)) |slot| slot.output_acked = true;
         }
 
         fn resetReceived(self: *Self, id: StreamId) !void {
             _ = try self.connection.readStreamReset(id);
-            if (self.findRequest(id)) |slot| slot.occupied = false;
-            if (self.findUni(id)) |slot| {
-                if (slot.stream_type) |stream_type| try self.peer_streams.closed(stream_type);
-                slot.occupied = false;
+            if (self.findRequest(id)) |slot| self.failRequest(slot, .request_cancelled, error.PeerReset);
+        }
+
+        fn stopped(self: *Self, id: StreamId) void {
+            if (id.value == self.local_control.value or id.value == self.local_encoder.value or id.value == self.local_decoder.value) {
+                self.closeFor(error.ClosedCriticalStream, 0);
+                return;
+            }
+            if (self.findRequest(id)) |slot| self.failRequest(slot, .request_cancelled, error.PeerStopped);
+        }
+
+        fn returnCredits(self: *Self) !usize {
+            var total: usize = 0;
+            for (&self.requests) |*slot| {
+                if (!slot.occupied) continue;
+                const amount = slot.consumed_credit.swap(0, .acquire);
+                if (amount == 0) continue;
+                if (amount > slot.payload_staged) return error.ConsumeBeyondReadable;
+                try self.connection.consumeStream(slot.id, amount);
+                slot.payload_staged -= amount;
+                total += amount;
+                if (slot.payload_staged == 0) {
+                    try self.processRequestBytes(slot, 0);
+                    try self.finishInputIfReady(slot);
+                }
+            }
+            return total;
+        }
+
+        fn startResponse(self: *Self, slot: *RequestSlot) !void {
+            if (!slot.occupied or slot.response == null) return;
+            const response = &slot.response.?;
+            if (response.takeover != null) return error.UnsupportedHttp3Takeover;
+            const maximum: u32 = @intCast(@min(self.peer_max_field_section_size, std.math.maxInt(u32)));
+            const plan = try response_semantics.plan(slot.request.?.method, response.*, maximum);
+            if (response.body == .stream) try trailer_policy.validateNames(response.body.stream.trailer_names, config.max_response_trailer_count, config.max_response_trailer_size);
+            slot.suppress_response_body = !plan.produce_body;
+            slot.expected_response_length = plan.expected_length;
+            if (response.body == .bytes and response.body.bytes.len > config.max_response_body_size) return error.ResponseBodyTooLarge;
+            try self.appendHeaderFrame(slot, response.status, response.headers);
+            slot.response_headers_sent = true;
+            slot.response_started.set(self.io);
+        }
+
+        fn flushResponses(self: *Self) !usize {
+            var total: usize = 0;
+            for (&self.requests) |*slot| {
+                if (!slot.occupied or slot.response == null or slot.output_done) continue;
+                if (slot.control_sent < slot.control_len) {
+                    const written = try self.tryWrite(slot.id, slot.control[slot.control_sent..slot.control_len]);
+                    slot.control_sent += written;
+                    total += written;
+                    if (slot.control_sent != slot.control_len) continue;
+                    slot.control_len = 0;
+                    slot.control_sent = 0;
+                }
+                if (!slot.response_headers_sent) continue;
+                if (slot.suppress_response_body or slot.response.?.body == .empty) {
+                    try self.finishResponse(slot);
+                    continue;
+                }
+                if (slot.data_header_len != 0) {
+                    total += try self.flushDataFrame(slot);
+                    if (slot.data_header_len != 0) continue;
+                }
+                switch (slot.response.?.body) {
+                    .bytes => |bytes| {
+                        if (slot.bytes_offset < bytes.len) {
+                            try self.beginDataFrame(slot, @min(config.max_frame_size, bytes.len - slot.bytes_offset));
+                            total += try self.flushDataFrame(slot);
+                        } else try self.finishResponse(slot);
+                    },
+                    .stream => {
+                        const output = slot.output orelse continue;
+                        if (output.failure()) |err| {
+                            self.failRequest(slot, .internal_error, err);
+                            continue;
+                        }
+                        const bytes = output.peek(config.max_frame_size);
+                        if (bytes.len != 0) {
+                            if (slot.response_bytes_sent + bytes.len > config.max_response_body_size) {
+                                self.failRequest(slot, .internal_error, error.ResponseBodyTooLarge);
+                                continue;
+                            }
+                            try self.beginDataFrame(slot, bytes.len);
+                            total += try self.flushDataFrame(slot);
+                        } else if (output.isFinished()) {
+                            if (!slot.trailers_queued and !slot.response_trailers.isEmpty()) {
+                                try self.appendTrailerFrame(slot, slot.response_trailers);
+                                slot.trailers_queued = true;
+                            } else if (slot.control_len == 0) try self.finishResponse(slot);
+                        }
+                    },
+                    .empty => {},
+                }
+            }
+            return total;
+        }
+
+        fn beginDataFrame(_: *Self, slot: *RequestSlot, length: usize) !void {
+            std.debug.assert(slot.data_header_len == 0 and length != 0);
+            var cursor: usize = 0;
+            var encoded: [8]u8 = undefined;
+            const type_bytes = try varint.encode(&encoded, @intFromEnum(frame.Type.data));
+            @memcpy(slot.data_header[cursor..][0..type_bytes.len], type_bytes);
+            cursor += type_bytes.len;
+            const length_bytes = try varint.encode(&encoded, length);
+            @memcpy(slot.data_header[cursor..][0..length_bytes.len], length_bytes);
+            cursor += length_bytes.len;
+            slot.data_header_len = cursor;
+            slot.data_header_sent = 0;
+            slot.data_payload_len = length;
+            slot.data_payload_sent = 0;
+        }
+
+        fn flushDataFrame(self: *Self, slot: *RequestSlot) !usize {
+            var total: usize = 0;
+            if (slot.data_header_sent < slot.data_header_len) {
+                const written = try self.tryWrite(slot.id, slot.data_header[slot.data_header_sent..slot.data_header_len]);
+                slot.data_header_sent += written;
+                total += written;
+                if (slot.data_header_sent != slot.data_header_len) return total;
+            }
+            const remaining = slot.data_payload_len - slot.data_payload_sent;
+            if (remaining != 0) {
+                const source = switch (slot.response.?.body) {
+                    .bytes => |bytes| bytes[slot.bytes_offset..][0..remaining],
+                    .stream => slot.output.?.peek(remaining),
+                    .empty => unreachable,
+                };
+                const written = try self.tryWrite(slot.id, source);
+                slot.data_payload_sent += written;
+                slot.response_bytes_sent += written;
+                switch (slot.response.?.body) {
+                    .bytes => slot.bytes_offset += written,
+                    .stream => slot.output.?.consume(written),
+                    .empty => unreachable,
+                }
+                total += written;
+                if (slot.response_bytes_sent > config.max_response_body_size) return error.ResponseBodyTooLarge;
+            }
+            if (slot.data_payload_sent == slot.data_payload_len) {
+                slot.data_header_len = 0;
+                slot.data_header_sent = 0;
+                slot.data_payload_len = 0;
+                slot.data_payload_sent = 0;
+            }
+            return total;
+        }
+
+        fn finishResponse(self: *Self, slot: *RequestSlot) !void {
+            if (slot.finish_queued) return;
+            if (slot.expected_response_length) |expected| if (slot.response_bytes_sent != expected) {
+                self.failRequest(slot, .internal_error, error.ResponseContentLengthMismatch);
+                return;
+            };
+            try self.connection.finishStream(slot.id);
+            slot.finish_queued = true;
+            slot.output_done = true;
+            slot.notifyCompletion(.success);
+        }
+
+        fn tryWrite(self: *Self, id: StreamId, bytes: []const u8) !usize {
+            return self.connection.writeStream(id, bytes) catch |err| {
+                if (err == error.SendBufferFull) return 0;
+                return err;
+            };
+        }
+
+        fn failRequest(self: *Self, slot: *RequestSlot, code: errors.Code, err: anyerror) void {
+            if (!slot.occupied) return;
+            if (slot.input) |input| input.fail(err);
+            if (slot.output) |output| output.abort(err);
+            slot.notifyCompletion(.{ .failure = err });
+            self.connection.resetStream(slot.id, @intFromEnum(code)) catch {};
+            self.connection.stopSending(slot.id, @intFromEnum(code)) catch {};
+            slot.output_done = true;
+            slot.receive_finished = true;
+        }
+
+        fn collectRequests(self: *Self) void {
+            for (&self.requests) |*slot| {
+                if (!slot.occupied or !slot.task_done or !slot.output_done or !slot.output_acked) continue;
+                slot.deinit();
             }
         }
 
-        fn stopped(self: *Self, id: StreamId) !void {
-            if (id.value == self.local_control.value or id.value == self.local_encoder.value or id.value == self.local_decoder.value) {
-                return error.ClosedCriticalStream;
+        const ExchangeAdapter = struct {
+            owner: *Self,
+            slot: *RequestSlot,
+            pub fn informational(self: *@This(), status: std.http.Status, headers: Headers) !void {
+                if (status.class() != .informational) return error.InvalidInformationalStatus;
+                var operation: Informational = .{ .slot = self.slot, .status = status, .headers = headers };
+                try self.owner.messages.putOne(self.owner.io, .{ .informational = &operation });
+                try operation.done.wait(self.owner.io);
+                if (operation.err) |err| return err;
             }
-            if (self.findRequest(id)) |slot| slot.occupied = false;
+        };
+
+        fn dispatchTask(self: *Self, slot: *RequestSlot) Io.Cancelable!void {
+            var task_error: ?anyerror = null;
+            self.dispatchTaskRun(slot) catch |err| {
+                task_error = err;
+            };
+            self.messages.putOneUncancelable(self.io, .{ .task_done = .{ .slot = slot, .err = task_error } }) catch {};
+            if (task_error) |err| if (err == error.Canceled) return error.Canceled;
+        }
+
+        fn dispatchTaskRun(self: *Self, slot: *RequestSlot) !void {
+            const allocator = slot.arena.?.allocator();
+            var adapter: ExchangeAdapter = .{ .owner = self, .slot = slot };
+            var exchange = Exchange.borrowed(&adapter);
+            var locals: if (Locals) |LocalState| LocalState else void = if (Locals != null) .{} else {};
+            const context = if (Locals) |_| Context{
+                .execution = .{ .state = self.state, .allocator = allocator, .io = self.io },
+                .request = slot.request.?,
+                .locals = &locals,
+                .exchange = &exchange,
+            } else Context{
+                .execution = .{ .state = self.state, .allocator = allocator, .io = self.io },
+                .request = slot.request.?,
+                .exchange = &exchange,
+            };
+            var response = Dispatcher.dispatch(&context) catch |err| switch (config.application_error_policy) {
+                .internal_server_error => Response{ .status = .internal_server_error },
+                .reset_stream => return err,
+            };
+            defer response.body.finalize();
+            defer if (response.takeover) |*takeover| takeover.finalize();
+            if (response.write_deadline == null) if (config.response_write_timeout) |timeout| {
+                response.write_deadline = .fromNow(self.io, .{ .raw = timeout, .clock = .awake });
+            };
+            exchange.beginFinal();
+            if (response.body == .stream) {
+                const ring = try allocator.alloc(u8, config.response_body_buffer_size);
+                const writer_buffer = try allocator.alloc(u8, config.response_writer_buffer_size);
+                const output = try allocator.create(outbound_body.Pipe);
+                output.* = try .init(self.io, ring, writer_buffer, .{ .context = slot, .notify_fn = RequestSlot.outputReady });
+                slot.output = output;
+            }
+            slot.response = response;
+            try self.messages.putOne(self.io, .{ .response_ready = slot });
+            try slot.response_started.wait(self.io);
+            if (slot.suppress_response_body or response.body != .stream) return;
+            try self.runProducer(slot, allocator);
+        }
+
+        fn runProducer(self: *Self, slot: *RequestSlot, allocator: std.mem.Allocator) !void {
+            const deadline = slot.response.?.write_deadline orelse return self.produce(slot, allocator);
+            const Race = union(enum) { produce: anyerror!void, timeout: anyerror!void };
+            var results: [2]Race = undefined;
+            var select = Io.Select(Race).init(self.io, &results);
+            select.async(.produce, produceTask, .{ self, slot, allocator });
+            select.async(.timeout, waitUntil, .{ deadline, self.io });
+            const result = select.await() catch |err| {
+                select.cancelDiscard();
+                return err;
+            };
+            defer select.cancelDiscard();
+            switch (result) {
+                .produce => |produce_result| try produce_result,
+                .timeout => |timeout_result| {
+                    try timeout_result;
+                    slot.output.?.abort(error.ResponseTimeout);
+                    return error.ResponseTimeout;
+                },
+            }
+        }
+
+        fn produceTask(self: *Self, slot: *RequestSlot, allocator: std.mem.Allocator) !void {
+            return self.produce(slot, allocator);
+        }
+
+        fn produce(_: *Self, slot: *RequestSlot, allocator: std.mem.Allocator) !void {
+            var body = &slot.response.?.body.stream;
+            body.produce(&slot.output.?.writer) catch |err| {
+                slot.output.?.abort(err);
+                return err;
+            };
+            slot.response_trailers = try copyHeaders(allocator, body.trailers());
+            try trailer_policy.validateOutgoing(
+                body.trailer_names,
+                slot.response_trailers,
+                config.max_response_trailer_count,
+                config.max_response_trailer_size,
+            );
+            try slot.output.?.finish();
+        }
+
+        fn waitUntil(deadline: Io.Clock.Timestamp, io: Io) anyerror!void {
+            try deadline.wait(io);
+        }
+
+        fn copyHeaders(allocator: std.mem.Allocator, headers: Headers) !Headers {
+            const fields = try allocator.alloc(Header, headers.items.len);
+            for (headers.items, fields) |source, *destination| destination.* = .{
+                .name = try allocator.dupe(u8, source.name),
+                .value = try allocator.dupe(u8, source.value),
+            };
+            return .{ .items = fields };
         }
 
         fn processUni(self: *Self, slot: *UniSlot, now: u64) !void {
@@ -364,71 +935,13 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             removePrefix(&slot.input, &slot.input_len, consumed);
         }
 
-        fn processRequest(self: *Self, slot: *RequestSlot, now: u64) !void {
-            var consumed: usize = 0;
-            while (consumed < slot.input_len) {
-                const parsed = frame.parse(slot.input[consumed..slot.input_len]) catch |err| switch (err) {
-                    error.Truncated => break,
+        fn retryRequests(self: *Self, now: u64) !void {
+            for (&self.requests) |*slot| {
+                if (!slot.occupied or slot.wire == null or slot.payload_staged != 0) continue;
+                self.processRequestBytes(slot, now) catch |err| switch (err) {
+                    error.Blocked => continue,
                     else => return err,
                 };
-                self.processRequestFrame(slot, parsed.frame) catch |err| switch (err) {
-                    error.Blocked => break,
-                    error.MessageError, error.BodyTooLarge => {
-                        try self.rejectRequest(slot, if (err == error.BodyTooLarge) .excessive_load else .message_error);
-                        return;
-                    },
-                    else => return err,
-                };
-                consumed += parsed.consumed;
-            }
-            removePrefix(&slot.input, &slot.input_len, consumed);
-            if (slot.finished and slot.input_len == 0 and !slot.dispatched and slot.occupied) {
-                slot.state.closed() catch |err| {
-                    try self.rejectRequest(slot, if (err == error.RequestIncomplete) .request_incomplete else .message_error);
-                    return;
-                };
-                try self.dispatch(slot);
-            }
-            _ = now;
-        }
-
-        fn processRequestFrame(self: *Self, slot: *RequestSlot, value: frame.Frame) !void {
-            const previous_state = slot.state;
-            try slot.state.observe(value);
-            switch (value.payload) {
-                .headers => |block| {
-                    const start = slot.field_count;
-                    const required = self.decoder.?.sectionRequiredInsertCount(block) catch return error.QpackDecompressionFailed;
-                    self.decoder.?.decodeSection(block, @intCast(slot.id.value), &self.qpack_name_scratch, &self.qpack_value_scratch, slot, emitField) catch |err| switch (err) {
-                        error.Blocked => {
-                            slot.state = previous_state;
-                            return error.Blocked;
-                        },
-                        error.TooManyHeaders, error.HeaderStorageExhausted => return error.MessageError,
-                        else => return err,
-                    };
-                    const section_fields = slot.fields[start..slot.field_count];
-                    try enforceFieldSectionSize(section_fields);
-                    if (slot.state.phase == .body) {
-                        _ = semantics.parseRequest(slot.fields[0..slot.field_count], config.enable_extended_connect) catch return error.MessageError;
-                        slot.initial_field_count = slot.field_count;
-                    } else {
-                        const trailers = semantics.validateTrailers(section_fields) catch return error.MessageError;
-                        trailer_policy.validateIncoming(trailers, config.max_header_count, config.max_header_bytes) catch return error.MessageError;
-                    }
-                    if (required != 0) {
-                        var storage: [16]u8 = undefined;
-                        var writer: Io.Writer = .fixed(&storage);
-                        try self.decoder.?.writeSectionAcknowledgment(&writer, @intCast(slot.id.value));
-                        try self.writeAll(self.local_decoder, writer.buffered());
-                    }
-                },
-                .data => |bytes| {
-                    if (slot.body_len + bytes.len > slot.body.len) return error.BodyTooLarge;
-                    @memcpy(slot.body[slot.body_len .. slot.body_len + bytes.len], bytes);
-                    slot.body_len += bytes.len;
-                },
-                else => {},
             }
         }
 
@@ -456,95 +969,6 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             slot.field_count += 1;
         }
 
-        fn dispatch(self: *Self, slot: *RequestSlot) !void {
-            if (slot.dispatched or !slot.occupied) return;
-            slot.dispatched = true;
-            const head = semantics.parseRequest(slot.fields[0..slot.initial_field_count], config.enable_extended_connect) catch {
-                return self.rejectRequest(slot, .message_error);
-            };
-            if (head.content_length) |expected| if (expected != slot.body_len) return self.rejectRequest(slot, .message_error);
-            slot.body_state = if (slot.body_len == 0 and head.content_length == null and slot.field_count == slot.initial_field_count)
-                .initAbsent()
-            else
-                .initBuffered(slot.body[0..slot.body_len]);
-            if (slot.field_count > slot.initial_field_count) {
-                slot.body_state.trailers_cache = .{ .items = slot.fields[slot.initial_field_count..slot.field_count] };
-            }
-            const request = request_adapter.build(head, RequestBody.init(&slot.body_state)) catch return self.rejectRequest(slot, .message_error);
-
-            var arena = std.heap.ArenaAllocator.init(self.allocator);
-            defer arena.deinit();
-            var adapter: ExchangeAdapter = .{ .owner = self, .slot = slot };
-            var exchange = Exchange.borrowed(&adapter);
-            var locals: if (Locals) |LocalState| LocalState else void = if (Locals != null) .{} else {};
-            const context = if (Locals) |_| Context{
-                .execution = .{ .state = self.state, .allocator = arena.allocator(), .io = self.io },
-                .request = request,
-                .locals = &locals,
-                .exchange = &exchange,
-            } else Context{
-                .execution = .{ .state = self.state, .allocator = arena.allocator(), .io = self.io },
-                .request = request,
-                .exchange = &exchange,
-            };
-            var response = Dispatcher.dispatch(&context) catch |err| switch (config.application_error_policy) {
-                .internal_server_error => Response{ .status = .internal_server_error },
-                .reset_stream => {
-                    try self.rejectRequest(slot, .internal_error);
-                    return err;
-                },
-            };
-            defer response.body.finalize();
-            defer if (response.takeover) |*takeover| takeover.finalize();
-            exchange.beginFinal();
-            self.appendResponse(slot, request, &response) catch |err| switch (config.application_error_policy) {
-                .internal_server_error => {
-                    slot.output_len = 0;
-                    var fallback = Response{ .status = .internal_server_error };
-                    try self.appendResponse(slot, request, &fallback);
-                },
-                .reset_stream => {
-                    try self.rejectRequest(slot, .internal_error);
-                    return err;
-                },
-            };
-            response.complete(.success);
-        }
-
-        const ExchangeAdapter = struct {
-            owner: *Self,
-            slot: *RequestSlot,
-            pub fn informational(self: *@This(), status: std.http.Status, headers: Headers) !void {
-                if (status.class() != .informational) return error.InvalidInformationalStatus;
-                try self.owner.appendHeaderFrame(self.slot, status, headers);
-            }
-        };
-
-        fn appendResponse(self: *Self, slot: *RequestSlot, request: Request, response: *Response) !void {
-            if (response.takeover != null) return error.UnsupportedHttp3Takeover;
-            const maximum: u32 = @intCast(@min(self.peer_max_field_section_size, std.math.maxInt(u32)));
-            const plan = try response_semantics.plan(request.method, response.*, maximum);
-            try self.appendHeaderFrame(slot, response.status, response.headers);
-            if (!plan.produce_body) return;
-            var body: []const u8 = "";
-            var trailers: Headers = .empty;
-            switch (response.body) {
-                .empty => {},
-                .bytes => |bytes| body = bytes,
-                .stream => |*producer| {
-                    var writer: Io.Writer = .fixed(&slot.response_body);
-                    try producer.produce(&writer);
-                    body = writer.buffered();
-                    trailers = producer.trailers();
-                    try trailer_policy.validateOutgoing(producer.trailer_names, trailers, config.max_response_trailer_count, config.max_response_trailer_size);
-                },
-            }
-            if (body.len > config.max_response_body_size) return error.ResponseBodyTooLarge;
-            if (plan.expected_length) |expected| if (expected != body.len) return error.ResponseContentLengthMismatch;
-            if (body.len != 0) try appendFrame(slot, .{ .frame_type = .data, .payload = .{ .data = body } });
-            if (!trailers.isEmpty()) try self.appendTrailerFrame(slot, trailers);
-        }
-
         fn appendHeaderFrame(self: *Self, slot: *RequestSlot, status: std.http.Status, headers: Headers) !void {
             var status_storage: [3]u8 = undefined;
             const fields_value = try response_fields.fields(status, headers, &self.response_field_storage, &self.response_names, &status_storage);
@@ -557,43 +981,11 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         fn encodeHeaderFrame(self: *Self, slot: *RequestSlot, fields_value: []const qpack.Field) !void {
+            if (slot.control_sent != 0) return error.StreamBlocked;
             var writer: Io.Writer = .fixed(&self.qpack_block);
             try self.encoder.?.encodeSection(&writer, @intCast(slot.id.value), fields_value, &self.qpack_staging, false);
-            try appendFrame(slot, .{ .frame_type = .headers, .payload = .{ .headers = writer.buffered() } });
-        }
-
-        fn appendFrame(slot: *RequestSlot, value: frame.Frame) !void {
-            const written = try frame.encode(slot.output[slot.output_len..], value);
-            slot.output_len += written;
-        }
-
-        fn retryRequests(self: *Self, now: u64) !void {
-            for (&self.requests) |*slot| if (slot.occupied and !slot.dispatched and slot.input_len != 0) try self.processRequest(slot, now);
-        }
-
-        fn flushResponses(self: *Self) !usize {
-            var total: usize = 0;
-            for (&self.requests) |*slot| {
-                if (!slot.occupied or !slot.dispatched) continue;
-                if (slot.output_sent < slot.output_len) {
-                    const written = try self.connection.writeStream(slot.id, slot.output[slot.output_sent..slot.output_len]);
-                    slot.output_sent += written;
-                    total += written;
-                }
-                if (slot.output_sent == slot.output_len and !slot.output_finished) {
-                    try self.connection.finishStream(slot.id);
-                    slot.output_finished = true;
-                    total += 1;
-                }
-            }
-            return total;
-        }
-
-        fn rejectRequest(self: *Self, slot: *RequestSlot, code: errors.Code) !void {
-            if (!slot.occupied) return;
-            try self.connection.resetStream(slot.id, @intFromEnum(code));
-            try self.connection.stopSending(slot.id, @intFromEnum(code));
-            slot.occupied = false;
+            const written = try frame.encode(slot.control[slot.control_len..], .{ .frame_type = .headers, .payload = .{ .headers = writer.buffered() } });
+            slot.control_len += written;
         }
 
         fn writeSettings(self: *Self) !void {
@@ -619,10 +1011,15 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         fn writeAll(self: *Self, id: StreamId, bytes: []const u8) !void {
             var cursor: usize = 0;
             while (cursor < bytes.len) {
-                const written = try self.connection.writeStream(id, bytes[cursor..]);
+                const written = try self.tryWrite(id, bytes[cursor..]);
                 if (written == 0) return error.StreamBlocked;
                 cursor += written;
             }
+        }
+
+        fn rejectId(self: *Self, id: StreamId, code: errors.Code) !void {
+            try self.connection.resetStream(id, @intFromEnum(code));
+            try self.connection.stopSending(id, @intFromEnum(code));
         }
 
         fn closeFor(self: *Self, cause: anyerror, now: u64) void {
@@ -658,7 +1055,6 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             @memcpy(destination[length.* .. length.* + bytes.len], bytes);
             length.* += bytes.len;
         }
-
         fn removePrefix(destination: []u8, length: *usize, amount: usize) void {
             std.debug.assert(amount <= length.*);
             std.mem.copyForwards(u8, destination[0 .. length.* - amount], destination[amount..length.*]);

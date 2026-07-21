@@ -50,6 +50,13 @@ pub const Pipe = struct {
         self.ready.notify();
     }
 
+    /// Returns the number of bytes currently queued for the controller.
+    pub fn readableLen(self: *const Pipe) usize {
+        const head = self.head.load(.acquire);
+        const tail = self.tail.load(.acquire);
+        return tail - head;
+    }
+
     /// Returns the next contiguous DATA slice, bounded by frame/window credit.
     pub fn peek(self: *Pipe, maximum: usize) []const u8 {
         const head = self.head.load(.monotonic);
