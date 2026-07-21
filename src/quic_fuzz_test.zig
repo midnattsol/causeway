@@ -196,6 +196,7 @@ fn fuzzTlsWire(input: []const u8) void {
     _ = hello.selectCipherSuite(&.{ .AES_128_GCM_SHA256, .CHACHA20_POLY1305_SHA256 });
     _ = hello.selectX25519KeyShare();
     _ = hello.selectSignatureScheme(&.{ .ecdsa_secp256r1_sha256, .ed25519 });
+    _ = quic_tls.negotiation.negotiateDefaults(hello) catch {};
 }
 
 fn fuzzTransportParameters(input: []const u8, role: transport_parameters.Role) !void {
