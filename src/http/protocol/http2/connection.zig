@@ -481,7 +481,10 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             fn finishHeaderBlock(self: *Controller, stream_id: u32, bytes: []const u8, end_stream: bool) !void {
                 const stream = self.registry.get(stream_id).?;
                 if (self.sessions.get(stream_id)) |session| {
-                    var block = self.decoder.decode(session.arena.allocator(), bytes) catch |err| return self.connectionFailure(.compression_error, err);
+                    var block = self.decoder.decode(session.arena.allocator(), bytes) catch |err| switch (err) {
+                        error.HeaderListTooLarge, error.TooManyHeaderFields => return self.streamFailure(stream_id, .enhance_your_calm, err),
+                        else => return self.connectionFailure(.compression_error, err),
+                    };
                     const trailers = header_semantics.validateTrailers(block.items) catch |err| return self.streamFailure(stream_id, .protocol_error, err);
                     trailer_policy.validateIncoming(
                         trailers,
@@ -519,7 +522,13 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     self.owner.allocator.destroy(session);
                 };
                 const allocator = session.arena.allocator();
-                var block = self.decoder.decode(allocator, bytes) catch |err| return self.connectionFailure(.compression_error, err);
+                var block = self.decoder.decode(allocator, bytes) catch |err| switch (err) {
+                    error.HeaderListTooLarge, error.TooManyHeaderFields => {
+                        self.streamFailure(stream_id, .enhance_your_calm, err);
+                        return null;
+                    },
+                    else => return self.connectionFailure(.compression_error, err),
+                };
                 const head = header_semantics.parseRequest(block.items, self.owner.options.enable_extended_connect) catch |err| {
                     self.streamFailure(stream_id, .protocol_error, err);
                     return null;

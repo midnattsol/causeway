@@ -67,13 +67,25 @@ pub const Decoder = struct {
         var cursor: usize = 0;
         var list_size: usize = 0;
         var saw_field = false;
+        var limit_failure: ?enum { header_list, header_count } = null;
         while (cursor < encoded.len) {
             const first = encoded[cursor];
             if (first & 0x80 != 0) {
                 saw_field = true;
                 const index = try integer.decode(encoded, &cursor, 7, std.math.maxInt(usize));
                 const field = table.get(self.dynamic, @intCast(index)) orelse return error.InvalidHeaderIndex;
-                try appendField(allocator, &fields, field.name, field.value, &list_size, self.limits);
+                if (limit_failure == null) appendField(
+                    allocator,
+                    &fields,
+                    field.name,
+                    field.value,
+                    &list_size,
+                    self.limits,
+                ) catch |err| switch (err) {
+                    error.HeaderListTooLarge => limit_failure = .header_list,
+                    error.TooManyHeaderFields => limit_failure = .header_count,
+                    else => return err,
+                };
                 continue;
             }
             if (first & 0x40 != 0) {
@@ -83,9 +95,22 @@ pub const Decoder = struct {
                     allocator.free(field.name);
                     allocator.free(field.value);
                 }
-                try accountField(fields.items.len, field, &list_size, self.limits);
                 try self.dynamic.insert(field.name, field.value);
-                try fields.append(allocator, field);
+                var appended = false;
+                if (limit_failure == null) {
+                    accountField(fields.items.len, field, &list_size, self.limits) catch |err| switch (err) {
+                        error.HeaderListTooLarge => limit_failure = .header_list,
+                        error.TooManyHeaderFields => limit_failure = .header_count,
+                    };
+                    if (limit_failure == null) {
+                        try fields.append(allocator, field);
+                        appended = true;
+                    }
+                }
+                if (!appended) {
+                    allocator.free(field.name);
+                    allocator.free(field.value);
+                }
                 continue;
             }
             if (first & 0x20 != 0) {
@@ -101,10 +126,27 @@ pub const Decoder = struct {
                 allocator.free(field.name);
                 allocator.free(field.value);
             }
-            try accountField(fields.items.len, field, &list_size, self.limits);
-            try fields.append(allocator, field);
+            var appended = false;
+            if (limit_failure == null) {
+                accountField(fields.items.len, field, &list_size, self.limits) catch |err| switch (err) {
+                    error.HeaderListTooLarge => limit_failure = .header_list,
+                    error.TooManyHeaderFields => limit_failure = .header_count,
+                };
+                if (limit_failure == null) {
+                    try fields.append(allocator, field);
+                    appended = true;
+                }
+            }
+            if (!appended) {
+                allocator.free(field.name);
+                allocator.free(field.value);
+            }
         }
 
+        if (limit_failure) |failure| return switch (failure) {
+            .header_list => error.HeaderListTooLarge,
+            .header_count => error.TooManyHeaderFields,
+        };
         return .{ .allocator = allocator, .items = try fields.toOwnedSlice(allocator) };
     }
 
@@ -303,6 +345,17 @@ test "HPACK encoder and decoder round trip indexed sensitive and Huffman fields"
     }
     try std.testing.expect(decoder.dynamic.findName("authorization") == null);
     try std.testing.expect(decoder.dynamic.findName("custom-key") != null);
+}
+
+test "HPACK decoder preserves dynamic state after rejecting a large header list" {
+    var decoder = try Decoder.init(std.testing.allocator, .{ .header_list_size = 32 });
+    defer decoder.deinit();
+    try std.testing.expectError(error.HeaderListTooLarge, decoder.decode(
+        std.testing.allocator,
+        &.{ 0x40, 0x01, 'a', 0x01, 'b' },
+    ));
+    try std.testing.expectEqualStrings("a", decoder.dynamic.get(1).?.name);
+    try std.testing.expectEqualStrings("b", decoder.dynamic.get(1).?.value);
 }
 
 test "HPACK decoder enforces table updates and header-list limits" {
