@@ -6,6 +6,7 @@ pub const cache_control = @import("cache_control.zig");
 pub const conditional = @import("conditional.zig");
 pub const cookies = @import("cookies.zig");
 pub const range = @import("range.zig");
+pub const structured_fields = @import("structured_fields/root.zig");
 
 // -----------------------------------------------------------------------------
 // Tests
