@@ -28,6 +28,9 @@ pub const HandlerWithLocals = connection.HandlerWithLocals;
 
 test {
     _ = @import("compliance_test.zig");
-    _ = @import("connection_test.zig");
+    _ = @import("connection/tests/basic.zig");
+    _ = @import("connection/tests/body.zig");
+    _ = @import("connection/tests/response.zig");
+    _ = @import("connection/tests/lifecycle.zig");
     std.testing.refAllDecls(@This());
 }
