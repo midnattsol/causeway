@@ -127,6 +127,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             output_done: bool = false,
             bytes_offset: usize = 0,
             trailers_sent: bool = false,
+            tunnel: bool = false,
 
             fn deinit(self: *Session) void {
                 self.arena.deinit();
@@ -513,8 +514,8 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 self.connection_receive_window.consume(payload.bytes.len) catch |err| return self.connectionFailure(.flow_control_error, err);
                 stream.receiveData(payload.bytes.len, payload.end_stream) catch |err| return self.streamFailure(stream_id, .protocol_error, err);
                 session.received_body = std.math.add(u64, session.received_body, payload.bytes.len) catch return self.streamFailure(stream_id, .cancel, error.BodyTooLarge);
-                if (session.received_body > self.owner.options.max_body_size) return self.streamFailure(stream_id, .cancel, error.BodyTooLarge);
-                if (session.content_length) |expected| if (session.received_body > expected) return self.streamFailure(stream_id, .protocol_error, error.ContentLengthMismatch);
+                if (!session.tunnel and session.received_body > self.owner.options.max_body_size) return self.streamFailure(stream_id, .cancel, error.BodyTooLarge);
+                if (!session.tunnel) if (session.content_length) |expected| if (session.received_body > expected) return self.streamFailure(stream_id, .protocol_error, error.ContentLengthMismatch);
                 session.input.push(payload.bytes) catch |err| return self.streamFailure(stream_id, .flow_control_error, err);
                 if (payload.end_stream) {
                     self.verifyBodyEnd(session) catch |err| return self.streamFailure(stream_id, .protocol_error, err);
@@ -523,6 +524,7 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
 
             fn verifyBodyEnd(_: *Controller, session: *Session) !void {
+                if (session.tunnel) return;
                 if (session.content_length) |expected| {
                     if (session.received_body != expected) return error.ContentLengthMismatch;
                 }
@@ -581,6 +583,10 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 if (session.response == null or !session.response_headers_sent or session.output_done) return false;
                 const stream = self.registry.get(session.id) orelse return false;
                 const has_window = stream.send_window.value > 0 and self.connection_send_window.value > 0;
+                if (session.tunnel) {
+                    const output = session.output orelse return false;
+                    return output.failure() != null or output.isFinished() or (has_window and output.peek(1).len != 0);
+                }
                 return switch (session.response.?.body) {
                     .empty => true,
                     .bytes => |bytes| session.bytes_offset == bytes.len or has_window,
@@ -621,7 +627,15 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 const response = &session.response.?;
                 var bytes: []const u8 = &.{};
                 var producer_finished = false;
-                switch (response.body) {
+                if (session.tunnel) {
+                    const output = session.output orelse return false;
+                    bytes = output.peek(allowance);
+                    producer_finished = output.isFinished() and bytes.len == 0;
+                    if (output.failure()) |err| {
+                        self.streamFailure(session.id, .connect_error, err);
+                        return true;
+                    }
+                } else switch (response.body) {
                     .empty => producer_finished = true,
                     .bytes => |body| {
                         bytes = body[session.bytes_offset..][0..@min(allowance, body.len - session.bytes_offset)];
@@ -638,14 +652,16 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     },
                 }
                 if (bytes.len != 0) {
-                    const end_stream = producer_finished and switch (response.body) {
+                    const end_stream = producer_finished and (session.tunnel or switch (response.body) {
                         .stream => |body| body.trailer_names.len == 0,
                         else => true,
-                    };
+                    });
                     try self.writer.writeData(session.id, bytes, end_stream);
                     try stream.sendData(bytes.len, end_stream);
                     try self.connection_send_window.consume(bytes.len);
-                    switch (response.body) {
+                    if (session.tunnel) {
+                        session.output.?.consume(bytes.len);
+                    } else switch (response.body) {
                         .bytes => session.bytes_offset += bytes.len,
                         .stream => session.output.?.consume(bytes.len),
                         .empty => unreachable,
@@ -828,11 +844,24 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 .reset_stream => return err,
             };
             exchange.beginFinal();
-            if (response.takeover != null) {
-                response.body.finalize();
-                return error.UnsupportedHttp2Takeover;
-            }
-            if (response.body == .stream) {
+            if (response.takeover) |takeover| switch (takeover.kind) {
+                .upgrade => {
+                    response.body.finalize();
+                    return error.UnsupportedHttp2Upgrade;
+                },
+                .tunnel => {
+                    if (!session.request.method.is(.CONNECT) or response.status.class() != .success) {
+                        response.body.finalize();
+                        return error.InvalidHttp2Tunnel;
+                    }
+                    if (response.body != .empty) {
+                        response.body.finalize();
+                        return error.TunnelResponseBodyConflict;
+                    }
+                    session.tunnel = true;
+                },
+            };
+            if (response.body == .stream or session.tunnel) {
                 const ring = try allocator.alloc(u8, owner.options.response_body_buffer_size);
                 const writer_buffer = try allocator.alloc(u8, owner.options.response_writer_buffer_size);
                 const output = try allocator.create(outbound_body.Pipe);
@@ -844,7 +873,16 @@ fn HandlerType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             wake.signal();
             try session.response_started.wait(io);
 
-            if (session.response.?.body == .stream) {
+            if (session.tunnel) {
+                const input = try session.input.activate(allocator);
+                var takeover = &session.response.?.takeover.?;
+                defer takeover.finalize();
+                takeover.run(input, &session.output.?.writer) catch |err| {
+                    session.output.?.abort(err);
+                    return err;
+                };
+                try session.output.?.finish();
+            } else if (session.response.?.body == .stream) {
                 var body = &session.response.?.body.stream;
                 defer body.finalize();
                 body.produce(&session.output.?.writer) catch |err| {
@@ -930,6 +968,37 @@ test "HTTP/2 keeps valid multiplexed streams alive after a malformed request" {
     try std.testing.expectEqual(@as(usize, 1), state.requests);
     try std.testing.expect(serverOutputContains(output.written(), .rst_stream, 1));
     try std.testing.expect(serverOutputContains(output.written(), .headers, 3));
+}
+
+test "HTTP/2 CONNECT maps takeover I/O onto stream DATA" {
+    const AppState = struct {};
+    const Tunnel = struct {
+        pub fn run(_: *@This(), input: *Io.Reader, output: *Io.Writer) !void {
+            var bytes: [3]u8 = undefined;
+            try input.readSliceAll(&bytes);
+            try output.writeAll(&bytes);
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            const takeover = try response_module.Takeover.init(context.execution.allocator, Tunnel{});
+            return Response.tunnel(.ok, .empty, takeover);
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(4));
+    const bytes = frame.client_preface ++
+        "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++
+        "\x00\x00\x0c\x01\x04\x00\x00\x00\x01\x02\x07CONNECT\x01\x01x" ++
+        "\x00\x00\x03\x00\x01\x00\x00\x00\x01abc";
+    var input: Io.Reader = .fixed(bytes);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var state: AppState = .{};
+    var handler = Handler(AppState, Dispatcher).init(std.testing.allocator, &state, .{});
+    try handler.serve(&input, &output.writer, threaded.io());
+    try std.testing.expectEqual(@as(usize, 3), serverDataLength(output.written(), 1));
 }
 
 test "HTTP/2 request and response trailers survive stream boundaries" {
