@@ -1,6 +1,8 @@
 //! HTTP/3 application error codes from RFC 9114 section 8.1.
 
 pub const Code = enum(u64) {
+    /// RFC 9297: malformed or unnegotiated HTTP/3 DATAGRAM payload.
+    h3_datagram_error = 0x33,
     no_error = 0x100,
     general_protocol_error = 0x101,
     internal_error = 0x102,

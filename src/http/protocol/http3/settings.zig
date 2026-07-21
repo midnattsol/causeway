@@ -21,6 +21,14 @@ pub const Id = enum(u64) {
 
 pub const Entry = struct { id: Id, value: u64 };
 
+pub fn h3DatagramEnabled(value: u64) !bool {
+    return switch (value) {
+        0 => false,
+        1 => true,
+        else => error.InvalidH3DatagramSetting,
+    };
+}
+
 pub const Iterator = struct {
     bytes: []const u8,
     cursor: usize = 0,
@@ -92,6 +100,12 @@ test "SETTINGS iterates known, unknown, and GREASE values" {
     try std.testing.expectEqual(@as(u64, 64), @intFromEnum(unknown.id));
     try std.testing.expectEqual(@as(u64, 1), unknown.value);
     try std.testing.expect((try entries.next()) == null);
+}
+
+test "SETTINGS_H3_DATAGRAM accepts zero and one only" {
+    try std.testing.expect(!(try h3DatagramEnabled(0)));
+    try std.testing.expect(try h3DatagramEnabled(1));
+    try std.testing.expectError(error.InvalidH3DatagramSetting, h3DatagramEnabled(2));
 }
 
 test "SETTINGS accepts non-minimal varints and rejects semantic or malformed values" {

@@ -164,13 +164,46 @@ pub const Stream = struct {
     }
 };
 
+/// Transport-independent unreliable HTTP Datagram channel for a CONNECT tunnel.
+/// Received payloads borrow no transport storage: `receive` copies into the
+/// caller's buffer. A null result means the tunnel has closed cleanly.
+pub const DatagramChannel = struct {
+    context: *anyopaque,
+    mode_fn: *const fn (*anyopaque) Mode,
+    receive_fn: *const fn (*anyopaque, []u8) anyerror!?usize,
+    send_fn: *const fn (*anyopaque, []const u8) anyerror!void,
+    dropped_fn: *const fn (*anyopaque) u64,
+
+    pub const Mode = enum { quic, capsule };
+
+    pub fn mode(self: DatagramChannel) Mode {
+        return self.mode_fn(self.context);
+    }
+
+    pub fn receive(self: *DatagramChannel, destination: []u8) !?usize {
+        return self.receive_fn(self.context, destination);
+    }
+
+    pub fn send(self: *DatagramChannel, payload: []const u8) !void {
+        return self.send_fn(self.context, payload);
+    }
+
+    /// Number of associated incoming datagrams discarded because the bounded
+    /// queue was full or the application payload limit was exceeded. The counter
+    /// saturates rather than wrapping.
+    pub fn dropped(self: DatagramChannel) u64 {
+        return self.dropped_fn(self.context);
+    }
+};
+
 /// Type-erased control transfer after an HTTP upgrade or successful CONNECT.
 pub const Takeover = struct {
     context: *anyopaque,
-    run_fn: *const fn (*anyopaque, *std.Io.Reader, *std.Io.Writer) anyerror!void,
+    run_fn: *const fn (*anyopaque, *std.Io.Reader, *std.Io.Writer, ?*DatagramChannel) anyerror!void,
     finalize_fn: ?*const fn (*anyopaque) void,
     lifecycle: *Lifecycle,
     kind: Kind,
+    accepts_datagrams: bool = false,
 
     pub const Kind = union(enum) {
         upgrade: []const u8,
@@ -190,7 +223,7 @@ pub const Takeover = struct {
             handler: Handler,
         };
         const Adapter = struct {
-            fn run(context: *anyopaque, input: *std.Io.Reader, output: *std.Io.Writer) anyerror!void {
+            fn run(context: *anyopaque, input: *std.Io.Reader, output: *std.Io.Writer, _: ?*DatagramChannel) anyerror!void {
                 const typed: *Handler = @ptrCast(@alignCast(context));
                 return typed.run(input, output);
             }
@@ -211,10 +244,47 @@ pub const Takeover = struct {
         };
     }
 
+    /// Creates a richer tunnel handler whose effective signature is
+    /// `run(*Handler, *Reader, *Writer, ?*DatagramChannel) !void`.
+    /// HTTP versions or negotiations without HTTP Datagram support pass null.
+    pub fn initTunnel(allocator: std.mem.Allocator, handler: anytype) std.mem.Allocator.Error!Takeover {
+        const Handler = @TypeOf(handler);
+        if (!@hasDecl(Handler, "run")) @compileError("takeover handler must declare run");
+        const Box = struct {
+            lifecycle: Lifecycle = .{},
+            handler: Handler,
+        };
+        const Adapter = struct {
+            fn run(context: *anyopaque, input: *std.Io.Reader, output: *std.Io.Writer, datagrams: ?*DatagramChannel) anyerror!void {
+                const typed: *Handler = @ptrCast(@alignCast(context));
+                return typed.run(input, output, datagrams);
+            }
+
+            fn finalize(context: *anyopaque) void {
+                const typed: *Handler = @ptrCast(@alignCast(context));
+                typed.finalize();
+            }
+        };
+        const box = try allocator.create(Box);
+        box.* = .{ .handler = handler };
+        return .{
+            .context = &box.handler,
+            .run_fn = Adapter.run,
+            .finalize_fn = if (@hasDecl(Handler, "finalize")) Adapter.finalize else null,
+            .lifecycle = &box.lifecycle,
+            .kind = .tunnel,
+            .accepts_datagrams = true,
+        };
+    }
+
     pub fn run(self: *Takeover, input: *std.Io.Reader, output: *std.Io.Writer) !void {
+        return self.runTunnel(input, output, null);
+    }
+
+    pub fn runTunnel(self: *Takeover, input: *std.Io.Reader, output: *std.Io.Writer, datagrams: ?*DatagramChannel) !void {
         if (self.lifecycle.ran) return error.TakeoverAlreadyRun;
         self.lifecycle.ran = true;
-        return self.run_fn(self.context, input, output);
+        return self.run_fn(self.context, input, output, datagrams);
     }
 
     pub fn finalize(self: *Takeover) void {
@@ -440,6 +510,37 @@ test "Response supports empty headers and body fast path" {
     try std.testing.expectEqualStrings("", response.body.asBytes().?);
     try std.testing.expectEqual(@as(?u64, 0), response.body.contentLength());
     try std.testing.expectEqual(Connection.close, response.connection);
+}
+
+test "legacy takeover API remains compatible and richer tunnels are opt in" {
+    const Legacy = struct {
+        called: *bool,
+        pub fn run(self: *@This(), _: *std.Io.Reader, _: *std.Io.Writer) !void {
+            self.called.* = true;
+        }
+    };
+    const Rich = struct {
+        saw_null: *bool,
+        pub fn run(self: *@This(), _: *std.Io.Reader, _: *std.Io.Writer, datagrams: ?*DatagramChannel) !void {
+            self.saw_null.* = datagrams == null;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var input: std.Io.Reader = .fixed("");
+    var storage: [1]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&storage);
+    var called = false;
+    var legacy = try Takeover.init(arena.allocator(), Legacy{ .called = &called });
+    try std.testing.expect(!legacy.accepts_datagrams);
+    try legacy.run(&input, &output);
+    try std.testing.expect(called);
+
+    var saw_null = false;
+    var rich = try Takeover.initTunnel(arena.allocator(), Rich{ .saw_null = &saw_null });
+    try std.testing.expect(rich.accepts_datagrams);
+    try rich.run(&input, &output);
+    try std.testing.expect(saw_null);
 }
 
 test "allocated stream produces and finalizes at most once" {

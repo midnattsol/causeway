@@ -6,7 +6,9 @@ Causeway includes a server-side HTTP/3 stack built in the repository rather than
 - TLS use with QUIC and packet protection: RFC 9001, under `src/quic/tls/`, `crypto/`, and `packet/`;
 - loss detection and congestion control: RFC 9002, under `src/quic/recovery/`;
 - HTTP/3: RFC 9114, under `src/http/protocol/http3/`;
-- QPACK: RFC 9204, under `src/http/protocol/http3/qpack/`.
+- QPACK: RFC 9204, under `src/http/protocol/http3/qpack/`;
+- QUIC DATAGRAM: RFC 9221, under `src/quic/datagram/` and `src/quic/connection/`;
+- HTTP Datagrams and Capsule Protocol: RFC 9297, under `src/http/protocol/http3/capsule/` and `connection/`.
 
 The implementation is server-side. It uses UDP, negotiates ALPN `h3`, and composes the same router, middleware, extractors, handlers, application state, and response model used by the HTTP/1 and HTTP/2 engines.
 
@@ -91,7 +93,17 @@ On Zig 0.17 master, `std.Io.net.IncomingMessage.control` and `OutgoingMessage.co
 
 RFC 9221 DATAGRAM support is configured with `connection.Limits.datagram_receive_queue`, `datagram_send_queue`, and `datagram_max_payload`, together with the advertised `max_datagram_frame_size` transport parameter. Zero queue capacities compile a disabled path. `Connection.enqueueDatagram` copies into a bounded FIFO and rejects the newest item when full; received payloads are copied into a bounded connection queue exposed through `nextDatagram` and `consumeDatagram`, while receive overflow drops the newest datagram and increments `droppedDatagrams`.
 
-DATAGRAM frames are ack-eliciting, congestion-controlled, paced, and never retransmitted. Scheduling alternates with sustained stream output, preserves a queued datagram when packet construction or congestion control blocks, and consumes it only after packet bookkeeping succeeds. The negotiated limit applies to the complete encoded DATAGRAM frame, not only its payload. This transport API is the base for HTTP Datagrams; association with CONNECT requests is handled separately by the HTTP/3 layer.
+DATAGRAM frames are ack-eliciting, congestion-controlled, paced, and never retransmitted. Scheduling alternates with sustained stream output, preserves a queued datagram when packet construction or congestion control blocks, and consumes it only after packet bookkeeping succeeds. The negotiated limit applies to the complete encoded DATAGRAM frame, not only its payload. `Connection.datagramCapabilities` reports each negotiated direction and its complete-frame limit without exposing connection internals.
+
+## HTTP Datagrams and Capsule Protocol
+
+`http3.Config.enable_datagrams` advertises `SETTINGS_H3_DATAGRAM = 1` and enables bounded request-associated datagram queues. `datagram_queue_capacity`, `datagram_max_payload`, and `max_capsule_length` are compile-time limits. Native HTTP/3 Datagram mode additionally requires negotiated QUIC DATAGRAM support in both directions; the available application payload accounts for the DATAGRAM frame type and the encoded Quarter Stream ID. Otherwise an accepted Capsule Protocol tunnel uses reliable DATAGRAM capsules.
+
+A CONNECT handler opts in with `response.Takeover.initTunnel`. Its callback receives `?*response.DatagramChannel` after successful response HEADERS have been emitted. The value is non-null only when both request and successful response negotiate `Capsule-Protocol: ?1`; `mode()` reports `.quic` or `.capsule`, `send` copies or frames one bounded payload, `receive` copies one payload into caller storage, and `dropped` reports receive queue or application-size drops. The original `Takeover.init` callback remains source-compatible and receives no channel.
+
+The session owner associates native payloads using Quarter Stream ID and never exposes QUIC-owned borrows to handler tasks. Incoming queue overflow and application-size excess drop the newest datagram. Outgoing queue overflow rejects the newest send. Native datagrams are never converted to capsules after a tunnel starts; loss of a negotiated transport invariant fails that request with `H3_DATAGRAM_ERROR`. DATA received before the final response decision is left under QUIC flow control, then interpreted as capsules only after successful bilateral negotiation. Non-CONNECT request content is never treated as capsules merely because it contains a `Capsule-Protocol` field.
+
+Capsule parsing is incremental and bounded. Unknown capsule types are ignored, oversized DATAGRAM capsules are skipped without buffering their payload, and malformed or truncated capsule streams fail the request. Capsule Protocol messages reject `Content-Length`, `Content-Type`, and `Transfer-Encoding`, as well as statuses 204, 205, and 206. Payloads returned by `receive` belong to the caller's destination buffer; payloads passed to `send` need only remain valid for that call.
 
 ## Connection IDs, Retry, stateless reset, and paths
 
@@ -161,6 +173,7 @@ Timeout, peer reset, `STOP_SENDING`, connection close, and shutdown cancel block
 - response writer buffering and output scheduling batches;
 - control-message queue capacity;
 - response trailers;
+- HTTP Datagram queue capacity, application payload, and capsule length;
 - QPACK table bytes, metadata entries, blocked streams, outstanding sections, instruction buffering, and string scratch;
 - request/response deadlines and shutdown duration.
 
@@ -173,7 +186,8 @@ Timeout, peer reset, `STOP_SENDING`, connection close, and shutdown cancel block
 - active application-stream slots (`max_streams`);
 - retained closed receive-stream final sizes (`max_closed_streams`);
 - per-stream receive/send bytes and range metadata;
-- active connection IDs, path events, and paths.
+- active connection IDs, path events, and paths;
+- QUIC DATAGRAM receive/send queue capacity and copied payload size.
 
 `max_streams` counts all concurrently active QUIC application streams, not only HTTP requests. It must leave room for every inbound stream advertised by the local transport parameters and for the three server critical streams. A practical requirement is:
 

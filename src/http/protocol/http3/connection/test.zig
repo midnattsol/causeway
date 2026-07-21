@@ -42,6 +42,27 @@ fn encodeExtendedConnectHead(destination: []u8, path: []const u8) !usize {
     }, "");
 }
 
+fn encodeDatagramConnectHead(destination: []u8, path: []const u8) !usize {
+    return support.encodeRequestFields(destination, 0, &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "test" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = ":path", .value = path },
+        .{ .name = "capsule-protocol", .value = "?1;test=accepted" },
+    }, "");
+}
+
+fn encodePeerSettings(destination: []u8, h3_datagram: bool) !usize {
+    var payload: [16]u8 = undefined;
+    const payload_len = if (h3_datagram)
+        try settings.encodeEntry(&payload, .{ .id = .h3_datagram, .value = 1 })
+    else
+        0;
+    destination[0] = 0;
+    return 1 + try frame.encode(destination[1..], .{ .frame_type = .settings, .payload = .{ .settings = payload[0..payload_len] } });
+}
+
 fn encodeGetHead(destination: []u8) !usize {
     return support.encodeRequestFields(destination, 0, &.{
         .{ .name = ":method", .value = "GET" },
@@ -87,6 +108,12 @@ test "HTTP/3 session incrementally serves a request over the generic QUIC API" {
         if (entry.id == .enable_connect_protocol and entry.value == 1) advertised_extended_connect = true;
     }
     try std.testing.expect(advertised_extended_connect);
+    var advertised_datagrams = false;
+    setting_entries = settings.iterator(local_settings);
+    while (try setting_entries.next()) |entry| {
+        if (entry.id == .h3_datagram) advertised_datagrams = true;
+    }
+    try std.testing.expect(!advertised_datagrams);
 
     const control = try stream_id.Id.fromParts(.client, .unidirectional, 0);
     try transport.feed(control, "\x00", false);
@@ -115,6 +142,352 @@ test "HTTP/3 session incrementally serves a request over the generic QUIC API" {
     const data = (try parser.next()).?;
     try std.testing.expectEqualStrings("pong", data.payload.data);
     try std.testing.expect(transport.close_code == null);
+}
+
+test "HTTP/3 disabled datagram mode does not expose a channel" {
+    const State = struct { saw_null: std.atomic.Value(bool) = .init(false) };
+    const Handler = struct {
+        state: *State,
+        pub fn run(self: *@This(), _: *Io.Reader, _: *Io.Writer, datagrams: ?*response_module.DatagramChannel) !void {
+            self.state.saw_null.store(datagrams == null, .release);
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .{ .items = &.{.{ .name = "capsule-protocol", .value = "?1" }} }, try response_module.Takeover.initTunnel(
+                context.execution.allocator,
+                Handler{ .state = context.execution.state },
+            ));
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{};
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, test_config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    var bytes: [512]u8 = undefined;
+    const length = try encodeDatagramConnectHead(&bytes, "/disabled");
+    const id = try support.requestId(0);
+    try transport.feed(id, bytes[0..length], true);
+    for (0..100) |step| {
+        _ = try session.poll(1 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.saw_null.load(.acquire)) break;
+    }
+    try std.testing.expect(state.saw_null.load(.acquire));
+}
+
+test "Capsule-Protocol on a non-CONNECT request remains ordinary HTTP content" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.datagram_max_payload = 16;
+        value.max_capsule_length = 16;
+        break :blk value;
+    };
+    const State = struct { saw_body: std.atomic.Value(bool) = .init(false) };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            const body = (try context.request.body.readAll()).?;
+            try std.testing.expectEqualStrings("raw", body);
+            context.execution.state.saw_body.store(true, .release);
+            return .{ .status = .ok };
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{};
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+
+    var request_bytes: [512]u8 = undefined;
+    var request_len = try support.encodeRequestFields(&request_bytes, 0, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = ":path", .value = "/ordinary" },
+        .{ .name = "content-length", .value = "3" },
+        .{ .name = "capsule-protocol", .value = "?1" },
+    }, "");
+    request_len += try frame.encode(request_bytes[request_len..], .{ .frame_type = .data, .payload = .{ .data = "raw" } });
+    const request_id = try support.requestId(0);
+    try transport.feed(request_id, request_bytes[0..request_len], true);
+    for (0..100) |step| {
+        _ = try session.poll(1 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.saw_body.load(.acquire)) break;
+    }
+    try std.testing.expect(state.saw_body.load(.acquire));
+    try std.testing.expect(transport.close_code == null);
+}
+
+test "HTTP/3 native datagrams negotiate, associate, overflow explicitly, and send" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.datagram_queue_capacity = 1;
+        value.datagram_max_payload = 16;
+        value.max_capsule_length = 16;
+        break :blk value;
+    };
+    const State = struct {
+        started: Io.Event = .unset,
+        release: Io.Event = .unset,
+        io: Io = undefined,
+        complete: std.atomic.Value(bool) = .init(false),
+    };
+    const Handler = struct {
+        state: *State,
+        pub fn run(self: *@This(), _: *Io.Reader, _: *Io.Writer, datagrams: ?*response_module.DatagramChannel) !void {
+            const channel = datagrams orelse return error.ExpectedDatagramChannel;
+            try std.testing.expectEqual(response_module.DatagramChannel.Mode.quic, channel.mode());
+            self.state.started.set(self.state.io);
+            try self.state.release.wait(self.state.io);
+            try std.testing.expectEqual(@as(u64, 2), channel.dropped());
+            var payload: [16]u8 = undefined;
+            const length = (try channel.receive(&payload)).?;
+            try std.testing.expectEqualStrings("first", payload[0..length]);
+            try std.testing.expectError(error.DatagramTooLarge, channel.send("1234567"));
+            try channel.send("reply");
+            self.state.complete.store(true, .release);
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .{ .items = &.{.{ .name = "capsule-protocol", .value = "?1" }} }, try response_module.Takeover.initTunnel(
+                context.execution.allocator,
+                Handler{ .state = context.execution.state },
+            ));
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{};
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 64, .peer_max_frame_size = 8 };
+    var state: State = .{ .io = io };
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+
+    var control_bytes: [32]u8 = undefined;
+    const control_len = try encodePeerSettings(&control_bytes, true);
+    try transport.feed(try support.clientUniId(0), control_bytes[0..control_len], false);
+    var request_bytes: [512]u8 = undefined;
+    const request_len = try encodeDatagramConnectHead(&request_bytes, "/datagram");
+    const request_id = try support.requestId(0);
+    try transport.feed(request_id, request_bytes[0..request_len], false);
+    for (0..100) |step| {
+        _ = try session.poll(1 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.started.isSet()) break;
+    }
+    try std.testing.expect(state.started.isSet());
+    const local_settings_bytes = transport.output(session.local_control);
+    const local_prefix = try stream.parsePrefix(local_settings_bytes);
+    const local_settings = (try frame.parse(local_settings_bytes[local_prefix.consumed..])).frame.payload.settings;
+    var local_entries = settings.iterator(local_settings);
+    var advertised_datagrams = false;
+    while (try local_entries.next()) |entry| {
+        if (entry.id == .h3_datagram and entry.value == 1) advertised_datagrams = true;
+    }
+    try std.testing.expect(advertised_datagrams);
+
+    var first: [32]u8 = undefined;
+    const first_len = try @import("../capsule/datagram.zig").encodeHttp3(&first, .{ .quarter_stream_id = 0, .payload = "first" });
+    var second: [32]u8 = undefined;
+    const second_len = try @import("../capsule/datagram.zig").encodeHttp3(&second, .{ .quarter_stream_id = 0, .payload = "second" });
+    var oversized: [32]u8 = undefined;
+    const oversized_len = try @import("../capsule/datagram.zig").encodeHttp3(&oversized, .{ .quarter_stream_id = 0, .payload = "seventeen-bytes!!" });
+    try transport.feedDatagram(first[0..first_len]);
+    try transport.feedDatagram(second[0..second_len]);
+    try transport.feedDatagram(oversized[0..oversized_len]);
+    _ = try session.poll(200);
+    state.release.set(io);
+    for (0..100) |step| {
+        _ = try session.poll(201 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.complete.load(.acquire) and transport.sent_datagram_count != 0) break;
+    }
+    try std.testing.expect(state.complete.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), transport.sent_datagram_count);
+    const sent = transport.sent_datagrams[0];
+    const parsed = try @import("../capsule/datagram.zig").parseHttp3(sent.bytes[0..sent.length]);
+    try std.testing.expectEqual(@as(u64, 0), parsed.quarter_stream_id);
+    try std.testing.expectEqualStrings("reply", parsed.payload);
+}
+
+test "HTTP/3 native datagram capability loss fails the request without changing mode" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.datagram_queue_capacity = 1;
+        value.datagram_max_payload = 16;
+        value.max_capsule_length = 16;
+        break :blk value;
+    };
+    const State = struct {
+        started: Io.Event = .unset,
+        release: Io.Event = .unset,
+        io: Io = undefined,
+    };
+    const Handler = struct {
+        state: *State,
+        pub fn run(self: *@This(), _: *Io.Reader, _: *Io.Writer, datagrams: ?*response_module.DatagramChannel) !void {
+            const channel = datagrams orelse return error.ExpectedDatagramChannel;
+            try std.testing.expectEqual(response_module.DatagramChannel.Mode.quic, channel.mode());
+            self.state.started.set(self.state.io);
+            try self.state.release.wait(self.state.io);
+            try channel.send("queued");
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .{ .items = &.{.{ .name = "capsule-protocol", .value = "?1" }} }, try response_module.Takeover.initTunnel(
+                context.execution.allocator,
+                Handler{ .state = context.execution.state },
+            ));
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{};
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 64, .peer_max_frame_size = 64 };
+    var state: State = .{ .io = io };
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+
+    var control_bytes: [32]u8 = undefined;
+    const control_len = try encodePeerSettings(&control_bytes, true);
+    try transport.feed(try support.clientUniId(0), control_bytes[0..control_len], false);
+    var request_bytes: [512]u8 = undefined;
+    const request_len = try encodeDatagramConnectHead(&request_bytes, "/capability-loss");
+    const request_id = try support.requestId(0);
+    try transport.feed(request_id, request_bytes[0..request_len], false);
+    for (0..100) |step| {
+        _ = try session.poll(1 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.started.isSet()) break;
+    }
+    try std.testing.expect(state.started.isSet());
+    transport.datagrams.peer_max_frame_size = 0;
+    state.release.set(io);
+    for (0..100) |step| {
+        _ = try session.poll(200 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (transport.find(request_id).?.reset_code != null) break;
+    }
+    try std.testing.expectEqual(@as(?u64, @intFromEnum(@import("../error.zig").Code.h3_datagram_error)), transport.find(request_id).?.reset_code);
+    try std.testing.expectEqual(@as(usize, 0), transport.sent_datagram_count);
+}
+
+test "HTTP/3 rejects malformed quarter-stream association with H3_DATAGRAM_ERROR" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.datagram_max_payload = 16;
+        value.max_capsule_length = 16;
+        break :blk value;
+    };
+    const State = struct {};
+    const Dispatcher = struct {
+        pub fn dispatch(_: anytype) !Response {
+            return .{ .status = .ok };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var transport: FakeConnection = .{};
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 64, .peer_max_frame_size = 64 };
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, threaded.io());
+    defer session.deinit();
+    var control_bytes: [32]u8 = undefined;
+    const control_len = try encodePeerSettings(&control_bytes, true);
+    try transport.feed(try support.clientUniId(0), control_bytes[0..control_len], false);
+    _ = try session.poll(1);
+    try transport.feedDatagram("");
+    try std.testing.expectError(error.MalformedHttpDatagram, session.poll(2));
+    try std.testing.expectEqual(@as(?u64, @intFromEnum(@import("../error.zig").Code.h3_datagram_error)), transport.close_code);
+}
+
+test "HTTP/3 datagrams fall back to incremental capsules and ignore unknown capsules" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.datagram_queue_capacity = 2;
+        value.datagram_max_payload = 16;
+        value.max_capsule_length = 32;
+        break :blk value;
+    };
+    const State = struct { complete: std.atomic.Value(bool) = .init(false) };
+    const Handler = struct {
+        state: *State,
+        pub fn run(self: *@This(), _: *Io.Reader, _: *Io.Writer, datagrams: ?*response_module.DatagramChannel) !void {
+            const channel = datagrams orelse return error.ExpectedDatagramChannel;
+            try std.testing.expectEqual(response_module.DatagramChannel.Mode.capsule, channel.mode());
+            try std.testing.expectEqual(@as(u64, 1), channel.dropped());
+            var payload: [16]u8 = undefined;
+            const length = (try channel.receive(&payload)).?;
+            try std.testing.expectEqualStrings("ping", payload[0..length]);
+            try channel.send("pong");
+            self.state.complete.store(true, .release);
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .{ .items = &.{.{ .name = "capsule-protocol", .value = "?1" }} }, try response_module.Takeover.initTunnel(
+                context.execution.allocator,
+                Handler{ .state = context.execution.state },
+            ));
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{};
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    var request_bytes: [512]u8 = undefined;
+    var request_len = try encodeDatagramConnectHead(&request_bytes, "/capsule");
+    var capsule_bytes: [64]u8 = undefined;
+    var capsule_len = try @import("../capsule/writer.zig").encode(&capsule_bytes, .{ .capsule_type = @enumFromInt(64), .value = "ignored" }, .{ .max_capsule_length = 32 });
+    capsule_len += try @import("../capsule/writer.zig").encode(capsule_bytes[capsule_len..], .datagram("seventeen-bytes!!"), .{ .max_capsule_length = 32 });
+    capsule_len += try @import("../capsule/writer.zig").encode(capsule_bytes[capsule_len..], .datagram("ping"), .{ .max_capsule_length = 32 });
+    request_len += try frame.encode(request_bytes[request_len..], .{ .frame_type = .data, .payload = .{ .data = capsule_bytes[0..capsule_len] } });
+    const request_id = try support.requestId(0);
+    try transport.feed(request_id, request_bytes[0..request_len], true);
+    for (0..100) |step| {
+        _ = try session.poll(1 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (transport.find(request_id).?.finished) break;
+    }
+    try std.testing.expect(state.complete.load(.acquire));
+    var frames = frame.Parser{ .bytes = transport.output(request_id) };
+    try std.testing.expectEqual(frame.Type.headers, (try frames.next()).?.frame_type);
+    var encoded_reply: [32]u8 = undefined;
+    var encoded_reply_len: usize = 0;
+    while (try frames.next()) |item| if (item.payload == .data) {
+        const bytes = item.payload.data;
+        @memcpy(encoded_reply[encoded_reply_len..][0..bytes.len], bytes);
+        encoded_reply_len += bytes.len;
+    };
+    const reply = try @import("../capsule/parser.zig").parseExact(encoded_reply[0..encoded_reply_len], .{ .max_capsule_length = 16 });
+    try std.testing.expectEqualStrings("pong", try reply.datagramPayload());
 }
 
 test "HTTP/3 CONNECT waits for drained headers, bypasses body limits, survives deadline, and half-closes" {

@@ -124,7 +124,7 @@ pub const RequestState = struct {
 pub fn errorCode(cause: anyerror) errors.Code {
     return switch (cause) {
         error.MissingSettings => .missing_settings,
-        error.DuplicateSetting, error.ReservedHttp2Setting, error.DuplicateSettingsFrame => .settings_error,
+        error.DuplicateSetting, error.ReservedHttp2Setting, error.DuplicateSettingsFrame, error.InvalidH3DatagramSetting => .settings_error,
         error.DuplicateCriticalStream, error.ClientOpenedPushStream => .stream_creation_error,
         error.ClosedCriticalStream => .closed_critical_stream,
         error.InvalidGoawayId, error.GoawayIdIncreased, error.PushIdDecreased, error.PushDisabled => .id_error,
@@ -202,5 +202,6 @@ test "response stream accepts informational heads before final head, body, and t
 test "wire failures map to RFC error codes" {
     try std.testing.expectEqual(errors.Code.frame_unexpected, errorCode(error.ForbiddenHttp2Frame));
     try std.testing.expectEqual(errors.Code.settings_error, errorCode(error.DuplicateSetting));
+    try std.testing.expectEqual(errors.Code.settings_error, errorCode(error.InvalidH3DatagramSetting));
     try std.testing.expectEqual(errors.Code.closed_critical_stream, errorCode(error.ClosedCriticalStream));
 }

@@ -35,6 +35,14 @@ pub const DatagramMetadata = struct {
     path_id: u8 = 0,
     ecn: EcnCodepoint = .not_ect,
 };
+pub const DatagramCapabilities = struct {
+    receive: bool,
+    send: bool,
+    /// Maximum complete DATAGRAM frame size accepted locally, including type.
+    max_receive_frame_size: u64,
+    /// Maximum complete DATAGRAM frame size accepted by the peer, including type.
+    max_send_frame_size: u64,
+};
 
 pub const Limits = struct {
     crypto_receive_bytes: usize = 4096,
@@ -319,6 +327,14 @@ pub fn Connection(comptime limits: Limits) type {
         }
         pub fn droppedDatagrams(self: *const Self) u64 {
             return self.datagrams.dropped_received;
+        }
+        pub fn datagramCapabilities(self: *const Self) DatagramCapabilities {
+            return .{
+                .receive = self.datagrams.negotiated and self.datagrams.local_max_frame_size != 0,
+                .send = self.datagrams.negotiated and self.datagrams.peer_max_frame_size != 0,
+                .max_receive_frame_size = if (self.datagrams.negotiated) self.datagrams.local_max_frame_size else 0,
+                .max_send_frame_size = if (self.datagrams.negotiated) self.datagrams.peer_max_frame_size else 0,
+            };
         }
         pub fn streamReadable(self: *Self, id: Self.StreamId) ![]const u8 {
             return self.application.readable(id);

@@ -12,8 +12,10 @@ const Request = request_module.Request;
 const RequestBody = @import("../../../message/request_body.zig").RequestBody;
 const response_module = @import("../../../message/response.zig");
 const Response = response_module.Response;
+const DatagramChannel = response_module.DatagramChannel;
 
 const frame = @import("../frame/root.zig");
+const capsule = @import("../capsule/root.zig");
 const settings = @import("../settings.zig");
 const stream = @import("../stream.zig");
 const validation = @import("../validation.zig");
@@ -28,6 +30,7 @@ const outbound_body = @import("../../http2/body/outbound.zig");
 const request_adapter = @import("request.zig");
 const response_fields = @import("response.zig");
 const options_module = @import("options.zig");
+const datagram_pipe = @import("datagram.zig");
 
 pub fn Handler(comptime State: type, comptime Dispatcher: type, comptime Connection: type, comptime config: options_module.Config) type {
     return SessionType(State, null, Dispatcher, Connection, config);
@@ -53,6 +56,9 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         const Context = if (Locals) |LocalState| context_module.ContextWithLocals(State, LocalState) else context_module.Context(State);
         const frame_buffer_size = config.max_frame_size + 16;
         const response_control_size = config.max_response_header_bytes * 2 + 64;
+        const datagram_capacity = if (config.enable_datagrams) config.datagram_queue_capacity else 0;
+        const datagram_payload_size = if (config.enable_datagrams) config.datagram_max_payload else 0;
+        const DatagramPipes = datagram_pipe.Pipes(datagram_capacity, datagram_payload_size);
 
         const WireHeader = struct { frame_type: frame.Type, length: usize, encoded: usize };
 
@@ -119,6 +125,19 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             output_acked: bool = false,
             completion_notified: bool = false,
 
+            capsule_requested: bool = false,
+            capsule_decided: bool = false,
+            datagram_active: bool = false,
+            datagram_mode: DatagramChannel.Mode = .capsule,
+            datagram_payload_limit: usize = config.datagram_max_payload,
+            datagrams: DatagramPipes = .{},
+            datagram_channel: DatagramChannel = undefined,
+            capsule_parser: capsule.StreamParser = capsule.StreamParser.init(.{ .max_capsule_length = config.max_capsule_length }),
+            capsule_type: capsule.Type = .datagram,
+            capsule_payload: [datagram_payload_size]u8 = undefined,
+            capsule_payload_len: usize = 0,
+            capsule_discard: bool = false,
+
             control: [response_control_size]u8 = undefined,
             control_len: usize = 0,
             control_sent: usize = 0,
@@ -138,6 +157,36 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
             fn outputReady(_: *anyopaque) void {}
 
+            fn datagramMode(raw: *anyopaque) DatagramChannel.Mode {
+                const self: *RequestSlot = @ptrCast(@alignCast(raw));
+                return self.datagram_mode;
+            }
+
+            fn receiveDatagram(raw: *anyopaque, destination: []u8) !?usize {
+                const self: *RequestSlot = @ptrCast(@alignCast(raw));
+                return self.datagrams.receive(destination);
+            }
+
+            fn sendDatagram(raw: *anyopaque, payload: []const u8) !void {
+                const self: *RequestSlot = @ptrCast(@alignCast(raw));
+                if (payload.len > self.datagram_payload_limit) return error.DatagramTooLarge;
+                switch (self.datagram_mode) {
+                    .quic => try self.datagrams.send(payload),
+                    .capsule => {
+                        const output = self.output orelse return error.DatagramChannelClosed;
+                        var encoded: [config.datagram_max_payload + 16]u8 = undefined;
+                        const length = try capsule.encode(&encoded, .datagram(payload), .{ .max_capsule_length = config.max_capsule_length });
+                        try output.writer.writeAll(encoded[0..length]);
+                        try output.writer.flush();
+                    },
+                }
+            }
+
+            fn droppedDatagrams(raw: *anyopaque) u64 {
+                const self: *RequestSlot = @ptrCast(@alignCast(raw));
+                return self.datagrams.dropped();
+            }
+
             fn notifyCompletion(self: *RequestSlot, result: response_module.CompletionResult) void {
                 if (self.completion_notified) return;
                 self.completion_notified = true;
@@ -145,6 +194,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
 
             fn abort(self: *RequestSlot, err: anyerror) void {
+                self.datagrams.fail(err);
                 if (self.input) |input| input.fail(err);
                 if (self.output) |output| output.abort(err);
                 self.notifyCompletion(.{ .failure = err });
@@ -179,6 +229,8 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         peer_streams: stream.Registry = .{},
         peer_control: validation.ControlState = .{ .sender = .client },
         peer_max_field_section_size: u64 = std.math.maxInt(u64),
+        peer_h3_datagram: bool = false,
+        peer_settings_received: bool = false,
         requests: [config.max_requests]RequestSlot = @splat(.{}),
         unidirectional: [config.max_peer_unidirectional_streams]UniSlot = @splat(.{}),
         tasks: Io.Group = .init,
@@ -256,6 +308,8 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 progressed += try self.returnCredits();
                 progressed += try self.processMessages();
             }
+            progressed += try self.processIncomingDatagrams();
+            progressed += try self.flushOutgoingDatagrams();
             try self.retryRequests(now);
             progressed += try self.processMessages();
             var budget = config.output_batch_size;
@@ -373,7 +427,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 if (self.findRequest(id) != null) return;
                 if (self.shutting_down) return self.rejectId(id, .request_rejected);
                 const slot = self.freeRequest() orelse return self.rejectId(id, .request_rejected);
-                slot.* = .{ .owner = self, .occupied = true, .id = id };
+                slot.* = .{ .owner = self, .occupied = true, .id = id, .datagrams = .init(self.io) };
                 self.highest_request_id = if (self.highest_request_id) |highest| @max(highest, id.value) else id.value;
             } else {
                 if (self.findUni(id) != null) return;
@@ -395,7 +449,8 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             if (slot.output_done and !slot.tunnel) return;
             self.processRequestBytes(slot, now) catch |err| switch (err) {
                 error.Blocked => return,
-                error.MessageError, error.BodyTooLarge => self.failRequest(slot, if (err == error.MessageError) .message_error else .excessive_load, err),
+                error.MessageError, error.Truncated, error.CapsuleTooLarge, error.DatagramTooLarge, error.MalformedCapsule => self.failRequest(slot, .message_error, err),
+                error.BodyTooLarge => self.failRequest(slot, .excessive_load, err),
                 else => return err,
             };
         }
@@ -435,11 +490,19 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                         try slot.state.observe(.{ .frame_type = .data, .payload = .{ .data = "" } });
                         try self.ensureRequest(slot, true);
                     }
+                    const body_bytes = try self.connection.streamReadable(slot.id);
+                    if (body_bytes.len == 0) return;
+                    if (slot.capsule_requested and !slot.capsule_decided) return;
+                    if (slot.datagram_active) {
+                        const amount = @min(body_bytes.len, wire.length - slot.payload_seen);
+                        try self.processCapsuleBytes(slot, body_bytes[0..amount]);
+                        try self.connection.consumeStream(slot.id, amount);
+                        slot.payload_seen += amount;
+                        continue;
+                    }
                     const input = slot.input orelse return error.MessageError;
                     const available = input.writableLen();
                     if (available == 0) return;
-                    const body_bytes = try self.connection.streamReadable(slot.id);
-                    if (body_bytes.len == 0) return;
                     const amount = @min(body_bytes.len, @min(available, wire.length - slot.payload_seen));
                     const tunnel_data = slot.tunnel or isConnect(slot);
                     const total = if (tunnel_data)
@@ -518,6 +581,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                         slot.initial_field_count = slot.field_count;
                         slot.head = head;
                         slot.content_length = head.content_length;
+                        slot.capsule_requested = config.enable_datagrams and head.method.is(.CONNECT) and capsuleProtocolEnabled(head.headers);
                         if (head.content_length != null or head.method.is(.CONNECT)) try self.ensureRequest(slot, true);
                     } else {
                         const trailers = semantics.validateTrailers(section_fields) catch return error.MessageError;
@@ -580,6 +644,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         fn finishInputIfReady(self: *Self, slot: *RequestSlot) !void {
             if (!slot.fin_observed or slot.receive_finished) return;
+            if (slot.capsule_requested and !slot.capsule_decided) return;
             if (slot.payload_staged != 0) return;
             if (slot.wire) |wire| {
                 if (slot.payload_seen == wire.length) return;
@@ -595,7 +660,9 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 self.failRequest(slot, .message_error, error.ContentLengthMismatch);
                 return;
             };
+            if (slot.datagram_active) try slot.capsule_parser.finish();
             slot.receive_finished = true;
+            slot.datagrams.finishIncoming();
             if (slot.input) |input| input.finish();
         }
 
@@ -818,6 +885,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         fn failRequest(self: *Self, slot: *RequestSlot, code: errors.Code, err: anyerror) void {
             if (!slot.occupied) return;
+            slot.datagrams.fail(err);
             if (slot.input) |input| input.fail(err);
             if (slot.output) |output| output.abort(err);
             slot.notifyCompletion(.{ .failure = err });
@@ -832,6 +900,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             for (&self.requests) |*slot| {
                 if (!slot.occupied or !slot.task_done or !slot.output_done or !slot.output_acked) continue;
                 if (slot.tunnel and !slot.receive_finished) continue;
+                if (slot.datagrams.hasPendingOutgoing()) continue;
                 slot.deinit();
             }
         }
@@ -884,6 +953,27 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             exchange.beginFinal();
             try validateTakeover(slot.request.?.method, response);
             if (response.takeover != null) slot.tunnel = true;
+            if (config.enable_datagrams and slot.tunnel and response.takeover.?.accepts_datagrams and
+                slot.capsule_requested and capsuleProtocolEnabled(response.headers))
+            {
+                try validateCapsuleMessages(slot.head.?.headers, response);
+                slot.datagram_active = true;
+                if (self.nativeDatagramPayloadLimit(slot.id)) |limit| {
+                    slot.datagram_mode = .quic;
+                    slot.datagram_payload_limit = limit;
+                } else {
+                    slot.datagram_mode = .capsule;
+                    slot.datagram_payload_limit = config.datagram_max_payload;
+                }
+                slot.datagram_channel = .{
+                    .context = slot,
+                    .mode_fn = RequestSlot.datagramMode,
+                    .receive_fn = RequestSlot.receiveDatagram,
+                    .send_fn = RequestSlot.sendDatagram,
+                    .dropped_fn = RequestSlot.droppedDatagrams,
+                };
+            }
+            slot.capsule_decided = true;
             if (response.body == .stream or slot.tunnel) {
                 const ring = try allocator.alloc(u8, config.response_body_buffer_size);
                 const writer_buffer = try allocator.alloc(u8, config.response_writer_buffer_size);
@@ -901,9 +991,10 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         fn runTunnel(_: *Self, slot: *RequestSlot, allocator: std.mem.Allocator) !void {
+            defer slot.datagrams.finishOutgoing();
             const input = try slot.input.?.activate(allocator);
             var takeover = &slot.response.?.takeover.?;
-            takeover.run(input, &slot.output.?.writer) catch |err| {
+            takeover.runTunnel(input, &slot.output.?.writer, if (slot.datagram_active) &slot.datagram_channel else null) catch |err| {
                 if (slot.input_direction_failed or slot.output_direction_failed) {
                     if (!slot.output_direction_failed) try slot.output.?.finish();
                     return err;
@@ -989,6 +1080,170 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             return false;
         }
 
+        fn capsuleProtocolEnabled(headers: Headers) bool {
+            var values = headers.values("capsule-protocol");
+            const raw = values.next() orelse return false;
+            if (values.next() != null) return false;
+            const value = std.mem.trim(u8, raw, " \t");
+            if (value.len < 2 or value[0] != '?' or (value[1] != '0' and value[1] != '1')) return false;
+            if (!validStructuredParameters(value[2..])) return false;
+            return value[1] == '1';
+        }
+
+        fn validStructuredParameters(raw: []const u8) bool {
+            var remaining = std.mem.trim(u8, raw, " \t");
+            while (remaining.len != 0) {
+                if (remaining[0] != ';') return false;
+                remaining = remaining[1..];
+                var end: usize = 0;
+                var quoted = false;
+                var escaped = false;
+                while (end < remaining.len) : (end += 1) {
+                    const byte = remaining[end];
+                    if (escaped) {
+                        escaped = false;
+                        continue;
+                    }
+                    if (quoted and byte == '\\') {
+                        escaped = true;
+                        continue;
+                    }
+                    if (byte == '"') quoted = !quoted;
+                    if (!quoted and byte == ';') break;
+                    if (!quoted and byte == ',') return false;
+                }
+                if (quoted or escaped) return false;
+                const parameter = std.mem.trim(u8, remaining[0..end], " \t");
+                if (parameter.len == 0) return false;
+                const equals = std.mem.indexOfScalar(u8, parameter, '=');
+                const key = if (equals) |index| parameter[0..index] else parameter;
+                if (!validParameterKey(key)) return false;
+                if (equals) |index| if (index + 1 == parameter.len) return false;
+                remaining = remaining[end..];
+            }
+            return true;
+        }
+
+        fn validParameterKey(key: []const u8) bool {
+            if (key.len == 0 or !(key[0] >= 'a' and key[0] <= 'z')) return false;
+            for (key[1..]) |byte| {
+                if ((byte >= 'a' and byte <= 'z') or std.ascii.isDigit(byte)) continue;
+                switch (byte) {
+                    '_', '-', '.', '*' => {},
+                    else => return false,
+                }
+            }
+            return true;
+        }
+
+        fn validateCapsuleMessages(request_headers: Headers, response: Response) !void {
+            const forbidden = [_][]const u8{ "content-length", "content-type", "transfer-encoding" };
+            for (forbidden) |name| {
+                if (request_headers.contains(name) or response.headers.contains(name)) return error.InvalidCapsuleMessage;
+            }
+            if (response.status == .no_content or response.status == .reset_content or response.status == .partial_content)
+                return error.InvalidCapsuleMessage;
+        }
+
+        fn nativeDatagramPayloadLimit(self: *const Self, id: StreamId) ?usize {
+            if (comptime !config.enable_datagrams) return null;
+            if (!self.peer_settings_received or !self.peer_h3_datagram) return null;
+            const capabilities = self.connection.datagramCapabilities();
+            if (!capabilities.receive or !capabilities.send) return null;
+            const association_size = varint.encodedLength(id.value / 4) catch return null;
+            const overhead = 1 + @as(u64, association_size);
+            if (capabilities.max_send_frame_size <= overhead) return null;
+            const available = std.math.cast(usize, capabilities.max_send_frame_size - overhead) orelse config.datagram_max_payload;
+            return @min(config.datagram_max_payload, available);
+        }
+
+        fn processIncomingDatagrams(self: *Self) !usize {
+            if (comptime !config.enable_datagrams) {
+                if (self.connection.nextDatagram() != null) return error.H3DatagramNotNegotiated;
+                return 0;
+            }
+            var count: usize = 0;
+            while (self.connection.nextDatagram()) |wire| {
+                if (!self.peer_settings_received or !self.peer_h3_datagram) return error.H3DatagramNotNegotiated;
+                const parsed = capsule.datagram.parseHttp3(wire) catch return error.MalformedHttpDatagram;
+                const stream_id_value = try parsed.streamId();
+                if (self.findRequestValue(stream_id_value)) |slot| {
+                    if (!slot.receive_finished) {
+                        if (!slot.datagram_active) {
+                            self.failRequest(slot, .h3_datagram_error, error.H3DatagramNotNegotiated);
+                        } else slot.datagrams.deliver(parsed.payload) catch |err| switch (err) {
+                            error.DatagramQueueFull, error.DatagramTooLarge, error.DatagramChannelClosed => {},
+                            else => return err,
+                        };
+                    }
+                }
+                try self.connection.consumeDatagram();
+                count += 1;
+            }
+            return count;
+        }
+
+        fn flushOutgoingDatagrams(self: *Self) !usize {
+            if (comptime !config.enable_datagrams) return 0;
+            var count: usize = 0;
+            for (&self.requests) |*slot| {
+                if (!slot.occupied or !slot.datagram_active or slot.datagram_mode != .quic) continue;
+                while (slot.datagrams.outgoing.peek()) |payload| {
+                    var encoded: [config.datagram_max_payload + 8]u8 = undefined;
+                    const length = try capsule.datagram.encodeHttp3(&encoded, .{
+                        .quarter_stream_id = slot.id.value / 4,
+                        .payload = payload,
+                    });
+                    self.connection.enqueueDatagram(encoded[0..length]) catch |err| switch (err) {
+                        error.DatagramQueueFull => break,
+                        error.DatagramDisabled, error.DatagramNotNegotiated, error.DatagramTooLarge => {
+                            try slot.datagrams.outgoing.consume();
+                            slot.datagrams.fail(err);
+                            self.failRequest(slot, .h3_datagram_error, err);
+                            break;
+                        },
+                        else => return err,
+                    };
+                    try slot.datagrams.outgoing.consume();
+                    count += 1;
+                }
+            }
+            return count;
+        }
+
+        fn processCapsuleBytes(_: *Self, slot: *RequestSlot, bytes: []const u8) !void {
+            var cursor: usize = 0;
+            while (cursor < bytes.len) {
+                const progress = try slot.capsule_parser.feed(bytes[cursor..]);
+                if (progress.consumed == 0 and progress.event == null) return error.MalformedCapsule;
+                cursor += progress.consumed;
+                if (progress.event) |event| switch (event) {
+                    .begin => |header| {
+                        slot.capsule_type = header.capsule_type;
+                        slot.capsule_payload_len = 0;
+                        slot.capsule_discard = header.capsule_type == .datagram and header.length > config.datagram_max_payload;
+                        if (slot.capsule_discard) slot.datagrams.dropIncoming();
+                        if (header.capsule_type == .datagram and !slot.capsule_discard) {
+                            if (header.length == 0) slot.datagrams.deliver("") catch |err| switch (err) {
+                                error.DatagramQueueFull, error.DatagramChannelClosed => {},
+                                else => return err,
+                            };
+                        }
+                    },
+                    .data => |data| {
+                        if (slot.capsule_type != .datagram or slot.capsule_discard) continue;
+                        if (data.bytes.len > slot.capsule_payload.len - slot.capsule_payload_len) return error.DatagramTooLarge;
+                        @memcpy(slot.capsule_payload[slot.capsule_payload_len..][0..data.bytes.len], data.bytes);
+                        slot.capsule_payload_len += data.bytes.len;
+                        if (data.final) slot.datagrams.deliver(slot.capsule_payload[0..slot.capsule_payload_len]) catch |err| switch (err) {
+                            error.DatagramQueueFull, error.DatagramChannelClosed => {},
+                            else => return err,
+                        };
+                    },
+                };
+            }
+        }
+
         fn processUni(self: *Self, slot: *UniSlot, now: u64) !void {
             if (slot.stream_type == null) {
                 const prefix = stream.parsePrefix(slot.input[0..slot.input_len]) catch return;
@@ -1025,8 +1280,10 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 .max_field_section_size => self.peer_max_field_section_size = entry.value,
                 .qpack_max_table_capacity => {},
                 .qpack_blocked_streams => self.encoder.?.max_blocked_streams = @min(@as(usize, @intCast(entry.value)), config.qpack_blocked_streams),
+                .h3_datagram => self.peer_h3_datagram = try settings.h3DatagramEnabled(entry.value),
                 else => {},
             };
+            self.peer_settings_received = true;
         }
 
         fn processEncoderInstructions(self: *Self, slot: *UniSlot, now: u64) !void {
@@ -1113,6 +1370,9 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             if (config.enable_extended_connect) {
                 cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .enable_connect_protocol, .value = 1 });
             }
+            if (config.enable_datagrams) {
+                cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .h3_datagram, .value = 1 });
+            }
             var encoded: [80]u8 = undefined;
             const length = try frame.encode(&encoded, .{ .frame_type = .settings, .payload = .{ .settings = payload[0..cursor] } });
             try self.writeAll(self.local_control, encoded[0..length]);
@@ -1143,6 +1403,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 error.QpackDecompressionFailed => qpack.errors.decompression_failed_code,
                 error.QpackEncoderStreamError => qpack.errors.encoder_stream_error_code,
                 error.QpackDecoderStreamError => qpack.errors.decoder_stream_error_code,
+                error.H3DatagramNotNegotiated, error.MalformedHttpDatagram => @intFromEnum(errors.Code.h3_datagram_error),
                 error.ExcessivePeerStreams, error.BufferTooSmall, error.StreamTooLong => @intFromEnum(errors.Code.excessive_load),
                 else => @intFromEnum(validation.errorCode(cause)),
             };
@@ -1150,7 +1411,10 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         fn findRequest(self: *Self, id: StreamId) ?*RequestSlot {
-            for (&self.requests) |*slot| if (slot.occupied and slot.id.value == id.value) return slot;
+            return self.findRequestValue(id.value);
+        }
+        fn findRequestValue(self: *Self, value: u64) ?*RequestSlot {
+            for (&self.requests) |*slot| if (slot.occupied and slot.id.value == value) return slot;
             return null;
         }
         fn freeRequest(self: *Self) ?*RequestSlot {

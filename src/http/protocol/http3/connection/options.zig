@@ -34,6 +34,13 @@ pub const Config = struct {
     qpack_string_size: usize = 16 * 1024,
     max_field_section_size: u64 = 64 * 1024,
     enable_extended_connect: bool = true,
+    /// Advertise and accept RFC 9297 HTTP Datagrams. The underlying QUIC
+    /// connection must also negotiate DATAGRAM transport parameters before the
+    /// native path is usable; otherwise negotiated CONNECT tunnels use capsules.
+    enable_datagrams: bool = false,
+    datagram_queue_capacity: usize = 8,
+    datagram_max_payload: usize = 1200,
+    max_capsule_length: usize = 1200,
     application_error_policy: ApplicationErrorPolicy = .internal_server_error,
     shutdown_timeout: u64 = 30 * 1_000_000_000,
 
@@ -50,5 +57,10 @@ pub const Config = struct {
         if (self.qpack_blocked_streams > self.max_requests) @compileError("HTTP/3 QPACK blocked streams cannot exceed request slots");
         if (self.max_field_section_size > self.max_header_bytes) @compileError("HTTP/3 max_field_section_size cannot exceed header storage");
         if (self.shutdown_timeout == 0) @compileError("HTTP/3 shutdown_timeout must be non-zero");
+        if (self.enable_datagrams) {
+            if (!self.enable_extended_connect) @compileError("HTTP/3 datagrams require extended CONNECT support");
+            if (self.datagram_queue_capacity == 0 or self.datagram_max_payload == 0) @compileError("HTTP/3 datagram queues and payload limit must be non-zero");
+            if (self.max_capsule_length < self.datagram_max_payload) @compileError("HTTP/3 capsule limit must hold a maximum datagram payload");
+        }
     }
 };

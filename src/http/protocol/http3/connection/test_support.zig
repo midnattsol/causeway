@@ -10,6 +10,18 @@ pub const FakeConnection = struct {
     pub const StreamId = stream_id.Id;
     pub const Event = quic.StreamEvent;
 
+    pub const DatagramState = struct {
+        send: [1]u8 = .{0},
+        negotiated: bool = false,
+        local_max_frame_size: u64 = 0,
+        peer_max_frame_size: u64 = 0,
+    };
+
+    pub const DatagramEntry = struct {
+        bytes: [2048]u8 = undefined,
+        length: usize = 0,
+    };
+
     pub const Slot = struct {
         used: bool = false,
         id: StreamId = undefined,
@@ -32,6 +44,51 @@ pub const FakeConnection = struct {
     consumed_total: usize = 0,
     write_limit: usize = std.math.maxInt(usize),
     writes_blocked: bool = false,
+    datagrams: DatagramState = .{},
+    received_datagrams: [8]DatagramEntry = @splat(.{}),
+    received_datagram_head: usize = 0,
+    received_datagram_count: usize = 0,
+    sent_datagrams: [8]DatagramEntry = @splat(.{}),
+    sent_datagram_count: usize = 0,
+
+    pub fn feedDatagram(self: *@This(), payload: []const u8) !void {
+        if (payload.len > 2048) return error.DatagramTooLarge;
+        if (self.received_datagram_count == self.received_datagrams.len) return error.DatagramQueueFull;
+        const index = (self.received_datagram_head + self.received_datagram_count) % self.received_datagrams.len;
+        @memcpy(self.received_datagrams[index].bytes[0..payload.len], payload);
+        self.received_datagrams[index].length = payload.len;
+        self.received_datagram_count += 1;
+    }
+
+    pub fn nextDatagram(self: *const @This()) ?[]const u8 {
+        if (self.received_datagram_count == 0) return null;
+        const entry = &self.received_datagrams[self.received_datagram_head];
+        return entry.bytes[0..entry.length];
+    }
+
+    pub fn consumeDatagram(self: *@This()) !void {
+        if (self.received_datagram_count == 0) return error.DatagramQueueEmpty;
+        self.received_datagram_head = (self.received_datagram_head + 1) % self.received_datagrams.len;
+        self.received_datagram_count -= 1;
+    }
+
+    pub fn enqueueDatagram(self: *@This(), payload: []const u8) anyerror!void {
+        if (!self.datagrams.negotiated or self.datagrams.peer_max_frame_size == 0) return error.DatagramNotNegotiated;
+        if (self.sent_datagram_count == self.sent_datagrams.len) return error.DatagramQueueFull;
+        if (payload.len > 2048 or payload.len + 1 > self.datagrams.peer_max_frame_size) return error.DatagramTooLarge;
+        @memcpy(self.sent_datagrams[self.sent_datagram_count].bytes[0..payload.len], payload);
+        self.sent_datagrams[self.sent_datagram_count].length = payload.len;
+        self.sent_datagram_count += 1;
+    }
+
+    pub fn datagramCapabilities(self: *const @This()) quic.DatagramCapabilities {
+        return .{
+            .receive = self.datagrams.negotiated and self.datagrams.local_max_frame_size != 0,
+            .send = self.datagrams.negotiated and self.datagrams.peer_max_frame_size != 0,
+            .max_receive_frame_size = if (self.datagrams.negotiated) self.datagrams.local_max_frame_size else 0,
+            .max_send_frame_size = if (self.datagrams.negotiated) self.datagrams.peer_max_frame_size else 0,
+        };
+    }
 
     pub fn openUnidirectionalStream(self: *@This()) !StreamId {
         const id = try StreamId.fromParts(.server, .unidirectional, self.next_uni);
