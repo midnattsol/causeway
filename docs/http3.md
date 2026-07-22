@@ -8,7 +8,9 @@ Causeway includes a server-side HTTP/3 stack built in the repository rather than
 - HTTP/3: RFC 9114, under `src/http/protocol/http3/`;
 - QPACK: RFC 9204, under `src/http/protocol/http3/qpack/`;
 - QUIC DATAGRAM: RFC 9221, under `src/quic/datagram/` and `src/quic/connection/`;
-- HTTP Datagrams and Capsule Protocol: RFC 9297, under `src/http/protocol/http3/capsule/` and `connection/`.
+- HTTP Datagrams and Capsule Protocol: RFC 9297, under `src/http/protocol/http3/capsule/` and `connection/`;
+- WebTransport over HTTP/3: `draft-ietf-webtrans-http3-16`, under `src/http/protocol/http3/webtransport/` and `connection/`;
+- reliable stream reset required by WebTransport: `draft-ietf-quic-reliable-stream-reset-09`, under `src/quic/`.
 
 The implementation is server-side. It uses UDP, negotiates ALPN `h3`, and composes the same router, middleware, extractors, handlers, application state, and response model used by the HTTP/1 and HTTP/2 engines.
 
@@ -101,6 +103,119 @@ Causeway implements `RESET_STREAM_AT` and the empty `reset_stream_at` transport 
 
 The implementation reserves flow-control credit through Final Size, retransmits only bytes below the smallest Reliable Size, and keeps the smallest reset plus its prefix live until both are acknowledged. Receive state delays the reset event until the reliable prefix is contiguous and consumed. Reordered reductions, ordinary `RESET_STREAM`, FIN, late ACK/loss callbacks, and closed-stream tombstones preserve the draft's immutable application-error and final-size invariants. This extension is a required transport primitive for the server-side WebTransport draft implemented by Causeway.
 
+## WebTransport over HTTP/3
+
+### Draft scope and compatibility
+
+Causeway implements the server role from **`draft-ietf-webtrans-http3-16`**, including its draft-16 SETTINGS, stream markers, capsules, session flow control, application-error mapping, and exporter context. It depends on **`draft-ietf-quic-reliable-stream-reset-09`** for `RESET_STREAM_AT`. These versions are an exact compatibility boundary: Causeway does **not** negotiate, recognize, or translate codepoints and wire formats from earlier WebTransport or reliable-stream-reset drafts. Deployments must use a client that implements these same drafts.
+
+The implementation is opt-in with `http3.Config.enable_webtransport = true`. Compile-time validation also requires extended CONNECT and HTTP Datagrams, so `enable_extended_connect` and `enable_datagrams` must remain enabled. Enabling WebTransport does not weaken normal TLS authentication, request routing, middleware, deadlines, QUIC congestion control, or bounded-storage rules.
+
+### Required negotiation
+
+A WebTransport session is admitted only after all relevant layers agree:
+
+- the request is an HTTPS extended CONNECT with `:protocol = webtransport-h3`, a non-empty authority, and a non-empty path;
+- the server advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`, `SETTINGS_H3_DATAGRAM = 1`, and draft-16 `SETTINGS_WT_ENABLED = 1`;
+- the client advertises `SETTINGS_H3_DATAGRAM = 1` and draft-16 `SETTINGS_WT_ENABLED = 1`;
+- both endpoints advertise a non-zero QUIC `max_datagram_frame_size` transport parameter and have usable native QUIC DATAGRAM send/receive capacity;
+- both endpoints advertise the empty `reset_stream_at` QUIC transport parameter (`0x1d`) from `draft-ietf-quic-reliable-stream-reset-09`.
+
+The server refuses to emit WebTransport SETTINGS if its local QUIC DATAGRAM receive path or local reliable-reset support is absent. Candidate CONNECT requests and optimistic WebTransport streams wait for peer SETTINGS; missing or false peer requirements reject the request/stream rather than silently falling back to another draft. Ordinary CONNECT tunnels can use RFC 9297 DATAGRAM capsules as a fallback, but a WebTransport session requires bilateral native QUIC DATAGRAM support.
+
+A minimal local opt-in therefore includes both HTTP/3 policy and QUIC transport/storage capacity:
+
+```zig
+const http3_config: causeway.http.http3.Config = .{
+    .enable_datagrams = true,
+    .enable_webtransport = true,
+    .max_webtransport_sessions = 1,
+    .max_pending_webtransport_streams = 16,
+};
+
+const quic_limits: causeway.quic.connection.Limits = .{
+    .datagram_receive_queue = 8,
+    .datagram_send_queue = 8,
+    .datagram_max_payload = 1200,
+    // plus sufficient max_streams and per-stream receive/send storage
+};
+
+const local_transport_parameters = causeway.quic.crypto.transport_parameters.Values{
+    .reset_stream_at = true,
+    .max_datagram_frame_size = 1201, // complete QUIC DATAGRAM frame
+    // plus normal connection/stream flow-control parameters
+};
+```
+
+Pass the local transport parameters through the HTTP/3 server bind options. `max_datagram_frame_size` limits the complete encoded QUIC DATAGRAM frame, while `datagram_max_payload` limits copied application payload. Queue capacities of zero compile a disabled native DATAGRAM path and therefore cannot satisfy WebTransport.
+
+The draft-16 flow-control SETTINGS are `SETTINGS_WT_INITIAL_MAX_DATA`, `SETTINGS_WT_INITIAL_MAX_STREAMS_UNI`, and `SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI`. Causeway advertises its configured receive limits and applies the peer's values to sending. Session-level flow control is active only when **both** sides advertise at least one non-zero WebTransport flow-control limit. More than one concurrent session requires this bilateral mode; without it, Causeway admits at most one session. QUIC connection/stream flow control remains independently mandatory underneath it.
+
+### Application API and Origin policy
+
+A successful handler returns `Response.tunnel` with a takeover created by `Takeover.initWebTransport`:
+
+```zig
+const WebTransportHandler = struct {
+    pub fn run(_: *@This(), session: *http.response.WebTransportSession) !void {
+        var stream = (try session.acceptBidirectionalStream()) orelse return;
+        var buffer: [4]u8 = undefined;
+        try stream.reader.?.readSliceAll(&buffer);
+        try stream.writer.?.writeAll(&buffer);
+        try stream.finish();
+    }
+};
+
+fn accept(context: anytype) !http.response.Response {
+    return http.response.Response.tunnel(
+        .ok,
+        .{},
+        try http.response.Takeover.initWebTransport(
+            context.execution.allocator,
+            WebTransportHandler{},
+        ),
+    );
+}
+```
+
+The effective callback signature is `run(*Handler, *WebTransportSession) !void`. `WebTransportSession` and every `WebTransportStream` returned from it are **borrowed handles valid only while that takeover callback is running**. Their readers, writers, datagram channel, selected protocol string, close message, and type-erased contexts are controller-owned; do not retain them, their slices, or copied handles after the callback returns. Data passed to `DatagramChannel.send` and close/exporter inputs need remain valid only for the call. `DatagramChannel.receive` copies into caller-owned storage.
+
+Causeway validates the extended CONNECT shape and transport negotiation, but it intentionally does **not** implement an application Origin allowlist. Before accepting, application routing or middleware must authenticate the requester and validate the `Origin` header according to the deployment's same-origin/cross-origin policy. A successful `Takeover.initWebTransport` response is an application authorization decision.
+
+### WebTransport protocol negotiation
+
+The optional `WT-Available-Protocols` request field and `WT-Protocol` response field use Structured Fields String values. If the response selects a protocol, it must be exactly one String present in the client's offered list; malformed selection or an unoffered value rejects establishment. `WebTransportSession.protocol` is the decoded selected protocol, or `null` when the response makes no selection. This protocol negotiation is distinct from QUIC ALPN (`h3`) and from the extended CONNECT token (`webtransport-h3`).
+
+### Streams, datagrams, and error codes
+
+`acceptUnidirectionalStream` and `acceptBidirectionalStream` return pending peer streams; `openUnidirectionalStream` and `openBidirectionalStream` create server streams. A unidirectional stream exposes only its usable direction (`reader` or `writer`); a bidirectional stream exposes both. `finish` closes the send direction, `reset(code)` resets it, and `stop(code)` requests that the peer stop its send direction. `resetInfo` and `stopInfo` recover a peer's 32-bit application code when the wire code lies in the draft-16 `WT_APPLICATION_ERROR` range; protocol errors are reported with `application_error = null`. Causeway maps all 32-bit application codes reversibly while skipping reserved HTTP/3 codepoints.
+
+The stream header is the draft-16 marker (`0x54` for unidirectional streams, `0x41` for bidirectional streams) followed by the Session ID, which must be a client-initiated bidirectional CONNECT stream ID. Streams can arrive optimistically before the CONNECT is established. They are held only in the bounded pending-stream table and are associated after SETTINGS and session admission; stale sessions, failed requirements, excess buffering, or exhausted per-session quota are rejected with the corresponding draft-16 code instead of being buffered without limit.
+
+`session.datagrams` is always the WebTransport session's native HTTP Datagram channel and reports `.quic`. Datagrams are associated by Quarter Stream ID, copied through bounded queues, congestion-controlled and paced by QUIC, but not retransmitted. `send` rejects an oversized payload or a full outgoing queue; receive overflow and application-size excess drop the newest datagram and increment `dropped()`. There is no WebTransport DATAGRAM-capsule fallback.
+
+### Close, drain, and exporter
+
+`session.close(application_error, message)` sends `WT_CLOSE_SESSION`, records the 32-bit application error, and tears down associated streams. The message must be valid UTF-8 and is bounded by `max_webtransport_close_message_size`, never above the draft limit of 1024 bytes. `closeInfo()` exposes the peer's close while the callback remains alive. `session.drain()` sends `WT_DRAIN_SESSION`; `isDraining()` reports either local or peer drain state so applications can stop opening new work before closure. Connection shutdown and HTTP/3 GOAWAY also close or drain sessions through the normal bounded lifecycle.
+
+`session.exportKeyingMaterial(label, context, output)` invokes the TLS exporter with label `EXPORTER-WebTransport`. Its draft-16 exporter context is exactly the network-order 64-bit Session ID, one-octet application-label length and bytes, then one-octet context length and bytes. Application labels and contexts are each limited to 255 bytes; output is caller-owned and subject to the TLS exporter's output bound. Exporting before a complete TLS handshake fails rather than returning synthetic material.
+
+### Capsules, buffering, fairness, and limits
+
+The CONNECT stream carries draft-16 control capsules. Causeway parses `WT_CLOSE_SESSION`, `WT_DRAIN_SESSION`, `WT_MAX_DATA`, `WT_MAX_STREAMS_*`, `WT_DATA_BLOCKED`, and `WT_STREAMS_BLOCKED_*` incrementally. Unknown capsules are ignored as required by RFC 9297. Native WebTransport prohibits `WT_MAX_STREAM_DATA` and `WT_STREAM_DATA_BLOCKED` because QUIC supplies per-stream credit; receiving either terminates the session with `WT_FLOW_CONTROL_ERROR`. Known malformed or oversized capsules fail the request/session, while unknown oversized capsules are skipped without retaining their payload.
+
+All application-facing paths are bounded:
+
+- `max_webtransport_sessions` bounds admitted sessions and cannot exceed `max_requests`;
+- `max_pending_webtransport_streams` bounds all pending/active WebTransport stream slots and is divided into a per-session quota for isolation;
+- `webtransport_initial_max_streams_uni`, `webtransport_initial_max_streams_bidi`, `webtransport_initial_max_data`, and `max_webtransport_session_data` bound cumulative session usage;
+- request/response body-pipe sizes back WebTransport stream readers and writers, so unread input withholds QUIC and WebTransport credit and unwritten output applies backpressure;
+- `datagram_queue_capacity` and `datagram_max_payload` bound copied datagrams; `max_capsule_length` must be at least 1028 when WebTransport is enabled;
+- `control_queue_capacity` bounds cross-task session operations, and stale borrowed stream generations are rejected;
+- QUIC `max_streams`, per-stream storage, connection flow control, DATAGRAM queues, congestion control, and peer stream limits remain outer bounds.
+
+Scheduling is fair within those bounds rather than globally FIFO: stream flushing advances a per-session round-robin cursor after each action, datagram output rotates across request/session slots, and `output_batch_size` caps work per poll. A blocked stream or session therefore does not intentionally monopolize the owner loop, though executor capacity and transport congestion can still delay all work.
+
 ## HTTP Datagrams and Capsule Protocol
 
 `http3.Config.enable_datagrams` advertises `SETTINGS_H3_DATAGRAM = 1` and enables bounded request-associated datagram queues. `datagram_queue_capacity`, `datagram_max_payload`, and `max_capsule_length` are compile-time limits. Native HTTP/3 Datagram mode additionally requires negotiated QUIC DATAGRAM support in both directions; the available application payload accounts for the DATAGRAM frame type and the encoded Quarter Stream ID. Otherwise an accepted Capsule Protocol tunnel uses reliable DATAGRAM capsules.
@@ -180,6 +295,7 @@ Timeout, peer reset, `STOP_SENDING`, connection close, and shutdown cancel block
 - control-message queue capacity;
 - response trailers;
 - HTTP Datagram queue capacity, application payload, and capsule length;
+- WebTransport sessions, pending/active streams, per-session stream quota, initial bilateral stream/data credit, cumulative session data, and close-message length;
 - QPACK table bytes, metadata entries, blocked streams, outstanding sections, instruction buffering, and string scratch;
 - request/response deadlines and shutdown duration.
 
@@ -241,7 +357,7 @@ zig build --fuzz=100K quic-fuzz
 zig build http3-bench -Doptimize=ReleaseFast
 ```
 
-- `http3-compliance` runs the repository's self-contained HTTP/3/QPACK matrix and is included by `zig build test`.
+- `http3-compliance` runs the repository's self-contained HTTP/3/QPACK/WebTransport matrix and is included by `zig build test`.
 - `http3-fuzz` covers HTTP/3 frames, SETTINGS, stream prefixes, QPACK primitives, and bounded complete-session event scripts.
 - `quic-fuzz` covers QUIC wire primitives, transport parameters, packet protection, ACK/loss state, streams, and TLS wire parsing.
 - `http3-bench` reports frame, QPACK, packet-protection, and stream-scheduling microbenchmarks.
@@ -252,6 +368,6 @@ These targets validate Causeway's own invariants and regression cases. They do n
 
 - Server push is disabled.
 - 0-RTT/early data and session resumption are unsupported.
-
-- WebTransport is not implemented.
-- HTTP/3 datagrams are not a core application API. QUIC transport parameters can parse `max_datagram_frame_size`, but the HTTP/3 engine does not expose H3 DATAGRAM/WebTransport semantics.
+- WebTransport client mode and compatibility with drafts before `draft-ietf-webtrans-http3-16` are unsupported.
+- Reliable stream reset drafts before `draft-ietf-quic-reliable-stream-reset-09` are unsupported.
+- Causeway does not enforce an Origin allowlist for WebTransport; that authorization policy belongs to the application.
