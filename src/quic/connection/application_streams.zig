@@ -122,6 +122,8 @@ pub fn Application(
         send_storage: *[capacity][send_bytes]u8,
         send_ack_storage: *[capacity][send_ranges]stream.range_set.Range,
         send_lost_storage: *[capacity][send_ranges]stream.range_set.Range,
+        retransmission_cursor: usize = 0,
+        new_data_cursor: usize = 0,
 
         pub fn init(
             receive_storage_value: *[capacity][receive_bytes]u8,
@@ -635,18 +637,23 @@ pub fn Application(
         }
 
         fn prepareRetransmission(self: *Self, maximum_data_length: usize) !?Prepared {
-            for (&self.slots) |*slot| {
+            for (0..self.slots.len) |offset| {
+                const index = (self.retransmission_cursor + offset) % self.slots.len;
+                const slot = &self.slots[index];
                 if (!slot.occupied or slot.sender == null) continue;
                 var sender = &slot.sender.?;
                 if (sender.lost.count == 0 and !sender.fin_lost) continue;
                 const tx = (try sender.nextTransmission(maximum_data_length, slot.send_flow.?.maximum_stream_data, 0)) orelse continue;
+                self.retransmission_cursor = (index + 1) % self.slots.len;
                 return streamPrepared(slot.id, tx);
             }
             return null;
         }
 
         fn prepareNew(self: *Self, maximum_data_length: usize) !?Prepared {
-            for (&self.slots) |*slot| {
+            for (0..self.slots.len) |offset| {
+                const index = (self.new_data_cursor + offset) % self.slots.len;
+                const slot = &self.slots[index];
                 if (!slot.occupied or slot.sender == null) continue;
                 var sender = &slot.sender.?;
                 var send_flow = &slot.send_flow.?;
@@ -661,6 +668,7 @@ pub fn Application(
                     continue;
                 };
                 _ = try send_flow.commit(tx.offset + tx.data.len, &self.send_connection);
+                self.new_data_cursor = (index + 1) % self.slots.len;
                 return streamPrepared(slot.id, tx);
             }
             return null;
@@ -997,6 +1005,78 @@ test "application data limitation distinguishes queued credit from empty and flo
     const blocked_id = try blocked.open(.unidirectional);
     _ = try blocked.write(blocked_id, "x");
     try std.testing.expect(blocked.isDataLimited());
+}
+
+test "application new data rotates and late streams progress" {
+    const A = TestApplication(3, 16);
+    var receive_bytes: [3][16]u8 = undefined;
+    var receive_ranges: [3][8]stream.range_set.Range = undefined;
+    var send_bytes: [3][16]u8 = undefined;
+    var ack_ranges: [3][8]stream.range_set.Range = undefined;
+    var lost_ranges: [3][8]stream.range_set.Range = undefined;
+    var application = A.init(&receive_bytes, &receive_ranges, &send_bytes, &ack_ranges, &lost_ranges);
+    var local = testLocal();
+    local.initial_max_streams_bidi = 0;
+    local.initial_max_streams_uni = 0;
+    var peer = testPeer();
+    peer.initial_max_data = 64;
+    peer.initial_max_stream_data_uni = 64;
+    peer.initial_max_streams_uni = 3;
+    try application.applyTransportParameters(local, peer);
+
+    const first = try application.open(.unidirectional);
+    _ = try application.write(first, "abcdefgh");
+    try std.testing.expectEqual(first, (try application.prepare(2)).?.item.stream.id);
+    try std.testing.expectEqual(first, (try application.prepare(2)).?.item.stream.id);
+
+    const second = try application.open(.unidirectional);
+    _ = try application.write(second, "ijkl");
+    try std.testing.expectEqual(second, (try application.prepare(2)).?.item.stream.id);
+
+    const third = try application.open(.unidirectional);
+    _ = try application.write(third, "mnop");
+    try std.testing.expectEqual(third, (try application.prepare(2)).?.item.stream.id);
+    try std.testing.expectEqual(first, (try application.prepare(2)).?.item.stream.id);
+}
+
+test "application retransmissions keep global priority and rotate streams" {
+    const A = TestApplication(2, 16);
+    var receive_bytes: [2][16]u8 = undefined;
+    var receive_ranges: [2][8]stream.range_set.Range = undefined;
+    var send_bytes: [2][16]u8 = undefined;
+    var ack_ranges: [2][8]stream.range_set.Range = undefined;
+    var lost_ranges: [2][8]stream.range_set.Range = undefined;
+    var application = A.init(&receive_bytes, &receive_ranges, &send_bytes, &ack_ranges, &lost_ranges);
+    var local = testLocal();
+    local.initial_max_streams_bidi = 0;
+    local.initial_max_streams_uni = 0;
+    var peer = testPeer();
+    peer.initial_max_data = 64;
+    peer.initial_max_stream_data_uni = 64;
+    peer.initial_max_streams_uni = 2;
+    try application.applyTransportParameters(local, peer);
+
+    const first = try application.open(.unidirectional);
+    const second = try application.open(.unidirectional);
+    _ = try application.write(first, "abcd");
+    _ = try application.write(second, "wxyz");
+    const first_sent = (try application.prepare(2)).?;
+    const second_sent = (try application.prepare(2)).?;
+    try std.testing.expectEqual(first, first_sent.item.stream.id);
+    try std.testing.expectEqual(second, second_sent.item.stream.id);
+    try application.onLost(first_sent.item);
+    try application.onLost(second_sent.item);
+
+    const first_retry = (try application.prepare(2)).?;
+    const second_retry = (try application.prepare(2)).?;
+    try std.testing.expectEqual(first, first_retry.item.stream.id);
+    try std.testing.expect(first_retry.value.stream.data.len != 0);
+    try std.testing.expectEqual(second, second_retry.item.stream.id);
+    try std.testing.expect(second_retry.value.stream.data.len != 0);
+
+    const new_data = (try application.prepare(2)).?;
+    try std.testing.expectEqual(first, new_data.item.stream.id);
+    try std.testing.expectEqual(@as(u64, 2), new_data.value.stream.offset);
 }
 
 test "application streams enforce peer and local stream limits" {

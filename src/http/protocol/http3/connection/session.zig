@@ -122,6 +122,8 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         const DatagramPipes = datagram_pipe.Pipes(datagram_capacity, datagram_payload_size);
 
         const WireHeader = struct { frame_type: frame.Type, length: usize, encoded: usize };
+        const ResponseClass = enum { request, push };
+        const FlushResult = struct { handled: bool = false, bytes: usize = 0 };
         const WtController = webtransport_controller.Controller(config, WebTransportOps);
         const wt_capsule_payload_size = @max(config.datagram_max_payload, 4 + wt_constants.maximum_close_message);
 
@@ -783,6 +785,9 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         webtransport_tombstones_saturated: bool = false,
         webtransport_session_cursor: usize = 0,
         webtransport_datagram_cursor: usize = 0,
+        response_class_turn: ResponseClass = .request,
+        request_response_cursor: usize = 0,
+        push_response_cursor: usize = 0,
         tasks: Io.Group = .init,
         message_storage: [config.control_queue_capacity]Message = undefined,
         messages: MessageQueue = undefined,
@@ -903,9 +908,9 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             progressed += try self.processMessages();
             var budget = config.output_batch_size;
             while (budget != 0) : (budget -= 1) {
-                const amount = try self.flushResponses();
-                if (amount == 0) break;
-                progressed += amount;
+                const result = try self.flushNextResponse();
+                if (!result.handled) break;
+                progressed += result.bytes;
             }
             self.collectPushes();
             self.collectRequests();
@@ -1671,23 +1676,98 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             if (!slot.tunnel) slot.response_started.set(self.io);
         }
 
-        fn flushResponses(self: *Self) !usize {
-            var total: usize = 0;
-            for (&self.requests) |*slot| {
-                if (!slot.occupied) continue;
-                if (slot.control_sent < slot.control_len) {
-                    const written = try self.tryWrite(slot.id, slot.control[slot.control_sent..slot.control_len]);
-                    slot.control_sent += written;
-                    total += written;
-                    if (slot.control_sent != slot.control_len) continue;
+        fn flushNextResponse(self: *Self) !FlushResult {
+            const preferred = self.response_class_turn;
+            const alternate = nextResponseClass(preferred);
+            const first = try self.flushResponseClass(preferred);
+            if (first.handled) {
+                self.response_class_turn = alternate;
+                return first;
+            }
+            const second = try self.flushResponseClass(alternate);
+            if (second.handled) self.response_class_turn = preferred;
+            return second;
+        }
+
+        fn nextResponseClass(class: ResponseClass) ResponseClass {
+            return switch (class) {
+                .request => .push,
+                .push => .request,
+            };
+        }
+
+        fn flushResponseClass(self: *Self, class: ResponseClass) !FlushResult {
+            return switch (class) {
+                .request => self.flushNextRequestResponse(),
+                .push => self.flushNextPushResponse(),
+            };
+        }
+
+        fn flushNextRequestResponse(self: *Self) !FlushResult {
+            for (0..self.requests.len) |offset| {
+                const index = (self.request_response_cursor + offset) % self.requests.len;
+                const slot = &self.requests[index];
+                if (!requestResponseReady(slot)) continue;
+                self.request_response_cursor = (index + 1) % self.requests.len;
+                return .{ .handled = true, .bytes = try self.flushRequestResponse(slot) };
+            }
+            return .{};
+        }
+
+        fn flushNextPushResponse(self: *Self) !FlushResult {
+            if (self.pushes.len == 0) return .{};
+            for (0..self.pushes.len) |offset| {
+                const index = (self.push_response_cursor + offset) % self.pushes.len;
+                const slot = &self.pushes[index];
+                if (!pushResponseReady(slot)) continue;
+                self.push_response_cursor = (index + 1) % self.pushes.len;
+                return .{ .handled = true, .bytes = try self.flushPush(slot) };
+            }
+            return .{};
+        }
+
+        fn requestResponseReady(slot: *RequestSlot) bool {
+            if (!slot.occupied) return false;
+            if (slot.control_sent < slot.control_len or slot.promise != null) return true;
+            if (slot.output_done or slot.response == null or !slot.response_headers_sent) return false;
+            if (slot.tunnel and !slot.handshake_complete) return true;
+            if (slot.suppress_response_body or slot.response.?.body == .empty or slot.data_header_len != 0) return true;
+            return switch (slot.response.?.body) {
+                .bytes => true,
+                .stream => if (slot.output) |output| output.failure() != null or output.peek(config.max_frame_size).len != 0 or output.isFinished() else false,
+                .empty => true,
+            };
+        }
+
+        fn pushResponseReady(slot: *PushSlot) bool {
+            if (!slot.occupied or slot.output_done) return false;
+            if (slot.parent) |parent| if (parent.promise == slot) return false;
+            if (slot.control_sent < slot.control_len or slot.data_header_len != 0) return true;
+            const response = slot.response orelse return false;
+            if (slot.suppress_body or response.body == .empty) return slot.task_done;
+            return switch (response.body) {
+                .bytes => |bytes| slot.bytes_offset < bytes.len or slot.task_done,
+                .stream => if (slot.output) |output| output.failure() != null or output.peek(config.max_frame_size).len != 0 or (output.isFinished() and slot.task_done) else false,
+                .empty => slot.task_done,
+            };
+        }
+
+        fn flushRequestResponse(self: *Self, slot: *RequestSlot) !usize {
+            if (slot.control_sent < slot.control_len) {
+                const remaining = slot.control[slot.control_sent..slot.control_len];
+                const written = try self.tryWrite(slot.id, remaining[0..@min(remaining.len, config.max_frame_size)]);
+                slot.control_sent += written;
+                if (slot.control_sent == slot.control_len) {
                     slot.control_len = 0;
                     slot.control_sent = 0;
                 }
-                if (slot.promise) |promised| {
-                    const written = try self.tryWrite(slot.id, promised.promise[promised.promise_sent..promised.promise_len]);
-                    promised.promise_sent += written;
-                    total += written;
-                    if (promised.promise_sent != promised.promise_len) continue;
+                return written;
+            }
+            if (slot.promise) |promised| {
+                const remaining = promised.promise[promised.promise_sent..promised.promise_len];
+                const written = try self.tryWrite(slot.id, remaining[0..@min(remaining.len, config.max_frame_size)]);
+                promised.promise_sent += written;
+                if (promised.promise_sent == promised.promise_len) {
                     slot.promise = null;
                     if (promised.cancelled) promised.detachParent();
                     if (slot.pending_push) |operation| {
@@ -1695,73 +1775,66 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                         self.processPushOperation(operation);
                     }
                 }
-                if (slot.output_done or slot.response == null) continue;
-                if (!slot.response_headers_sent) continue;
-                if (slot.tunnel and !slot.handshake_complete) {
-                    slot.handshake_complete = true;
-                    if (slot.webtransport_candidate) try WtController.establishWebTransport(self, slot);
-                    slot.response_started.set(self.io);
-                }
-                if (slot.tunnel) {
-                    total += try self.flushTunnel(slot);
-                    continue;
-                }
-                if (slot.suppress_response_body or slot.response.?.body == .empty) {
+                return written;
+            }
+            if (slot.output_done or slot.response == null or !slot.response_headers_sent) return 0;
+            if (slot.tunnel and !slot.handshake_complete) {
+                slot.handshake_complete = true;
+                if (slot.webtransport_candidate) try WtController.establishWebTransport(self, slot);
+                slot.response_started.set(self.io);
+            }
+            if (slot.tunnel) return self.flushTunnel(slot);
+            if (slot.suppress_response_body or slot.response.?.body == .empty) {
+                try self.finishResponse(slot);
+                return 0;
+            }
+            if (slot.data_header_len != 0) return self.flushDataFrame(slot);
+            switch (slot.response.?.body) {
+                .bytes => |bytes| {
+                    if (slot.bytes_offset < bytes.len) {
+                        try self.beginDataFrame(slot, @min(config.max_frame_size, bytes.len - slot.bytes_offset));
+                        return self.flushDataFrame(slot);
+                    }
                     try self.finishResponse(slot);
-                    continue;
-                }
-                if (slot.data_header_len != 0) {
-                    total += try self.flushDataFrame(slot);
-                    if (slot.data_header_len != 0) continue;
-                }
-                switch (slot.response.?.body) {
-                    .bytes => |bytes| {
-                        if (slot.bytes_offset < bytes.len) {
-                            try self.beginDataFrame(slot, @min(config.max_frame_size, bytes.len - slot.bytes_offset));
-                            total += try self.flushDataFrame(slot);
-                        } else try self.finishResponse(slot);
-                    },
-                    .stream => {
-                        const output = slot.output orelse continue;
-                        if (output.failure()) |err| {
-                            self.failRequest(slot, .internal_error, err);
-                            continue;
+                },
+                .stream => {
+                    const output = slot.output orelse return 0;
+                    if (output.failure()) |err| {
+                        self.failRequest(slot, .internal_error, err);
+                        return 0;
+                    }
+                    const bytes = output.peek(config.max_frame_size);
+                    if (bytes.len != 0) {
+                        if (slot.response_bytes_sent + bytes.len > config.max_response_body_size) {
+                            self.failRequest(slot, .internal_error, error.ResponseBodyTooLarge);
+                            return 0;
                         }
-                        const bytes = output.peek(config.max_frame_size);
-                        if (bytes.len != 0) {
-                            if (slot.response_bytes_sent + bytes.len > config.max_response_body_size) {
-                                self.failRequest(slot, .internal_error, error.ResponseBodyTooLarge);
-                                continue;
-                            }
-                            try self.beginDataFrame(slot, bytes.len);
-                            total += try self.flushDataFrame(slot);
-                        } else if (output.isFinished()) {
-                            if (!slot.trailers_queued and !slot.response_trailers.isEmpty()) {
-                                try self.appendTrailerFrame(slot, slot.response_trailers);
-                                slot.trailers_queued = true;
-                            } else if (slot.control_len == 0) try self.finishResponse(slot);
-                        }
-                    },
-                    .empty => {},
-                }
+                        try self.beginDataFrame(slot, bytes.len);
+                        return self.flushDataFrame(slot);
+                    }
+                    if (output.isFinished()) {
+                        if (!slot.trailers_queued and !slot.response_trailers.isEmpty()) {
+                            try self.appendTrailerFrame(slot, slot.response_trailers);
+                            slot.trailers_queued = true;
+                        } else if (slot.control_len == 0) try self.finishResponse(slot);
+                    }
+                },
+                .empty => unreachable,
             }
-            for (&self.pushes) |*slot| {
-                if (!slot.occupied or slot.output_done) continue;
-                if (slot.parent) |parent| if (parent.promise == slot) continue;
-                total += try self.flushPush(slot);
-            }
-            return total;
+            return 0;
         }
 
         fn flushPush(self: *Self, slot: *PushSlot) !usize {
             var total: usize = 0;
             if (slot.control_sent < slot.control_len) {
-                const written = try self.tryWrite(slot.stream_id, slot.control[slot.control_sent..slot.control_len]);
+                const remaining = slot.control[slot.control_sent..slot.control_len];
+                const written = try self.tryWrite(slot.stream_id, remaining[0..@min(remaining.len, config.max_frame_size)]);
                 slot.control_sent += written;
-                total += written;
-                if (slot.control_sent != slot.control_len) return total;
-                slot.control_len = 0;
-                slot.control_sent = 0;
+                if (slot.control_sent == slot.control_len) {
+                    slot.control_len = 0;
+                    slot.control_sent = 0;
+                }
+                return written;
             }
             if (slot.suppress_body or slot.response.?.body == .empty) {
                 if (slot.task_done) try self.finishPush(slot);

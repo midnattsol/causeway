@@ -3430,3 +3430,194 @@ test "HTTP/3 shutdown waits for cancelled push task and QPACK sections keep pare
     }
     try std.testing.expect(session.drainComplete());
 }
+
+test "HTTP/3 normal response is not starved by continuous push responses" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.max_requests = 1;
+        value.qpack_decoder_blocked_streams = 1;
+        value.enable_server_push = true;
+        value.max_pushes = 3;
+        value.qpack_sections = 8;
+        value.output_batch_size = 1;
+        break :blk value;
+    };
+    const State = struct { ready: std.atomic.Value(bool) = .init(false) };
+    const Dispatcher = struct {
+        const body = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz";
+        pub fn dispatch(context: anytype) !Response {
+            for (0..3) |index| {
+                const path = switch (index) {
+                    0 => "/push-a",
+                    1 => "/push-b",
+                    else => "/push-c",
+                };
+                const outcome = try context.push(.{ .path = path }, .{ .status = .ok, .body = .{ .bytes = body } });
+                try std.testing.expect(outcome == .promised);
+            }
+            context.execution.state.ready.store(true, .release);
+            return .{ .status = .ok, .body = .{ .bytes = body } };
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(12));
+    const io = threaded.io();
+    var transport: FakeConnection = .{ .write_limit = 1 };
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    try feedControlWithMaxPushId(&transport, 2);
+    var request_bytes: [512]u8 = undefined;
+    const request_id = try support.requestId(0);
+    try transport.feed(request_id, request_bytes[0..try encodeGetHead(&request_bytes)], true);
+    for (0..3000) |step| {
+        _ = try session.poll(step + 1);
+        var active_pushes: usize = 0;
+        for (session.pushes) |slot| if (slot.occupied and !slot.output_done) {
+            active_pushes += 1;
+        };
+        const request_ready = session.requests[0].response_headers_sent and session.requests[0].promise == null and !session.requests[0].output_done;
+        if (state.ready.load(.acquire) and active_pushes == 3 and request_ready) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    var active_pushes: usize = 0;
+    for (session.pushes) |slot| if (slot.occupied and !slot.output_done) {
+        active_pushes += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 3), active_pushes);
+    try std.testing.expect(session.requests[0].response_headers_sent);
+
+    transport.write_log_count = 0;
+    session.response_class_turn = .push;
+    _ = try session.poll(4000);
+    _ = try session.poll(4001);
+    try std.testing.expect(transport.write_log_count >= 2);
+    try std.testing.expect(transport.write_log[0].direction() == .unidirectional);
+    try std.testing.expectEqual(request_id, transport.write_log[1]);
+}
+
+test "HTTP/3 late push response is not starved by a large normal response" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_server_push = true;
+        value.max_pushes = 1;
+        value.qpack_sections = 6;
+        value.output_batch_size = 1;
+        break :blk value;
+    };
+    const State = struct { calls: std.atomic.Value(usize) = .init(0) };
+    const Dispatcher = struct {
+        const body = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz";
+        pub fn dispatch(context: anytype) !Response {
+            const call = context.execution.state.calls.fetchAdd(1, .acq_rel);
+            if (call == 0) return .{ .status = .ok, .body = .{ .bytes = body } };
+            const outcome = try context.push(.{ .path = "/late" }, .{ .status = .ok, .body = .{ .bytes = body } });
+            try std.testing.expect(outcome == .promised);
+            return .{ .status = .ok };
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(12));
+    const io = threaded.io();
+    var transport: FakeConnection = .{ .write_limit = 1 };
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    try feedControlWithMaxPushId(&transport, 0);
+    var request_bytes: [512]u8 = undefined;
+    const first_request = try support.requestId(0);
+    try transport.feed(first_request, request_bytes[0..try encodeGetHead(&request_bytes)], true);
+    for (0..500) |step| {
+        _ = try session.poll(step + 1);
+        if (session.requests[0].response_headers_sent and !session.requests[0].output_done) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(!session.requests[0].output_done);
+
+    const second_request = try support.requestId(1);
+    try transport.feed(second_request, request_bytes[0..try encodeGetHead(&request_bytes)], true);
+    for (0..2000) |step| {
+        _ = try session.poll(step + 600);
+        if (session.pushes[0].occupied and session.requests[1].promise == null and !session.pushes[0].output_done) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(session.pushes[0].occupied and !session.pushes[0].output_done);
+    try std.testing.expect(!session.requests[0].output_done);
+    const push_stream = session.pushes[0].stream_id;
+
+    transport.write_log_count = 0;
+    session.response_class_turn = .request;
+    _ = try session.poll(3000);
+    _ = try session.poll(3001);
+    var saw_push = false;
+    for (transport.write_log[0..transport.write_log_count]) |id| if (id.value == push_stream.value) {
+        saw_push = true;
+    };
+    try std.testing.expect(saw_push);
+}
+
+test "HTTP/3 push responses alternate between active push slots" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.max_requests = 1;
+        value.qpack_decoder_blocked_streams = 1;
+        value.enable_server_push = true;
+        value.max_pushes = 2;
+        value.qpack_sections = 6;
+        value.output_batch_size = 8;
+        break :blk value;
+    };
+    const State = struct { ready: std.atomic.Value(bool) = .init(false) };
+    const Dispatcher = struct {
+        const body = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz";
+        pub fn dispatch(context: anytype) !Response {
+            const first = try context.push(.{ .path = "/first" }, .{ .status = .ok, .body = .{ .bytes = body } });
+            const second = try context.push(.{ .path = "/second" }, .{ .status = .ok, .body = .{ .bytes = body } });
+            try std.testing.expect(first == .promised and second == .promised);
+            context.execution.state.ready.store(true, .release);
+            return .{ .status = .ok };
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(12));
+    const io = threaded.io();
+    var transport: FakeConnection = .{ .write_limit = 1 };
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    try feedControlWithMaxPushId(&transport, 1);
+    var request_bytes: [512]u8 = undefined;
+    try transport.feed(try support.requestId(0), request_bytes[0..try encodeGetHead(&request_bytes)], true);
+    for (0..2000) |step| {
+        _ = try session.poll(step + 1);
+        if (state.ready.load(.acquire) and session.pushes[0].occupied and session.pushes[1].occupied and
+            !session.pushes[0].output_done and !session.pushes[1].output_done and session.requests[0].promise == null) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(session.pushes[0].occupied and session.pushes[1].occupied);
+    const first_stream = session.pushes[0].stream_id;
+    const second_stream = session.pushes[1].stream_id;
+
+    transport.write_log_count = 0;
+    session.response_class_turn = .push;
+    session.push_response_cursor = 0;
+    _ = try session.poll(3000);
+    var observed: [4]stream_id.Id = undefined;
+    var observed_count: usize = 0;
+    for (transport.write_log[0..transport.write_log_count]) |id| {
+        if (id.value != first_stream.value and id.value != second_stream.value) continue;
+        if (observed_count < observed.len) observed[observed_count] = id;
+        observed_count += 1;
+    }
+    try std.testing.expect(observed_count >= observed.len);
+    try std.testing.expectEqual(first_stream, observed[0]);
+    try std.testing.expectEqual(second_stream, observed[1]);
+    try std.testing.expectEqual(first_stream, observed[2]);
+    try std.testing.expectEqual(second_stream, observed[3]);
+}
