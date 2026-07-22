@@ -9,6 +9,7 @@ const encoder = @import("encoder.zig");
 const credentials_module = @import("credentials.zig");
 const resumption = @import("resumption.zig");
 const session_ticket = @import("session_ticket.zig");
+const transport_parameters = @import("../crypto/transport_parameters.zig");
 
 const tls = std.crypto.tls;
 const X25519 = std.crypto.dh.X25519;
@@ -16,7 +17,9 @@ const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const hash_length = 32;
 
 pub const ServerCredentials = credentials_module.ServerCredentials;
-pub const TicketOpener = resumption.TicketOpener;
+pub const TicketService = resumption.TicketService;
+pub const TicketIssuanceMaterial = resumption.TicketIssuanceMaterial;
+pub const ResumptionLimits = resumption.Limits;
 pub const ResumptionInfo = resumption.Info;
 pub const ResumptionFallbackReason = resumption.FallbackReason;
 pub const EncryptionLevel = enum { initial, handshake, application };
@@ -106,9 +109,12 @@ pub const Config = struct {
     x25519: X25519Material,
     transport_parameters: []const u8,
     transcript_scratch: []u8,
-    ticket_opener: ?resumption.TicketOpener = null,
+    ticket_service: ?resumption.TicketService = null,
     /// Authenticated endpoint/application context expected in the ticket.
     resumption_context: []const u8 = "",
+    resumption_limits: resumption.Limits = .{},
+    ticket_lifetime: u32 = 24 * 60 * 60,
+    ticket_issuance: ?resumption.TicketIssuanceMaterial = null,
 };
 
 pub const Outputs = struct {
@@ -135,8 +141,11 @@ pub const Server = struct {
     server_random: [32]u8,
     x25519: X25519Material,
     local_transport_parameters: []const u8,
-    ticket_opener: ?resumption.TicketOpener,
+    ticket_service: ?resumption.TicketService,
     resumption_context: []const u8,
+    resumption_limits: resumption.Limits,
+    ticket_lifetime: u32,
+    ticket_issuance: ?resumption.TicketIssuanceMaterial,
     transcript: []u8,
     transcript_length: usize = 0,
 
@@ -158,8 +167,11 @@ pub const Server = struct {
             .server_random = config.server_random,
             .x25519 = config.x25519,
             .local_transport_parameters = config.transport_parameters,
-            .ticket_opener = config.ticket_opener,
+            .ticket_service = config.ticket_service,
             .resumption_context = config.resumption_context,
+            .resumption_limits = config.resumption_limits,
+            .ticket_lifetime = config.ticket_lifetime,
+            .ticket_issuance = config.ticket_issuance,
             .transcript = config.transcript_scratch,
         };
     }
@@ -185,6 +197,9 @@ pub const Server = struct {
     }
     pub fn resumed(self: *const Server) bool {
         return self.resumption_info_value != null;
+    }
+    pub fn wasSessionResumed(self: *const Server) bool {
+        return self.resumed();
     }
     pub fn resumptionInfo(self: *const Server) ?resumption.Info {
         return self.resumption_info_value;
@@ -212,7 +227,16 @@ pub const Server = struct {
         return result;
     }
 
-    /// Internal one-shot handoff for future NewSessionTicket issuance. It is
+    /// Derives a per-ticket PSK while retaining the resumption master secret.
+    /// The caller must clear the returned PSK. Failed ticket preparation can
+    /// therefore be retried without consuming the one-shot secret.
+    pub fn deriveTicketPsk(self: *const Server, nonce: []const u8) !key_schedule.Secret {
+        if (self.state != .connected) return error.HandshakeNotComplete;
+        const secret = self.resumption_master_secret orelse return error.ResumptionSecretUnavailable;
+        return key_schedule.deriveTicketPsk(secret, nonce);
+    }
+
+    /// Internal one-shot handoff for successful NewSessionTicket commit. It is
     /// unavailable until ClientFinished has authenticated the complete transcript.
     /// The caller owns the returned secret and must call `std.crypto.secureZero`
     /// on it as soon as ticket derivation is complete.
@@ -313,7 +337,12 @@ pub const Server = struct {
                 .selected_identity = selected.index,
                 .issued_at = selected.contents.issued_at,
                 .ticket_lifetime = selected.contents.lifetime,
+                .application_length = selected.contents.application_length,
             };
+            @memcpy(
+                self.resumption_info_value.?.application_storage[0..selected.contents.application_length],
+                selected.contents.applicationData(),
+            );
             self.resumption_fallback_reason = null;
         } else {
             self.resumption_fallback_reason = psk_selection.fallback;
@@ -396,7 +425,7 @@ pub const Server = struct {
 
     fn selectPsk(self: *Server, hello: wire.ClientHello, negotiated_alpn: []const u8) !PskSelection {
         const offered = hello.pre_shared_key orelse return .{ .fallback = .not_offered };
-        const opener = self.ticket_opener orelse return .{ .fallback = .resumption_disabled };
+        const service = self.ticket_service orelse return .{ .fallback = .resumption_disabled };
         if (!hello.containsPskDheKe()) return .{ .fallback = .psk_dhe_not_offered };
         const binder_transcript = hello.binder_transcript orelse unreachable;
         const binder_hash = key_schedule.transcriptHash(binder_transcript);
@@ -406,8 +435,12 @@ pub const Server = struct {
         var index: usize = 0;
         while (identities.next()) |identity| : (index += 1) {
             const binder = binders.next() orelse unreachable;
-            if (index >= resumption.maximum_identities) return .{ .fallback = .identity_limit };
-            var contents = opener.open(identity.identity) catch |err| {
+            if (index >= self.resumption_limits.max_identities) return .{ .fallback = .identity_limit };
+            if (identity.identity.len > self.resumption_limits.max_ticket_bytes) {
+                fallback = .unknown_ticket;
+                continue;
+            }
+            var contents = service.open(identity.identity) catch |err| {
                 fallback = switch (err) {
                     error.ExpiredTicket => .expired_ticket,
                     else => .unknown_ticket,
@@ -415,9 +448,30 @@ pub const Server = struct {
                 continue;
             };
             errdefer contents.deinit();
-            if (!std.mem.eql(u8, contents.applicationData(), self.resumption_context)) {
+            if (!std.mem.eql(u8, contents.contextData(), self.resumption_context)) {
                 contents.deinit();
                 fallback = .context_mismatch;
+                continue;
+            }
+            if (contents.applicationData().len > self.resumption_limits.max_state_bytes) {
+                contents.deinit();
+                fallback = .unknown_ticket;
+                continue;
+            }
+            var normalized_storage: [session_ticket.maximum_quic_parameters_length]u8 = undefined;
+            const remembered = transport_parameters.parse(contents.quicTransportParameters(), .client) catch {
+                contents.deinit();
+                fallback = .unknown_ticket;
+                continue;
+            };
+            const normalized = transport_parameters.encode(&normalized_storage, remembered, .client) catch {
+                contents.deinit();
+                fallback = .unknown_ticket;
+                continue;
+            };
+            if (!std.mem.eql(u8, normalized, contents.quicTransportParameters())) {
+                contents.deinit();
+                fallback = .unknown_ticket;
                 continue;
             }
             if (!std.mem.eql(u8, contents.alpn(), negotiated_alpn)) {
@@ -678,7 +732,7 @@ const ServerTestEntropy = struct {
 fn fixtureServerWithResumption(
     transcript: []u8,
     credentials: *const ServerCredentials,
-    opener: ?TicketOpener,
+    service: ?TicketService,
     context: []const u8,
 ) Server {
     return Server.init(.{
@@ -687,7 +741,7 @@ fn fixtureServerWithResumption(
         .x25519 = .{ .seed = @splat(0x22) },
         .transport_parameters = "server parameters",
         .transcript_scratch = transcript,
-        .ticket_opener = opener,
+        .ticket_service = service,
         .resumption_context = context,
     });
 }
@@ -767,8 +821,9 @@ test "deterministic resumed PSK-DHE handshake omits certificate rejects early da
         .cipher_suite = .AES_128_GCM_SHA256,
         .psk = &psk,
         .alpn = "h3",
-        .quic_transport_parameters = "remembered",
-        .application = "endpoint-a",
+        .quic_transport_parameters = "\x0f\x00",
+        .context = "endpoint-a",
+        .application = "snapshot",
     };
     var ticket_storage: [session_ticket.maximum_ticket_length]u8 = undefined;
     const ticket = try controller.seal(&ticket_storage, &plaintext);
@@ -779,13 +834,15 @@ test "deterministic resumed PSK-DHE handshake omits certificate rejects early da
     const rotated_pair = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x72)) catch unreachable;
     const credentials: ServerCredentials = .{ .ed25519 = .{ .chain = &.{"rotated certificate"}, .key_pair = rotated_pair } };
     var transcript: [4096]u8 = undefined;
-    var server = fixtureServerWithResumption(&transcript, &credentials, TicketOpener.fromController(&controller), "endpoint-a");
+    var server = fixtureServerWithResumption(&transcript, &credentials, TicketService.fromController(&controller), "endpoint-a");
     defer server.deinit();
     var initial: [256]u8 = undefined;
     var handshake: [1024]u8 = undefined;
     const flights = try server.receive(.initial, hello, &initial, &handshake);
     try std.testing.expect(server.resumed());
+    try std.testing.expect(server.wasSessionResumed());
     try std.testing.expectEqual(@as(u16, 0), server.resumptionInfo().?.selected_identity);
+    try std.testing.expectEqualStrings("snapshot", server.resumptionInfo().?.applicationState());
     try std.testing.expect(server.resumptionFallbackReason() == null);
     try std.testing.expectEqualSlices(u8, "\x00\x29\x00\x02\x00\x00", flights.initial[flights.initial.len - 6 ..]);
 
@@ -826,7 +883,7 @@ fn expectPskFallback(
     if (mode == @intFromEnum(wire.PskKeyExchangeMode.psk_ke)) hello[hello.len - 1] ^= 1;
     const credentials = testCredentials();
     var transcript: [4096]u8 = undefined;
-    var server = fixtureServerWithResumption(&transcript, &credentials, TicketOpener.fromController(controller), context);
+    var server = fixtureServerWithResumption(&transcript, &credentials, TicketService.fromController(controller), context);
     defer server.deinit();
     var initial: [256]u8 = undefined;
     var handshake: [1024]u8 = undefined;
@@ -848,7 +905,7 @@ test "PSK selection fallback reasons and psk_ke-only behavior preserve full hand
     try controller.addKey(&ticket_key);
     const psk: [32]u8 = @splat(0x42);
     var ticket_storage: [3][session_ticket.maximum_ticket_length]u8 = undefined;
-    var plaintext: session_ticket.Plaintext = .{ .lifetime = 120, .age_add = 1, .cipher_suite = .AES_128_GCM_SHA256, .psk = &psk, .alpn = "h3", .quic_transport_parameters = "remembered", .application = "endpoint-a" };
+    var plaintext: session_ticket.Plaintext = .{ .lifetime = 120, .age_add = 1, .cipher_suite = .AES_128_GCM_SHA256, .psk = &psk, .alpn = "h3", .quic_transport_parameters = "\x0f\x00", .context = "endpoint-a", .application = "snapshot" };
     const valid = try controller.seal(&ticket_storage[0], &plaintext);
     plaintext.alpn = "h2";
     const wrong_alpn = try controller.seal(&ticket_storage[1], &plaintext);
@@ -867,7 +924,7 @@ test "PSK selection fallback reasons and psk_ke-only behavior preserve full hand
     const no_signature = try makePskClientHello(&no_signature_storage, client_key.public_key, "unknown", &psk, @intFromEnum(wire.PskKeyExchangeMode.psk_dhe_ke), false, false);
     const credentials = testCredentials();
     var transcript: [4096]u8 = undefined;
-    var fallback_server = fixtureServerWithResumption(&transcript, &credentials, TicketOpener.fromController(&controller), "endpoint-a");
+    var fallback_server = fixtureServerWithResumption(&transcript, &credentials, TicketService.fromController(&controller), "endpoint-a");
     defer fallback_server.deinit();
     var initial: [256]u8 = undefined;
     var handshake: [1024]u8 = undefined;
@@ -878,18 +935,27 @@ test "PSK selection fallback reasons and psk_ke-only behavior preserve full hand
 }
 
 test "PSK resolver opens at most the bounded identity limit" {
-    const CountingOpener = struct {
+    const CountingService = struct {
         calls: usize = 0,
         fn open(context: *anyopaque, _: []const u8) anyerror!session_ticket.Contents {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.calls += 1;
             return error.UnknownTicket;
         }
+        fn sealedLength(_: *anyopaque, _: *const session_ticket.Plaintext) anyerror!usize {
+            return error.Unsupported;
+        }
+        fn seal(_: *anyopaque, _: []u8, _: *const session_ticket.Plaintext) anyerror![]u8 {
+            return error.Unsupported;
+        }
+        fn claimOwner(_: *anyopaque, _: *anyopaque) anyerror!void {}
+        fn releaseOwner(_: *anyopaque, _: *anyopaque) void {}
     };
-    var counting: CountingOpener = .{};
-    var identities: [resumption.maximum_identities * 7 + 7]u8 = undefined;
-    var binders: [(resumption.maximum_identities + 1) * 33]u8 = undefined;
-    for (0..resumption.maximum_identities + 1) |index| {
+    const identity_limit = 4;
+    var counting: CountingService = .{};
+    var identities: [identity_limit * 7 + 7]u8 = undefined;
+    var binders: [(identity_limit + 1) * 33]u8 = undefined;
+    for (0..identity_limit + 1) |index| {
         const identity_offset = index * 7;
         identities[identity_offset..][0..7].* = .{ 0, 1, @intCast(index), 0, 0, 0, 0 };
         const binder_offset = index * 33;
@@ -905,17 +971,24 @@ test "PSK resolver opens at most the bounded identity limit" {
         .compression_methods = "\x00",
         .extensions = "",
         .psk_key_exchange_modes = "\x01",
-        .pre_shared_key = .{ .identities = &identities, .binders = &binders, .count = resumption.maximum_identities + 1 },
+        .pre_shared_key = .{ .identities = &identities, .binders = &binders, .count = identity_limit + 1 },
         .binder_transcript = "bounded binder transcript",
     };
     const credentials = testCredentials();
     var transcript: [256]u8 = undefined;
-    var server = fixtureServerWithResumption(&transcript, &credentials, .{ .context = &counting, .open_fn = CountingOpener.open }, "");
+    var server = fixtureServerWithResumption(&transcript, &credentials, .{
+        .context = &counting,
+        .open_fn = CountingService.open,
+        .sealed_length_fn = CountingService.sealedLength,
+        .seal_fn = CountingService.seal,
+        .claim_owner_fn = CountingService.claimOwner,
+        .release_owner_fn = CountingService.releaseOwner,
+    }, "");
     defer server.deinit();
     const selection = try server.selectPsk(hello, "h3");
     try std.testing.expect(selection.selected == null);
     try std.testing.expectEqual(ResumptionFallbackReason.identity_limit, selection.fallback);
-    try std.testing.expectEqual(resumption.maximum_identities, counting.calls);
+    try std.testing.expectEqual(identity_limit, counting.calls);
 }
 
 test "recognized ticket with bad binder is fatal BadBinder" {
@@ -927,7 +1000,7 @@ test "recognized ticket with bad binder is fatal BadBinder" {
     const ticket_key: session_ticket.Key = .{ .id = 7, .secret = @splat(0x31), .seal_from = 0, .seal_until = 200, .accept_until = 300 };
     try controller.addKey(&ticket_key);
     const psk: [32]u8 = @splat(0x42);
-    const plaintext: session_ticket.Plaintext = .{ .lifetime = 120, .age_add = 1, .cipher_suite = .AES_128_GCM_SHA256, .psk = &psk, .alpn = "h3", .quic_transport_parameters = "remembered", .application = "endpoint-a" };
+    const plaintext: session_ticket.Plaintext = .{ .lifetime = 120, .age_add = 1, .cipher_suite = .AES_128_GCM_SHA256, .psk = &psk, .alpn = "h3", .quic_transport_parameters = "\x0f\x00", .context = "endpoint-a", .application = "snapshot" };
     var ticket_storage: [session_ticket.maximum_ticket_length]u8 = undefined;
     const ticket = try controller.seal(&ticket_storage, &plaintext);
     var hello_storage: [2048]u8 = undefined;
@@ -935,7 +1008,7 @@ test "recognized ticket with bad binder is fatal BadBinder" {
     hello[hello.len - 1] ^= 1;
     const credentials = testCredentials();
     var transcript: [4096]u8 = undefined;
-    var server = fixtureServerWithResumption(&transcript, &credentials, TicketOpener.fromController(&controller), "endpoint-a");
+    var server = fixtureServerWithResumption(&transcript, &credentials, TicketService.fromController(&controller), "endpoint-a");
     defer server.deinit();
     var initial: [256]u8 = undefined;
     var handshake: [1024]u8 = undefined;

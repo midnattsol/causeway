@@ -4,6 +4,7 @@ const std = @import("std");
 const connection = @import("../connection/root.zig");
 const header = @import("../packet/header.zig");
 const tls_server = @import("../tls/server.zig");
+const session_ticket = @import("../tls/session_ticket.zig");
 const transport_parameters = @import("../crypto/transport_parameters.zig");
 const retry = @import("../packet/retry.zig");
 const retry_token = @import("token.zig");
@@ -27,8 +28,11 @@ pub const RetryMode = enum { disabled, always };
 pub const Policy = struct {
     /// Credentials and borrowed TLS policy values must outlive the endpoint.
     credentials: *const tls_server.ServerCredentials,
-    ticket_opener: ?tls_server.TicketOpener = null,
+    /// Exclusively owned ticket service. It must not be shared with another
+    /// endpoint or independent thread; initialization claims this endpoint owner.
+    ticket_service: ?tls_server.TicketService = null,
     resumption_context: []const u8 = "",
+    ticket_lifetime: u32 = 24 * 60 * 60,
     transport_parameters: transport_parameters.Values = .{},
     /// Length of server-issued connection IDs (1...20).
     connection_id_length: u8 = 16,
@@ -122,6 +126,9 @@ pub fn EndpointWithFeatures(
         pub fn init(self: *Self, socket: net.Socket, policy: Policy) !void {
             if (policy.connection_id_length == 0 or policy.connection_id_length > header.maximum_connection_id_length)
                 return error.InvalidConnectionIdLength;
+            if (policy.resumption_context.len > session_ticket.maximum_context_length) return error.ContextTooLong;
+            if (policy.ticket_lifetime == 0 or policy.ticket_lifetime > session_ticket.maximum_lifetime)
+                return error.InvalidTicketLifetime;
             if (policy.transport_parameters.active_connection_id_limit > connection_limits.active_connection_ids)
                 return error.ActiveConnectionIdLimitExceedsCapacity;
             if (policy.path_validation_attempts == 0 or policy.path_validation_interval == 0)
@@ -130,13 +137,14 @@ pub fn EndpointWithFeatures(
                 return error.InvalidRetryPolicy;
             if (policy.stateless_reset_secret != null and (policy.stateless_reset_burst == 0 or policy.stateless_reset_interval == 0))
                 return error.InvalidStatelessResetPolicy;
-            self.* = .{ .socket = socket, .policy = policy };
             if (features.ecn) switch (ecn.enableReceive(socket.handle, std.meta.activeTag(socket.address))) {
                 .enabled => {},
                 .unsupported => return error.EcnUnsupported,
                 .setup_failed => return error.EcnSetupFailed,
                 .not_requested => unreachable,
             };
+            self.* = .{ .socket = socket, .policy = policy };
+            if (policy.ticket_service) |service| try service.claimExclusiveOwner(self);
         }
 
         /// Binds and initializes this endpoint. On initialization failure the socket is closed.
@@ -147,6 +155,7 @@ pub fn EndpointWithFeatures(
         }
 
         pub fn deinit(self: *Self, io: Io) void {
+            if (self.policy.ticket_service) |service| service.releaseExclusiveOwner(self);
             self.socket.close(io);
             for (&self.slots) |*slot| {
                 if (slot.occupied) slot.connection.deinit();
@@ -250,7 +259,7 @@ pub fn EndpointWithFeatures(
                 }
 
                 const slot = self.freeSlot() orelse continue;
-                var entropy_bytes: [100]u8 = undefined;
+                var entropy_bytes: [112]u8 = undefined;
                 const cid_len: usize = self.policy.connection_id_length;
                 var unique_cid = false;
                 for (0..4) |_| {
@@ -296,8 +305,18 @@ pub fn EndpointWithFeatures(
                         .x25519 = .{ .seed = entropy_bytes[52..84].* },
                         .transport_parameters = encoded_parameters,
                         .transcript_scratch = &slot.transcript,
-                        .ticket_opener = self.policy.ticket_opener,
+                        .ticket_service = self.policy.ticket_service,
                         .resumption_context = self.policy.resumption_context,
+                        .resumption_limits = .{
+                            .max_ticket_bytes = connection_limits.max_ticket_bytes,
+                            .max_state_bytes = connection_limits.max_ticket_state_bytes,
+                            .max_identities = connection_limits.max_ticket_identities,
+                        },
+                        .ticket_lifetime = self.policy.ticket_lifetime,
+                        .ticket_issuance = if (self.policy.ticket_service != null) .{
+                            .age_add = std.mem.readInt(u32, entropy_bytes[100..104], .big),
+                            .nonce = entropy_bytes[104..112].*,
+                        } else null,
                     },
                     .now = now,
                     .ecn_enabled = features.ecn,

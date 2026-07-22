@@ -67,6 +67,7 @@ fn fuzzQuic(_: std.Io, smith: *std.testing.Smith) !void {
     fuzzReliableResetReceive(input);
     fuzzStreamSend(input);
     fuzzTlsWire(input);
+    fuzzSessionTicket(input);
     if (input.len >= 6) {
         const encoded_length: u3 = @intCast(input[0] % 4 + 1);
         const truncated = try packet_number.decodeTruncated(input[1 .. 1 + encoded_length]);
@@ -293,6 +294,54 @@ fn fuzzTlsWire(input: []const u8) void {
     _ = hello.selectX25519KeyShare();
     _ = hello.selectSignatureScheme(&.{ .ecdsa_secp256r1_sha256, .ed25519 });
     _ = quic_tls.negotiation.negotiateDefaults(hello) catch {};
+}
+
+fn fuzzSessionTicket(input: []const u8) void {
+    const Clock = struct {
+        fn now(_: ?*anyopaque) u64 {
+            return 100;
+        }
+    };
+    const Entropy = struct {
+        next: u8 = 0,
+        fn fill(context: ?*anyopaque, output: []u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            for (output) |*byte| {
+                byte.* = self.next;
+                self.next +%= 1;
+            }
+        }
+    };
+    var entropy: Entropy = .{};
+    var controller = quic_tls.session_ticket.Controller(1).init(
+        .{ .context = null, .now_seconds_fn = Clock.now },
+        .{ .context = &entropy, .fill_fn = Entropy.fill },
+        "fuzz",
+    ) catch return;
+    defer controller.deinit();
+    const key: quic_tls.session_ticket.Key = .{ .id = 1, .secret = @splat(0x42), .seal_from = 0, .seal_until = 200, .accept_until = 300 };
+    controller.addKey(&key) catch return;
+    if (controller.open(input)) |contents_value| {
+        var contents = contents_value;
+        contents.deinit();
+    } else |_| {}
+    if (input.len > quic_tls.session_ticket.maximum_application_length) return;
+    const psk: [quic_tls.session_ticket.psk_length]u8 = @splat(0x31);
+    const value: quic_tls.session_ticket.Plaintext = .{
+        .lifetime = 60,
+        .age_add = 7,
+        .cipher_suite = .AES_128_GCM_SHA256,
+        .psk = &psk,
+        .alpn = "h3",
+        .quic_transport_parameters = "\x0f\x00",
+        .context = "fuzz-context",
+        .application = input,
+    };
+    var storage: [quic_tls.session_ticket.maximum_ticket_length]u8 = undefined;
+    const ticket = controller.seal(&storage, &value) catch @panic("bounded valid ticket did not seal");
+    var opened = controller.open(ticket) catch @panic("fresh ticket did not open");
+    defer opened.deinit();
+    std.testing.expectEqualSlices(u8, input, opened.applicationData()) catch @panic("ticket application state mismatch");
 }
 
 fn fuzzTransportParameters(input: []const u8, role: transport_parameters.Role) !void {

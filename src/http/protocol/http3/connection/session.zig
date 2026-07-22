@@ -22,6 +22,7 @@ const WebTransportStream = response_module.WebTransportStream;
 const frame = @import("../frame/root.zig");
 const capsule = @import("../capsule/root.zig");
 const settings = @import("../settings.zig");
+const h3_resumption = @import("../resumption.zig");
 const stream = @import("../stream.zig");
 const validation = @import("../validation.zig");
 const errors = @import("../error.zig");
@@ -111,6 +112,14 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
     config.validate();
     return struct {
         const Self = @This();
+        pub const TicketIssuanceStatus = enum {
+            not_requested,
+            pending_handshake,
+            pending_capacity,
+            issued,
+            disabled,
+            failed,
+        };
         const StreamId = Connection.StreamId;
         const Context = if (Locals) |LocalState| context_module.ContextWithLocals(State, LocalState) else context_module.Context(State);
         const frame_buffer_size = config.max_frame_size + 16;
@@ -773,7 +782,12 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         peer_wt_initial_max_streams_bidi: u64 = 0,
         peer_wt_initial_max_data: u64 = 0,
         peer_settings_received: bool = false,
-        peer_settings_resumed: bool = false,
+        peer_settings_unblocked: bool = false,
+        ticket_snapshot_pending: bool = false,
+        ticket_snapshot_storage: [h3_resumption.maximum_encoded_length]u8 = undefined,
+        ticket_snapshot_length: usize = 0,
+        ticket_issuance_status: TicketIssuanceStatus = .not_requested,
+        ticket_issuance_error: ?anyerror = null,
         push_registry: push_support.Registry = .{},
         requests: [config.max_requests]RequestSlot = @splat(.{}),
         pushes: [push_capacity]PushSlot = @splat(.{}),
@@ -878,6 +892,18 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             self.active = true;
         }
 
+        pub fn wasSessionResumed(self: *const Self) bool {
+            return self.connection.wasSessionResumed();
+        }
+
+        pub fn ticketIssuanceStatus(self: *const Self) TicketIssuanceStatus {
+            return self.ticket_issuance_status;
+        }
+
+        pub fn ticketIssuanceError(self: *const Self) ?anyerror {
+            return self.ticket_issuance_error;
+        }
+
         pub fn poll(self: *Self, now: u64) !usize {
             return self.pollInner(now) catch |err| {
                 self.closeFor(err, now);
@@ -887,6 +913,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         fn pollInner(self: *Self, now: u64) !usize {
             if (!self.active) try self.activate();
+            try self.tryIssuePendingTicket();
             var progressed = try self.processMessages();
             self.checkResponseDeadlines();
             progressed += try self.returnCredits();
@@ -914,6 +941,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
             self.collectPushes();
             self.collectRequests();
+            try self.tryIssuePendingTicket();
             return progressed;
         }
 
@@ -2681,6 +2709,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         fn applySettings(self: *Self, bytes: []const u8) anyerror!void {
+            const snapshot = try h3_resumption.Snapshot.capture(bytes);
             var iterator = settings.iterator(bytes);
             while (try iterator.next()) |entry| switch (entry.id) {
                 .max_field_section_size => self.peer_max_field_section_size = entry.value,
@@ -2700,11 +2729,44 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 else => {},
             };
             self.peer_settings_received = true;
+            const encoded = try snapshot.encode(&self.ticket_snapshot_storage);
+            self.ticket_snapshot_length = encoded.len;
+            self.ticket_snapshot_pending = true;
+            self.ticket_issuance_status = .pending_handshake;
+            self.ticket_issuance_error = null;
+            try self.tryIssuePendingTicket();
+        }
+
+        fn tryIssuePendingTicket(self: *Self) !void {
+            if (!self.ticket_snapshot_pending) return;
+            self.connection.issueSessionTicket(self.ticket_snapshot_storage[0..self.ticket_snapshot_length]) catch |err| switch (err) {
+                error.HandshakeNotComplete => {
+                    self.ticket_issuance_status = .pending_handshake;
+                    return;
+                },
+                error.SendBufferFull => {
+                    self.ticket_issuance_status = .pending_capacity;
+                    return;
+                },
+                error.SessionTicketsDisabled => {
+                    self.ticket_snapshot_pending = false;
+                    self.ticket_issuance_status = .disabled;
+                    return;
+                },
+                else => {
+                    self.ticket_snapshot_pending = false;
+                    self.ticket_issuance_status = .failed;
+                    self.ticket_issuance_error = err;
+                    return err;
+                },
+            };
+            self.ticket_snapshot_pending = false;
+            self.ticket_issuance_status = .issued;
         }
 
         fn resumeAfterPeerSettings(self: *Self) anyerror!void {
-            if (!self.peer_settings_received or self.peer_settings_resumed) return;
-            self.peer_settings_resumed = true;
+            if (!self.peer_settings_received or self.peer_settings_unblocked) return;
+            self.peer_settings_unblocked = true;
             for (&self.unidirectional) |*slot| if (slot.occupied and slot.stream_type == null) try self.readable(slot.id, 0);
             for (&self.requests) |*slot| {
                 if (!slot.occupied) continue;

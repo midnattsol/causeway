@@ -91,6 +91,17 @@ fn encodeWebTransportConnect(destination: []u8) !usize {
     }, "");
 }
 
+fn encodeKnownPeerSettings(destination: []u8, qpack_capacity: u64, connect: bool, h3_datagram: bool) !usize {
+    var payload: [64]u8 = undefined;
+    var payload_len: usize = 0;
+    payload_len += try settings.encodeEntry(payload[payload_len..], .{ .id = .qpack_max_table_capacity, .value = qpack_capacity });
+    payload_len += try settings.encodeEntry(payload[payload_len..], .{ .id = .qpack_blocked_streams, .value = 1 });
+    payload_len += try settings.encodeEntry(payload[payload_len..], .{ .id = .enable_connect_protocol, .value = @intFromBool(connect) });
+    payload_len += try settings.encodeEntry(payload[payload_len..], .{ .id = .h3_datagram, .value = @intFromBool(h3_datagram) });
+    destination[0] = 0;
+    return 1 + try frame.encode(destination[1..], .{ .frame_type = .settings, .payload = .{ .settings = payload[0..payload_len] } });
+}
+
 fn encodePeerSettings(destination: []u8, h3_datagram: bool) !usize {
     var payload: [16]u8 = undefined;
     const payload_len = if (h3_datagram)
@@ -193,6 +204,101 @@ test "HTTP/3 session incrementally serves a request over the generic QUIC API" {
     const data = (try parser.next()).?;
     try std.testing.expectEqualStrings("pong", data.payload.data);
     try std.testing.expect(transport.close_code == null);
+}
+
+test "HTTP/3 ticket waits for Finished and first valid SETTINGS then emits once" {
+    const State = struct {};
+    const Dispatcher = struct {
+        pub fn dispatch(_: anytype) !Response {
+            return .{ .status = .ok };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var transport: FakeConnection = .{ .ticket_enabled = true, .handshake_complete = false };
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, test_config).init(&transport, std.testing.allocator, &state, threaded.io());
+    defer session.deinit();
+
+    _ = try session.poll(1);
+    try std.testing.expectEqual(.not_requested, session.ticketIssuanceStatus());
+    try std.testing.expect(!transport.ticket_issued);
+    try std.testing.expectEqual(@as(usize, 0), transport.ticket_issue_calls);
+
+    var control_bytes: [96]u8 = undefined;
+    const length = try encodeKnownPeerSettings(&control_bytes, 37, true, false);
+    try transport.feed(try support.clientUniId(0), control_bytes[0..length], false);
+    _ = try session.poll(2);
+    try std.testing.expect(!transport.ticket_issued);
+    try std.testing.expect(transport.ticket_issue_calls != 0);
+    try std.testing.expectEqual(.pending_handshake, session.ticketIssuanceStatus());
+
+    transport.handshake_complete = true;
+    transport.ticket_issue_error = error.SendBufferFull;
+    _ = try session.poll(3);
+    try std.testing.expectEqual(.pending_capacity, session.ticketIssuanceStatus());
+    try std.testing.expect(!transport.ticket_issued);
+    transport.ticket_issue_error = null;
+    _ = try session.poll(4);
+    try std.testing.expectEqual(.issued, session.ticketIssuanceStatus());
+    try std.testing.expect(transport.ticket_issued);
+    const issued_calls = transport.ticket_issue_calls;
+    const snapshot = try @import("../resumption.zig").Snapshot.decode(transport.ticket_state[0..transport.ticket_state_len]);
+    try std.testing.expectEqual(@as(?u64, 37), snapshot.qpack_max_table_capacity);
+    try std.testing.expectEqual(@as(?u64, 1), snapshot.enable_connect_protocol);
+    try std.testing.expectEqual(@as(?u64, 0), snapshot.h3_datagram);
+    _ = try session.poll(5);
+    try std.testing.expectEqual(issued_calls, transport.ticket_issue_calls);
+}
+
+test "HTTP/3 ticket security failures are explicit and propagate" {
+    const State = struct {};
+    const Dispatcher = struct {
+        pub fn dispatch(_: anytype) !Response {
+            return .{ .status = .ok };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var transport: FakeConnection = .{ .ticket_enabled = true, .ticket_issue_error = error.ClockRollback };
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, test_config).init(&transport, std.testing.allocator, &state, threaded.io());
+    defer session.deinit();
+    var control_bytes: [96]u8 = undefined;
+    const length = try encodeKnownPeerSettings(&control_bytes, 0, false, false);
+    try transport.feed(try support.clientUniId(0), control_bytes[0..length], false);
+    try std.testing.expectError(error.ClockRollback, session.poll(1));
+    try std.testing.expectEqual(.failed, session.ticketIssuanceStatus());
+    try std.testing.expectEqual(error.ClockRollback, session.ticketIssuanceError().?);
+}
+
+test "resumed HTTP/3 connection keeps SETTINGS state fresh" {
+    const State = struct {};
+    const Dispatcher = struct {
+        pub fn dispatch(_: anytype) !Response {
+            return .{ .status = .ok };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var transport: FakeConnection = .{ .session_resumed = true };
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, test_config).init(&transport, std.testing.allocator, &state, threaded.io());
+    defer session.deinit();
+    try std.testing.expect(session.wasSessionResumed());
+    try std.testing.expect(!session.peer_settings_received);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), session.peer_max_field_section_size);
+    try std.testing.expect(!session.peer_h3_datagram);
+
+    var control_bytes: [96]u8 = undefined;
+    const length = try encodeKnownPeerSettings(&control_bytes, 0, false, true);
+    try transport.feed(try support.clientUniId(0), control_bytes[0..length], false);
+    _ = try session.poll(1);
+    try std.testing.expect(session.peer_settings_received);
+    try std.testing.expect(session.peer_settings_unblocked);
+    try std.testing.expect(session.peer_h3_datagram);
+    try std.testing.expectEqual(@as(usize, 1), session.encoder.?.max_blocked_streams);
+    try std.testing.expectEqual(.disabled, session.ticketIssuanceStatus());
 }
 
 test "HTTP/3 disabled datagram mode does not expose a channel" {

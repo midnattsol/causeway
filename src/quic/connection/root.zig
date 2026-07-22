@@ -10,7 +10,10 @@ const congestion = @import("../recovery/congestion.zig");
 const ecn = @import("ecn.zig");
 const crypto_stream = @import("../tls/crypto_stream.zig");
 const tls_server = @import("../tls/server.zig");
+const nst_encoder = @import("../tls/encoder.zig");
+const session_ticket = @import("../tls/session_ticket.zig");
 const packet_keys = @import("../tls/packet_keys.zig");
+const quic_transport_parameters = @import("../crypto/transport_parameters.zig");
 const types = @import("types.zig");
 const receive = @import("receive.zig");
 const schedule = @import("schedule.zig");
@@ -75,6 +78,11 @@ pub const Limits = struct {
     datagram_send_queue: usize = 0,
     /// Maximum copied DATAGRAM payload size. May be zero only when both queues are disabled.
     datagram_max_payload: usize = 0,
+    /// Stateless ticket envelope, authenticated application snapshot, and offered
+    /// identity scan bounds. These are compile-time capacities, not allocations.
+    max_ticket_bytes: usize = session_ticket.maximum_ticket_length,
+    max_ticket_state_bytes: usize = session_ticket.maximum_application_length,
+    max_ticket_identities: usize = 4,
 };
 
 pub fn Storage(comptime limits: Limits) type {
@@ -114,6 +122,12 @@ pub fn Connection(comptime limits: Limits) type {
     if (limits.active_connection_ids < 2) @compileError("QUIC active_connection_ids must be at least two");
     if (limits.path_events == 0 or limits.paths == 0) @compileError("QUIC path capacities must be nonzero");
     if (limits.paths > std.math.maxInt(u8) + 1) @compileError("QUIC path capacity exceeds metadata path ID range");
+    if (limits.max_ticket_bytes == 0 or limits.max_ticket_bytes > session_ticket.maximum_ticket_length)
+        @compileError("QUIC ticket byte limit is invalid");
+    if (limits.max_ticket_state_bytes > session_ticket.maximum_application_length)
+        @compileError("QUIC ticket state limit is invalid");
+    if (limits.max_ticket_identities == 0 or limits.max_ticket_identities > 64)
+        @compileError("QUIC ticket identity limit is invalid");
     return struct {
         const Self = @This();
         pub const StreamId = stream.Id;
@@ -188,12 +202,26 @@ pub fn Connection(comptime limits: Limits) type {
         probe_space: ?Level = null,
         ack_pending: [3]bool = @splat(false),
         handshake_done_pending: bool = false,
+        ticket_issue_attempted: bool = false,
+        ticket_issued: bool = false,
         initial_discarded: bool = false,
         handshake_discarded: bool = false,
         close_started: ?u64 = null,
 
         pub fn init(storage: *Storage(limits), options: Init) !Self {
             const initial_destination_id = options.initial_destination_id orelse options.original_destination_id;
+            try options.tls.resumption_limits.validate();
+            if (options.tls.resumption_limits.max_ticket_bytes != limits.max_ticket_bytes or
+                options.tls.resumption_limits.max_state_bytes != limits.max_ticket_state_bytes or
+                options.tls.resumption_limits.max_identities != limits.max_ticket_identities)
+                return error.ResumptionLimitsMismatch;
+            if (options.tls.ticket_lifetime == 0 or options.tls.ticket_lifetime > session_ticket.maximum_lifetime)
+                return error.InvalidTicketLifetime;
+            if (options.tls.resumption_context.len > session_ticket.maximum_context_length) return error.ContextTooLong;
+            if (options.tls.ticket_service != null and options.tls.ticket_issuance == null)
+                return error.MissingTicketIssuanceMaterial;
+            if (options.tls.ticket_service == null and options.tls.ticket_issuance != null)
+                return error.UnexpectedTicketIssuanceMaterial;
             if (options.original_destination_id.len > 20 or initial_destination_id.len > 20 or
                 options.client_source_id.len > 20 or options.server_connection_id.len > 20)
                 return error.InvalidConnectionIdLength;
@@ -273,6 +301,70 @@ pub fn Connection(comptime limits: Limits) type {
         /// RFC 8446 Section 7.5 exporter with caller-owned output storage.
         pub fn exportKeyingMaterial(self: *const Self, label: []const u8, context: []const u8, out: []u8) ExporterError!void {
             return self.tls.exportKeyingMaterial(label, context, out);
+        }
+
+        pub fn wasSessionResumed(self: *const Self) bool {
+            return self.tls.wasSessionResumed();
+        }
+
+        pub fn resumptionInfo(self: *const Self) ?tls_server.ResumptionInfo {
+            return self.tls.resumptionInfo();
+        }
+
+        pub fn resumptionApplicationState(self: *const Self) ?[]const u8 {
+            const info = if (self.tls.resumption_info_value) |*value| value else return null;
+            return info.applicationState();
+        }
+
+        /// Emits at most one TLS 1.3 NewSessionTicket after authenticated Finished.
+        /// The authenticated application state is copied into the stateless ticket;
+        /// no remembered QUIC state is installed on a resumed connection.
+        pub fn issueSessionTicket(self: *Self, application_state: []const u8) !void {
+            if (self.state != .active or self.tls.state != .connected) return error.HandshakeNotComplete;
+            const service = self.tls.ticket_service orelse return error.SessionTicketsDisabled;
+            const issuance = self.tls.ticket_issuance orelse return error.MissingTicketIssuanceMaterial;
+            if (self.ticket_issue_attempted) return error.SessionTicketAlreadyIssued;
+            if (application_state.len > limits.max_ticket_state_bytes) return error.TicketStateTooLarge;
+
+            const peer_bytes = self.tls.peerTransportParameters() orelse return error.TransportParametersUnavailable;
+            const peer = try quic_transport_parameters.parse(peer_bytes, .client);
+            var normalized_storage: [session_ticket.maximum_quic_parameters_length]u8 = undefined;
+            const normalized = try quic_transport_parameters.encode(&normalized_storage, peer, .client);
+            var psk = try self.tls.deriveTicketPsk(&issuance.nonce);
+            defer std.crypto.secureZero(u8, &psk);
+            const plaintext: session_ticket.Plaintext = .{
+                .lifetime = self.tls.ticket_lifetime,
+                .age_add = issuance.age_add,
+                .cipher_suite = self.tls.negotiatedSuite() orelse return error.CipherSuiteUnavailable,
+                .psk = &psk,
+                .alpn = self.tls.negotiatedAlpn() orelse return error.AlpnUnavailable,
+                .quic_transport_parameters = normalized,
+                .context = self.tls.resumption_context,
+                .application = application_state,
+            };
+            const ticket_length = try service.sealedLength(&plaintext);
+            if (ticket_length == 0 or ticket_length > limits.max_ticket_bytes) return error.TicketTooLarge;
+            const nst_length = 4 + 4 + 4 + 1 + issuance.nonce.len + 2 + ticket_length + 2;
+            if (self.crypto.application.sender.writableLen() < nst_length) return error.SendBufferFull;
+
+            var ticket_storage: [session_ticket.maximum_ticket_length]u8 = undefined;
+            defer std.crypto.secureZero(u8, &ticket_storage);
+            const ticket = try service.seal(ticket_storage[0..ticket_length], &plaintext);
+            if (ticket.len != ticket_length) return error.TicketServiceLengthMismatch;
+            var nst_storage: [4 + 4 + 4 + 1 + 8 + 2 + session_ticket.maximum_ticket_length + 2]u8 = undefined;
+            const nst = nst_encoder.encodeNewSessionTicket(&nst_storage, .{
+                .ticket_lifetime = self.tls.ticket_lifetime,
+                .ticket_age_add = issuance.age_add,
+                .ticket_nonce = &issuance.nonce,
+                .ticket = ticket,
+            }) catch unreachable;
+            std.debug.assert(nst.len == nst_length);
+            const written = self.crypto.application.sender.write(nst) catch unreachable;
+            std.debug.assert(written == nst.len);
+            var consumed = self.tls.takeResumptionMasterSecret() orelse unreachable;
+            std.crypto.secureZero(u8, &consumed);
+            self.ticket_issue_attempted = true;
+            self.ticket_issued = true;
         }
 
         pub fn receiveDatagram(self: *Self, datagram: []u8, now: u64) !void {
@@ -699,6 +791,170 @@ test "connection exporter is unavailable before TLS handshake" {
     defer connection.deinit();
     var output: [32]u8 = undefined;
     try std.testing.expectError(error.HandshakeNotComplete, connection.exportKeyingMaterial("EXPORTER-WebTransport", "", &output));
+}
+
+test "connection emits one bounded NST into application CRYPTO after Finished" {
+    const TestClock = struct {
+        seconds: u64 = 100,
+        fn now(context: ?*anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return self.seconds;
+        }
+    };
+    const TestEntropy = struct {
+        next: u8 = 1,
+        fn fill(context: ?*anyopaque, output: []u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            for (output) |*byte| {
+                byte.* = self.next;
+                self.next +%= 1;
+            }
+        }
+    };
+    var clock: TestClock = .{};
+    var entropy: TestEntropy = .{};
+    const ControllerType = session_ticket.Controller(2);
+    var controller = try ControllerType.init(
+        .{ .context = &clock, .now_seconds_fn = TestClock.now },
+        .{ .context = &entropy, .fill_fn = TestEntropy.fill },
+        "service-a",
+    );
+    defer controller.deinit();
+    const key: session_ticket.Key = .{ .id = 9, .secret = @splat(0x31), .seal_from = 0, .seal_until = 200, .accept_until = 300 };
+    const FailingService = struct {
+        controller: *ControllerType,
+        fail_seal: bool = false,
+        fn open(context: *anyopaque, identity: []const u8) anyerror!session_ticket.Contents {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.controller.open(identity);
+        }
+        fn sealedLength(context: *anyopaque, value: *const session_ticket.Plaintext) anyerror!usize {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.controller.sealedLength(value);
+        }
+        fn seal(context: *anyopaque, output: []u8, value: *const session_ticket.Plaintext) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.fail_seal) return error.BufferTooSmall;
+            return self.controller.seal(output, value);
+        }
+        fn claimOwner(_: *anyopaque, _: *anyopaque) anyerror!void {}
+        fn releaseOwner(_: *anyopaque, _: *anyopaque) void {}
+    };
+    var failing_service: FailingService = .{ .controller = &controller };
+    const service: tls_server.TicketService = .{
+        .context = &failing_service,
+        .open_fn = FailingService.open,
+        .sealed_length_fn = FailingService.sealedLength,
+        .seal_fn = FailingService.seal,
+        .claim_owner_fn = FailingService.claimOwner,
+        .release_owner_fn = FailingService.releaseOwner,
+    };
+
+    const limits: Limits = .{ .crypto_receive_bytes = 512, .crypto_send_bytes = 2048, .tls_output_bytes = 512 };
+    var storage: Storage(limits) = .{};
+    var transcript: [2048]u8 = undefined;
+    const credentials = testCredentials();
+    var options = testInit(&credentials, &transcript);
+    options.tls.ticket_service = service;
+    options.tls.resumption_context = "endpoint-a";
+    options.tls.ticket_lifetime = 120;
+    try std.testing.expectError(error.MissingTicketIssuanceMaterial, Connection(limits).init(&storage, options));
+    options.tls.ticket_issuance = .{ .age_add = 0x01020304, .nonce = "nonce123".* };
+    var connection = try Connection(limits).init(&storage, options);
+    defer connection.deinit();
+    connection.tls.selected_suite = .AES_128_GCM_SHA256;
+    connection.tls.selected_alpn = "h3";
+    connection.tls.peer_parameters = "\x0f\x06client";
+    connection.tls.resumption_master_secret = @splat(0x42);
+
+    try std.testing.expectError(error.HandshakeNotComplete, connection.issueSessionTicket("snapshot"));
+    try std.testing.expect(connection.tls.resumption_master_secret != null);
+    connection.tls.state = .connected;
+    connection.state = .active;
+    var oversized: [session_ticket.maximum_application_length + 1]u8 = @splat(0);
+    try std.testing.expectError(error.TicketStateTooLarge, connection.issueSessionTicket(&oversized));
+    try std.testing.expect(connection.tls.resumption_master_secret != null);
+    failing_service.fail_seal = true;
+    try std.testing.expectError(error.BufferTooSmall, connection.issueSessionTicket("snapshot"));
+    try std.testing.expect(connection.tls.resumption_master_secret != null);
+    try std.testing.expect(!connection.ticket_issue_attempted);
+    failing_service.fail_seal = false;
+    try std.testing.expectError(error.NoSealingKey, connection.issueSessionTicket("snapshot"));
+    try std.testing.expect(connection.tls.resumption_master_secret != null);
+    try std.testing.expect(!connection.ticket_issue_attempted);
+    try controller.addKey(&key);
+    _ = try connection.crypto.application.sender.write(&@as([1910]u8, @splat(0)));
+    try std.testing.expectError(error.SendBufferFull, connection.issueSessionTicket("snapshot"));
+    try std.testing.expect(connection.tls.resumption_master_secret != null);
+    connection.crypto.application.sender.write_offset = 0;
+    try connection.issueSessionTicket("snapshot");
+    try std.testing.expect(connection.ticket_issued);
+    try std.testing.expect(connection.tls.resumption_master_secret == null);
+    try std.testing.expectError(error.SessionTicketAlreadyIssued, connection.issueSessionTicket("again"));
+
+    const nst = connection.crypto.application.sender.storage[0..@intCast(connection.crypto.application.sender.write_offset)];
+    try std.testing.expectEqual(@as(u8, @intFromEnum(std.crypto.tls.HandshakeType.new_session_ticket)), nst[0]);
+    try std.testing.expectEqual(@as(u32, 120), std.mem.readInt(u32, nst[4..8], .big));
+    try std.testing.expectEqual(@as(u32, 0x01020304), std.mem.readInt(u32, nst[8..12], .big));
+    try std.testing.expectEqual(@as(u8, 8), nst[12]);
+    try std.testing.expectEqualSlices(u8, "nonce123", nst[13..21]);
+    const ticket_length = std.mem.readInt(u16, nst[21..23], .big);
+    var contents = try controller.open(nst[23..][0..ticket_length]);
+    defer contents.deinit();
+    try std.testing.expectEqualStrings("h3", contents.alpn());
+    try std.testing.expectEqualStrings("\x0f\x06client", contents.quicTransportParameters());
+    try std.testing.expectEqualStrings("endpoint-a", contents.contextData());
+    try std.testing.expectEqualStrings("snapshot", contents.applicationData());
+
+    const first_transmission = (try connection.crypto.application.sender.nextTransmission(nst.len)).?;
+    try std.testing.expectEqualSlices(u8, nst, first_transmission.data);
+    try connection.crypto.application.sender.onLost(first_transmission.offset, first_transmission.data.len);
+    const retransmission = (try connection.crypto.application.sender.nextTransmission(nst.len)).?;
+    try std.testing.expect(retransmission.retransmission);
+    try std.testing.expectEqualSlices(u8, nst, retransmission.data);
+    try connection.crypto.application.sender.onAcknowledged(retransmission.offset, retransmission.data.len);
+    try std.testing.expectEqual(connection.crypto.application.sender.write_offset, connection.crypto.application.sender.base_offset);
+
+    var second_storage: Storage(limits) = .{};
+    var second_transcript: [2048]u8 = undefined;
+    var second_options = testInit(&credentials, &second_transcript);
+    second_options.tls.ticket_service = service;
+    second_options.tls.resumption_context = "endpoint-a";
+    second_options.tls.ticket_lifetime = 120;
+    second_options.tls.ticket_issuance = .{ .age_add = 0x05060708, .nonce = "nonce456".* };
+    var second = try Connection(limits).init(&second_storage, second_options);
+    defer second.deinit();
+    second.tls.selected_suite = .AES_128_GCM_SHA256;
+    second.tls.selected_alpn = "h3";
+    second.tls.peer_parameters = "\x0f\x06client";
+    second.tls.resumption_master_secret = @splat(0x43);
+    second.tls.state = .connected;
+    second.state = .active;
+    clock.seconds = 101;
+    try second.issueSessionTicket("second");
+    const second_nst = second.crypto.application.sender.storage[0..@intCast(second.crypto.application.sender.write_offset)];
+    try std.testing.expectEqualSlices(u8, "nonce456", second_nst[13..21]);
+    try std.testing.expect(!std.mem.eql(u8, nst[13..21], second_nst[13..21]));
+
+    var rollback_storage: Storage(limits) = .{};
+    var rollback_transcript: [2048]u8 = undefined;
+    var rollback_options = testInit(&credentials, &rollback_transcript);
+    rollback_options.tls.ticket_service = service;
+    rollback_options.tls.resumption_context = "endpoint-a";
+    rollback_options.tls.ticket_lifetime = 120;
+    rollback_options.tls.ticket_issuance = .{ .age_add = 9, .nonce = "nonce789".* };
+    var rollback = try Connection(limits).init(&rollback_storage, rollback_options);
+    defer rollback.deinit();
+    rollback.tls.selected_suite = .AES_128_GCM_SHA256;
+    rollback.tls.selected_alpn = "h3";
+    rollback.tls.peer_parameters = "\x0f\x06client";
+    rollback.tls.resumption_master_secret = @splat(0x44);
+    rollback.tls.state = .connected;
+    rollback.state = .active;
+    clock.seconds = 100;
+    try std.testing.expectError(error.ClockRollback, rollback.issueSessionTicket("rollback"));
+    try std.testing.expect(rollback.tls.resumption_master_secret != null);
+    try std.testing.expect(!rollback.ticket_issue_attempted);
 }
 
 test "server anti-amplification allowance is exact and validation removes it" {

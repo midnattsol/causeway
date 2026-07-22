@@ -50,6 +50,7 @@ fn fuzzProtocol(io: std.Io, smith: *std.testing.Smith) !void {
     const input = storage[0..smith.slice(&storage)];
     fuzzFrames(input);
     _ = http3.settings.validate(input) catch {};
+    fuzzSnapshot(input);
     _ = http3.stream.parsePrefix(input) catch {};
     try fuzzInteger(input);
     try fuzzHuffman(input);
@@ -174,6 +175,17 @@ fn fuzzWebTransport(input: []const u8) void {
     }
     const raw = http3.capsule.parse(input, .{ .max_capsule_length = 4096 }) catch return;
     _ = http3.webtransport.capsule.parse(raw.capsule) catch {};
+}
+
+fn fuzzSnapshot(input: []const u8) void {
+    _ = http3.resumption.Snapshot.decode(input) catch {};
+    const snapshot = http3.resumption.Snapshot.capture(input) catch return;
+    var encoded: [http3.resumption.maximum_encoded_length]u8 = undefined;
+    const bytes = snapshot.encode(&encoded) catch @panic("captured SETTINGS snapshot did not fit");
+    const decoded = http3.resumption.Snapshot.decode(bytes) catch @panic("encoded SETTINGS snapshot did not decode");
+    var repeated: [http3.resumption.maximum_encoded_length]u8 = undefined;
+    const canonical = decoded.encode(&repeated) catch @panic("decoded SETTINGS snapshot did not fit");
+    std.testing.expectEqualSlices(u8, bytes, canonical) catch @panic("SETTINGS snapshot was not canonical");
 }
 
 fn fuzzConnection(io: std.Io, input: []const u8) void {

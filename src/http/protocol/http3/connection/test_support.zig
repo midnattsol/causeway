@@ -65,6 +65,14 @@ pub const FakeConnection = struct {
     operation_hook_context: ?*anyopaque = null,
     operation_hook: ?*const fn (*anyopaque) void = null,
     fail_push_task_spawn: bool = false,
+    handshake_complete: bool = true,
+    ticket_enabled: bool = false,
+    session_resumed: bool = false,
+    ticket_issued: bool = false,
+    ticket_issue_calls: usize = 0,
+    ticket_issue_error: ?anyerror = null,
+    ticket_state: [512]u8 = undefined,
+    ticket_state_len: usize = 0,
     write_log: [256]StreamId = undefined,
     write_log_count: usize = 0,
 
@@ -105,6 +113,22 @@ pub const FakeConnection = struct {
             .max_receive_frame_size = if (self.datagrams.negotiated) self.datagrams.local_max_frame_size else 0,
             .max_send_frame_size = if (self.datagrams.negotiated) self.datagrams.peer_max_frame_size else 0,
         };
+    }
+
+    pub fn wasSessionResumed(self: *const @This()) bool {
+        return self.session_resumed;
+    }
+
+    pub fn issueSessionTicket(self: *@This(), application_state: []const u8) anyerror!void {
+        self.ticket_issue_calls += 1;
+        if (!self.handshake_complete) return error.HandshakeNotComplete;
+        if (!self.ticket_enabled) return error.SessionTicketsDisabled;
+        if (self.ticket_issue_error) |err| return err;
+        if (self.ticket_issued) return error.SessionTicketAlreadyIssued;
+        if (application_state.len > self.ticket_state.len) return error.TicketStateTooLarge;
+        @memcpy(self.ticket_state[0..application_state.len], application_state);
+        self.ticket_state_len = application_state.len;
+        self.ticket_issued = true;
     }
 
     pub fn exportKeyingMaterial(self: *@This(), label: []const u8, context: []const u8, destination: []u8) !void {
