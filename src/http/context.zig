@@ -4,8 +4,12 @@ const std = @import("std");
 const CoreContext = @import("../core/context.zig").Context;
 const Request = @import("message/request.zig").Request;
 const RequestBody = @import("message/request_body.zig").RequestBody;
+const Response = @import("message/response.zig").Response;
 const Params = @import("routing/params.zig").Params;
 const Exchange = @import("exchange.zig").Exchange;
+const push_module = @import("message/push.zig");
+const PushOutcome = push_module.PushOutcome;
+const PushRequest = push_module.PushRequest;
 
 /// Returns the HTTP handler-context type for an application's `State`.
 ///
@@ -29,6 +33,17 @@ pub fn Context(comptime State: type) type {
             const exchange = self.exchange orelse return error.ExchangeUnavailable;
             return exchange.informational(status, headers);
         }
+
+        /// Requests server push before this request's final response starts.
+        /// `.promised` transfers logical ownership of `response` to the adapter,
+        /// which guarantees production, finalization, and completion; it does not
+        /// guarantee wire emission before return. On `.unavailable` or error the
+        /// caller retains ownership, and on `.unavailable` the adapter does not
+        /// touch `response`.
+        pub fn push(self: *const @This(), request: PushRequest, response: Response) !PushOutcome {
+            const exchange = self.exchange orelse return .{ .unavailable = .unsupported_protocol };
+            return exchange.push(request, response);
+        }
     };
 }
 
@@ -49,6 +64,17 @@ pub fn ContextWithLocals(comptime State: type, comptime Locals: type) type {
         pub fn informational(self: *const @This(), status: std.http.Status, headers: @import("message/headers.zig").Headers) !void {
             const exchange = self.exchange orelse return error.ExchangeUnavailable;
             return exchange.informational(status, headers);
+        }
+
+        /// Requests server push before this request's final response starts.
+        /// `.promised` transfers logical ownership of `response` to the adapter,
+        /// which guarantees production, finalization, and completion; it does not
+        /// guarantee wire emission before return. On `.unavailable` or error the
+        /// caller retains ownership, and on `.unavailable` the adapter does not
+        /// touch `response`.
+        pub fn push(self: *const @This(), request: PushRequest, response: Response) !PushOutcome {
+            const exchange = self.exchange orelse return .{ .unavailable = .unsupported_protocol };
+            return exchange.push(request, response);
         }
     };
 }
@@ -82,6 +108,8 @@ test "HTTP Context carries execution state and request data" {
     try std.testing.expectEqualStrings("/users", context.request.path);
     try std.testing.expectEqualStrings("active=true", context.request.query.?);
     try std.testing.expect(context.params.isEmpty());
+    const push_outcome = try context.push(.{ .path = "/assets/app.css" }, .{ .status = .ok });
+    try std.testing.expectEqual(push_module.PushUnavailable.unsupported_protocol, push_outcome.unavailable);
 }
 
 test "HTTP ContextWithLocals shares mutable request-scoped data across copies" {

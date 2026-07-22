@@ -20,6 +20,11 @@ pub const websocket = @import("websocket/root.zig");
 
 // Convenient module aliases for application code.
 pub const headers = message.headers;
+pub const push = message.push;
+pub const PushId = message.PushId;
+pub const PushOutcome = message.PushOutcome;
+pub const PushRequest = message.PushRequest;
+pub const PushUnavailable = message.PushUnavailable;
 pub const request = message.request;
 pub const request_body = message.request_body;
 pub const response = message.response;

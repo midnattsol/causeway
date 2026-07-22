@@ -42,6 +42,51 @@ const wt_capsule = webtransport.capsule;
 const wt_flow = webtransport.flow_control;
 const wt_error_codes = webtransport.error_codes;
 
+/// Shared lifetime for allocations rooted in one request. Refcounting is only
+/// used when acquiring or releasing a lease; arena allocations remain unchanged.
+const RequestResources = struct {
+    backing_allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    lease_count: std.atomic.Value(usize) = .init(1),
+
+    const Lease = struct {
+        owner: *RequestResources,
+
+        pub fn allocator(self: *const Lease) std.mem.Allocator {
+            return self.owner.arena.allocator();
+        }
+
+        /// Returns another single-owner lease over the same request resources.
+        pub fn retain(self: *const Lease) Lease {
+            const previous = self.owner.lease_count.fetchAdd(1, .monotonic);
+            std.debug.assert(previous != 0 and previous != std.math.maxInt(usize));
+            return .{ .owner = self.owner };
+        }
+
+        /// Releases this lease and reports whether it released the resources.
+        pub fn release(self: *Lease) bool {
+            const owner = self.owner;
+            self.* = undefined;
+            const previous = owner.lease_count.fetchSub(1, .acq_rel);
+            std.debug.assert(previous != 0);
+            if (previous != 1) return false;
+            owner.arena.deinit();
+            const backing_allocator = owner.backing_allocator;
+            backing_allocator.destroy(owner);
+            return true;
+        }
+    };
+
+    fn create(backing_allocator: std.mem.Allocator) std.mem.Allocator.Error!Lease {
+        const owner = try backing_allocator.create(RequestResources);
+        owner.* = .{
+            .backing_allocator = backing_allocator,
+            .arena = .init(backing_allocator),
+        };
+        return .{ .owner = owner };
+    }
+};
+
 pub fn Handler(comptime State: type, comptime Dispatcher: type, comptime Connection: type, comptime config: options_module.Config) type {
     return SessionType(State, null, Dispatcher, Connection, config);
 }
@@ -245,7 +290,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             field_bytes_len: usize = 0,
             head: ?semantics.RequestHead = null,
 
-            arena: ?std.heap.ArenaAllocator = null,
+            arena: ?RequestResources.Lease = null,
             input: ?*inbound_body.Pipe = null,
             body_state: ?*RequestBody.State = null,
             request: ?Request = null,
@@ -472,7 +517,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     self.wt_accept_bidi.close(self.owner.io);
                     WtController.closeWebTransportStreams(self.owner, self, error.WebTransportSessionClosed);
                 }
-                if (self.arena) |*arena| arena.deinit();
+                if (self.arena) |*resources| _ = resources.release();
                 self.* = .{};
             }
         };
@@ -1073,7 +1118,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     return;
                 }
             }
-            slot.arena = std.heap.ArenaAllocator.init(self.allocator);
+            if (slot.arena == null) slot.arena = try RequestResources.create(self.allocator);
             const allocator = slot.arena.?.allocator();
             const state_value = try allocator.create(RequestBody.State);
             if (present) {
@@ -2253,4 +2298,14 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             length.* -= amount;
         }
     };
+}
+
+test "HTTP/3 request resources are released by the final lease" {
+    var first = try RequestResources.create(std.testing.allocator);
+    const value = try first.allocator().dupe(u8, "retained");
+    var last = first.retain();
+
+    try std.testing.expect(!first.release());
+    try std.testing.expectEqualStrings("retained", value);
+    try std.testing.expect(last.release());
 }

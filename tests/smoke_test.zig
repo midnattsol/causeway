@@ -62,6 +62,19 @@ test "public HTTP API exposes protocol-independent messages and protocol layers"
     _ = causeway.http.transport;
     _ = causeway.http.message.request.Version.http_2;
     _ = causeway.http.message.request_body.Source;
+    _ = causeway.http.push.PushRequest;
+    _ = causeway.http.push.PushId;
+    _ = causeway.http.push.PushUnavailable;
+    _ = causeway.http.push.PushOutcome;
+    _ = causeway.http.message.PushRequest;
+    _ = causeway.http.PushRequest;
+    _ = causeway.http.PushId;
+    _ = causeway.http.PushUnavailable;
+    _ = causeway.http.PushOutcome;
+    _ = causeway.http.PushUnavailable.server_disabled;
+    _ = causeway.http.PushUnavailable.capacity;
+    _ = causeway.http.PushUnavailable.stream_limit_reached;
+    _ = causeway.http.exchange.Exchange.push;
     try std.testing.expect(true);
 }
 
