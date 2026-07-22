@@ -4,7 +4,7 @@ pub const options = @import("options.zig");
 pub const request = @import("request.zig");
 pub const response = @import("response.zig");
 pub const datagram = @import("datagram.zig");
-pub const webtransport = @import("webtransport.zig");
+pub const webtransport = @import("webtransport/policy.zig");
 pub const engine = @import("session.zig");
 
 pub const Config = options.Config;

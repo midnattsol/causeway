@@ -1,11 +1,11 @@
 //! Server-side policy helpers for draft-ietf-webtrans-http3-16.
 
 const std = @import("std");
-const Headers = @import("../../../message/headers.zig").Headers;
-const Request = @import("../../../message/request.zig").Request;
-const Response = @import("../../../message/response.zig").Response;
-const structured_fields = @import("../../../semantics/structured_fields/root.zig");
-const constants = @import("../webtransport/constants.zig");
+const Headers = @import("../../../../message/headers.zig").Headers;
+const Request = @import("../../../../message/request.zig").Request;
+const Response = @import("../../../../message/response.zig").Response;
+const structured_fields = @import("../../../../semantics/structured_fields/root.zig");
+const constants = @import("../../webtransport/constants.zig");
 
 pub const exporter_label = "EXPORTER-WebTransport";
 
