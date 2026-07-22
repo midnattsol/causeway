@@ -5,6 +5,12 @@ const frame = @import("../frame/root.zig");
 const stream = @import("../stream/root.zig");
 const transport_parameters = @import("../crypto/transport_parameters.zig");
 
+pub const ResetInfo = struct {
+    application_error: u64,
+    final_size: u64,
+    reliable_size: ?u64,
+};
+
 pub const Event = union(enum) {
     opened: stream.Id,
     readable: stream.Id,
@@ -240,14 +246,23 @@ pub fn Application(
         }
 
         pub fn readReset(self: *Self, id: stream.Id) !u64 {
+            return (try self.readResetInfo(id)).application_error;
+        }
+
+        pub fn readResetInfo(self: *Self, id: stream.Id) !ResetInfo {
             const slot = self.find(id) orelse return error.StreamNotFound;
             var receiver = &(slot.receiver orelse return error.StreamNotReceivable);
             var receive_flow = &(slot.receive_flow orelse return error.StreamNotReceivable);
             const application_error = try receiver.readReset();
+            const result: ResetInfo = .{
+                .application_error = application_error,
+                .final_size = receiver.final_size.?,
+                .reliable_size = receiver.reliable_size,
+            };
             const discarded = receive_flow.highest_received - receive_flow.consumed;
             if (discarded != 0) try receive_flow.consume(discarded, &self.receive_connection);
             self.queueReceiveFinished(slot);
-            return application_error;
+            return result;
         }
 
         pub fn writableLen(self: *Self, id: stream.Id) !usize {
@@ -1290,7 +1305,10 @@ test "application reset emits receive_finished once and validates late final siz
     try std.testing.expectEqual(@as(u64, 8), application.receive_connection.consumed);
     _ = application.accept();
     try std.testing.expectEqual(Event{ .reset = .{ .id = id, .application_error = 42 } }, application.nextEvent().?);
-    try std.testing.expectEqual(@as(u64, 42), try application.readReset(id));
+    const reset_info = try application.readResetInfo(id);
+    try std.testing.expectEqual(@as(u64, 42), reset_info.application_error);
+    try std.testing.expectEqual(@as(u64, 8), reset_info.final_size);
+    try std.testing.expectEqual(@as(?u64, null), reset_info.reliable_size);
     try std.testing.expectEqual(stream.receive.State.reset_read, application.find(id).?.receiver.?.state);
     try std.testing.expectEqual(Event{ .receive_finished = id }, application.nextEvent().?);
     try application.onResetStream(.{ .id = id.value, .application_error = 7, .final_size = 8 });

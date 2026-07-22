@@ -29,6 +29,7 @@ pub const TransportError = types.TransportError;
 pub const CloseCode = types.CloseCode;
 pub const ExporterError = tls_server.ExporterError;
 pub const StreamEvent = application_streams.Event;
+pub const StreamResetInfo = application_streams.ResetInfo;
 pub const StreamId = stream.Id;
 pub const StreamDirection = stream.Direction;
 pub const EcnCodepoint = ecn.Codepoint;
@@ -356,6 +357,9 @@ pub fn Connection(comptime limits: Limits) type {
         pub fn readStreamReset(self: *Self, id: Self.StreamId) !u64 {
             return self.application.readReset(id);
         }
+        pub fn readStreamResetInfo(self: *Self, id: Self.StreamId) !StreamResetInfo {
+            return self.application.readResetInfo(id);
+        }
         pub fn streamWritableLen(self: *Self, id: Self.StreamId) !usize {
             return self.application.writableLen(id);
         }
@@ -375,6 +379,9 @@ pub fn Connection(comptime limits: Limits) type {
         }
         pub fn peerSupportsResetStreamAt(self: *const Self) bool {
             return self.application.parameters_applied and self.application.peer.reset_stream_at;
+        }
+        pub fn localSupportsResetStreamAt(self: *const Self) bool {
+            return self.application.parameters_applied and self.application.local.reset_stream_at;
         }
         pub fn stopSending(self: *Self, id: Self.StreamId, application_error: u64) !void {
             return self.application.stopSending(id, application_error);
