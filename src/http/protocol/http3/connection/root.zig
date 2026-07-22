@@ -4,6 +4,7 @@ pub const options = @import("options.zig");
 pub const request = @import("request.zig");
 pub const response = @import("response.zig");
 pub const datagram = @import("datagram.zig");
+pub const webtransport = @import("webtransport.zig");
 pub const engine = @import("session.zig");
 
 pub const Config = options.Config;
@@ -15,5 +16,6 @@ pub const HandlerWithLocals = engine.HandlerWithLocals;
 
 test {
     _ = datagram;
+    _ = webtransport;
     _ = @import("test.zig");
 }

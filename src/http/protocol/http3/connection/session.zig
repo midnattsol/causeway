@@ -13,6 +13,8 @@ const RequestBody = @import("../../../message/request_body.zig").RequestBody;
 const response_module = @import("../../../message/response.zig");
 const Response = response_module.Response;
 const DatagramChannel = response_module.DatagramChannel;
+const WebTransportSession = response_module.WebTransportSession;
+const WebTransportStream = response_module.WebTransportStream;
 
 const frame = @import("../frame/root.zig");
 const capsule = @import("../capsule/root.zig");
@@ -31,6 +33,13 @@ const request_adapter = @import("request.zig");
 const response_fields = @import("response.zig");
 const options_module = @import("options.zig");
 const datagram_pipe = @import("datagram.zig");
+const webtransport_policy = @import("webtransport.zig");
+const webtransport = @import("../webtransport/root.zig");
+const wt_constants = webtransport.constants;
+const wt_stream = webtransport.stream;
+const wt_capsule = webtransport.capsule;
+const wt_flow = webtransport.flow_control;
+const wt_error_codes = webtransport.error_codes;
 
 pub fn Handler(comptime State: type, comptime Dispatcher: type, comptime Connection: type, comptime config: options_module.Config) type {
     return SessionType(State, null, Dispatcher, Connection, config);
@@ -61,6 +70,146 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         const DatagramPipes = datagram_pipe.Pipes(datagram_capacity, datagram_payload_size);
 
         const WireHeader = struct { frame_type: frame.Type, length: usize, encoded: usize };
+        const WebTransportFlush = struct { amount: usize = 0, action: bool = false };
+        const wt_capsule_payload_size = @max(config.datagram_max_payload, 4 + wt_constants.maximum_close_message);
+        const effective_webtransport_session_limit = @max(1, @min(config.max_webtransport_sessions, config.max_pending_webtransport_streams));
+        const webtransport_stream_quota = @max(1, config.max_pending_webtransport_streams / effective_webtransport_session_limit);
+
+        const WebTransportOperation = struct {
+            kind: Kind,
+            session: ?*RequestSlot = null,
+            stream: ?*WebTransportStreamSlot = null,
+            expected_generation: u64 = 0,
+            application_error: u32 = 0,
+            message: []const u8 = "",
+            label: []const u8 = "",
+            exporter_context: []const u8 = "",
+            exporter_output: []u8 = &.{},
+            result_stream: ?WebTransportStream = null,
+            err: ?anyerror = null,
+            done: Io.Event = .unset,
+
+            const Kind = enum { open_uni, open_bidi, finish, reset, stop, close, drain, exporter };
+        };
+
+        const WebTransportStreamHandle = struct {
+            slot: *WebTransportStreamSlot,
+            generation: u64,
+            reset_code: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+            stop_code: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+
+            fn current(self: *WebTransportStreamHandle) !*WebTransportStreamSlot {
+                if (!self.slot.occupied or self.slot.generation != self.generation) return error.StaleWebTransportStream;
+                return self.slot;
+            }
+
+            fn operation(self: *WebTransportStreamHandle, kind: WebTransportOperation.Kind, application_error: u32) !void {
+                const slot = try self.current();
+                if (slot.owner.webtransport_stopping.load(.acquire)) return error.WebTransportSessionClosed;
+                if (comptime @hasDecl(Connection, "beforeWebTransportOperationEnqueue")) slot.owner.connection.beforeWebTransportOperationEnqueue();
+                var operation_value: WebTransportOperation = .{
+                    .kind = kind,
+                    .session = slot.session,
+                    .stream = slot,
+                    .expected_generation = self.generation,
+                    .application_error = application_error,
+                };
+                try slot.owner.submitWebTransportOperation(&operation_value);
+                operation_value.done.waitUncancelable(slot.owner.io);
+                if (operation_value.err) |err| return err;
+            }
+
+            fn finish(raw: *anyopaque) !void {
+                const self: *WebTransportStreamHandle = @ptrCast(@alignCast(raw));
+                const slot = try self.current();
+                if (slot.owner.webtransport_stopping.load(.acquire)) return error.WebTransportSessionClosed;
+                try slot.output.?.finish();
+                return self.operation(.finish, 0);
+            }
+
+            fn reset(raw: *anyopaque, code: u32) !void {
+                const self: *WebTransportStreamHandle = @ptrCast(@alignCast(raw));
+                return self.operation(.reset, code);
+            }
+
+            fn stop(raw: *anyopaque, code: u32) !void {
+                const self: *WebTransportStreamHandle = @ptrCast(@alignCast(raw));
+                return self.operation(.stop, code);
+            }
+
+            fn resetInfo(raw: *anyopaque) ?response_module.WebTransportStreamError {
+                const self: *WebTransportStreamHandle = @ptrCast(@alignCast(raw));
+                const code = self.reset_code.load(.acquire);
+                if (code == std.math.maxInt(u64)) return null;
+                return .{ .application_error = wt_error_codes.fromHttp(code) catch null };
+            }
+
+            fn stopInfo(raw: *anyopaque) ?response_module.WebTransportStreamError {
+                const self: *WebTransportStreamHandle = @ptrCast(@alignCast(raw));
+                const code = self.stop_code.load(.acquire);
+                if (code == std.math.maxInt(u64)) return null;
+                return .{ .application_error = wt_error_codes.fromHttp(code) catch null };
+            }
+        };
+
+        const WebTransportStreamSlot = struct {
+            owner: *Self = undefined,
+            session: *RequestSlot = undefined,
+            occupied: bool = false,
+            prepared: bool = false,
+            associated: bool = false,
+            delivered: bool = false,
+            local_initiated: bool = false,
+            generation: u64 = 0,
+            session_id: u64 = 0,
+            id: StreamId = undefined,
+            direction: wt_flow.Direction = .bidirectional,
+            parser: wt_stream.Parser = wt_stream.Parser.init(.bidirectional),
+            header: [16]u8 = undefined,
+            header_length: usize = 0,
+            header_sent: usize = 0,
+            payload_staged: usize = 0,
+            receive_body_accounted: u64 = 0,
+            consumed_credit: std.atomic.Value(usize) = .init(0),
+            fin_observed: bool = false,
+            receive_finished: bool = false,
+            send_finished: bool = false,
+            input: ?*inbound_body.Pipe = null,
+            output: ?*outbound_body.Pipe = null,
+            handle: ?*WebTransportStreamHandle = null,
+            public_stream: WebTransportStream = undefined,
+            pending_open: ?*WebTransportOperation = null,
+
+            fn credit(raw: *anyopaque, amount: usize) void {
+                const self: *WebTransportStreamSlot = @ptrCast(@alignCast(raw));
+                _ = self.consumed_credit.fetchAdd(amount, .release);
+            }
+
+            fn outputReady(_: *anyopaque) void {}
+
+            fn fail(self: *WebTransportStreamSlot, err: anyerror) void {
+                if (self.input) |input| input.fail(err);
+                if (self.output) |output| output.abort(err);
+            }
+
+            fn completePendingOpen(self: *WebTransportStreamSlot, err: anyerror) void {
+                const operation = self.pending_open orelse return;
+                operation.err = err;
+                self.pending_open = null;
+                operation.done.set(self.owner.io);
+            }
+
+            fn recycle(self: *WebTransportStreamSlot) void {
+                if (self.occupied) self.completePendingOpen(error.WebTransportSessionClosed);
+                const generation = self.generation;
+                self.* = .{ .generation = generation };
+            }
+
+            fn clear(self: *WebTransportStreamSlot) void {
+                self.fail(error.WebTransportSessionClosed);
+                self.recycle();
+            }
+        };
 
         const TaskDone = struct { slot: *RequestSlot, err: ?anyerror };
         const Informational = struct {
@@ -74,6 +223,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             response_ready: *RequestSlot,
             task_done: TaskDone,
             informational: *Informational,
+            webtransport_operation: *WebTransportOperation,
         };
         const MessageQueue = Io.Queue(Message);
 
@@ -125,6 +275,25 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             output_acked: bool = false,
             completion_notified: bool = false,
 
+            webtransport_candidate: bool = false,
+            webtransport_admitted: bool = false,
+            webtransport_established: bool = false,
+            webtransport_draining: std.atomic.Value(bool) = .init(false),
+            webtransport_closed: std.atomic.Value(bool) = .init(false),
+            webtransport_close_code: u32 = 0,
+            webtransport_close_message: [wt_constants.maximum_close_message]u8 = undefined,
+            webtransport_close_message_len: usize = 0,
+            webtransport_protocol: ?[]const u8 = null,
+            webtransport_session: WebTransportSession = undefined,
+            wt_flow_control_enabled: bool = false,
+            wt_send_flow: wt_flow.Send = undefined,
+            wt_receive_flow: wt_flow.Receive = undefined,
+            wt_accept_uni_storage: [config.max_pending_webtransport_streams]WebTransportStream = undefined,
+            wt_accept_bidi_storage: [config.max_pending_webtransport_streams]WebTransportStream = undefined,
+            wt_accept_uni: Io.Queue(WebTransportStream) = undefined,
+            wt_accept_bidi: Io.Queue(WebTransportStream) = undefined,
+            wt_stream_cursor: usize = 0,
+
             capsule_requested: bool = false,
             capsule_decided: bool = false,
             datagram_active: bool = false,
@@ -134,7 +303,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             datagram_channel: DatagramChannel = undefined,
             capsule_parser: capsule.StreamParser = capsule.StreamParser.init(.{ .max_capsule_length = config.max_capsule_length }),
             capsule_type: capsule.Type = .datagram,
-            capsule_payload: [datagram_payload_size]u8 = undefined,
+            capsule_payload: [wt_capsule_payload_size]u8 = undefined,
             capsule_payload_len: usize = 0,
             capsule_discard: bool = false,
 
@@ -187,6 +356,102 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 return self.datagrams.dropped();
             }
 
+            fn acceptStream(self: *RequestSlot, direction: wt_flow.Direction) !?WebTransportStream {
+                return switch (direction) {
+                    .unidirectional => self.wt_accept_uni.getOne(self.owner.io),
+                    .bidirectional => self.wt_accept_bidi.getOne(self.owner.io),
+                } catch |err| switch (err) {
+                    error.Closed => null,
+                    else => return err,
+                };
+            }
+
+            fn acceptUni(raw: *anyopaque) !?WebTransportStream {
+                const self: *RequestSlot = @ptrCast(@alignCast(raw));
+                return self.acceptStream(.unidirectional);
+            }
+
+            fn acceptBidi(raw: *anyopaque) !?WebTransportStream {
+                const self: *RequestSlot = @ptrCast(@alignCast(raw));
+                return self.acceptStream(.bidirectional);
+            }
+
+            fn sessionOperation(self: *RequestSlot, operation_value: *WebTransportOperation) !void {
+                try self.owner.submitWebTransportOperation(operation_value);
+                operation_value.done.waitUncancelable(self.owner.io);
+                if (operation_value.err) |err| return err;
+            }
+
+            fn openStream(self: *RequestSlot, direction: wt_flow.Direction) !WebTransportStream {
+                var operation_value: WebTransportOperation = .{ .session = self, .kind = switch (direction) {
+                    .unidirectional => .open_uni,
+                    .bidirectional => .open_bidi,
+                } };
+                try self.sessionOperation(&operation_value);
+                return operation_value.result_stream orelse error.WebTransportSessionClosed;
+            }
+
+            fn openUni(raw: *anyopaque) !WebTransportStream {
+                const self: *RequestSlot = @ptrCast(@alignCast(raw));
+                return self.openStream(.unidirectional);
+            }
+
+            fn openBidi(raw: *anyopaque) !WebTransportStream {
+                const self: *RequestSlot = @ptrCast(@alignCast(raw));
+                return self.openStream(.bidirectional);
+            }
+
+            fn sendWebTransportCapsule(self: *RequestSlot, value: wt_capsule.Value) !void {
+                if (self.webtransport_closed.load(.acquire)) return error.WebTransportSessionClosed;
+                const output = self.output orelse return error.WebTransportSessionClosed;
+                var payload: [4 + wt_constants.maximum_close_message]u8 = undefined;
+                var wire: [4 + wt_constants.maximum_close_message + 16]u8 = undefined;
+                const length = try wt_capsule.write(&wire, &payload, value, .{ .max_capsule_length = config.max_capsule_length });
+                try output.writer.writeAll(wire[0..length]);
+                try output.writer.flush();
+            }
+
+            fn closeWebTransport(raw: *anyopaque, code: u32, message: []const u8) !void {
+                const self: *RequestSlot = @ptrCast(@alignCast(raw));
+                if (message.len > config.max_webtransport_close_message_size) return error.CloseMessageTooLong;
+                try self.sendWebTransportCapsule(.{ .close_session = .{ .application_error_code = code, .message = message } });
+                var operation_value: WebTransportOperation = .{ .kind = .close, .session = self, .application_error = code, .message = message };
+                return self.sessionOperation(&operation_value);
+            }
+
+            fn drainWebTransport(raw: *anyopaque) !void {
+                const self: *RequestSlot = @ptrCast(@alignCast(raw));
+                try self.sendWebTransportCapsule(.drain_session);
+                var operation_value: WebTransportOperation = .{ .kind = .drain, .session = self };
+                return self.sessionOperation(&operation_value);
+            }
+
+            fn exportWebTransport(raw: *anyopaque, label: []const u8, context: []const u8, output: []u8) !void {
+                const self: *RequestSlot = @ptrCast(@alignCast(raw));
+                var operation_value: WebTransportOperation = .{
+                    .kind = .exporter,
+                    .session = self,
+                    .label = label,
+                    .exporter_context = context,
+                    .exporter_output = output,
+                };
+                return self.sessionOperation(&operation_value);
+            }
+
+            fn webTransportCloseInfo(raw: *anyopaque) ?response_module.WebTransportClose {
+                const self: *RequestSlot = @ptrCast(@alignCast(raw));
+                if (!self.webtransport_closed.load(.acquire)) return null;
+                return .{
+                    .application_error = self.webtransport_close_code,
+                    .message = self.webtransport_close_message[0..self.webtransport_close_message_len],
+                };
+            }
+
+            fn webTransportDraining(raw: *anyopaque) bool {
+                const self: *RequestSlot = @ptrCast(@alignCast(raw));
+                return self.webtransport_draining.load(.acquire);
+            }
+
             fn notifyCompletion(self: *RequestSlot, result: response_module.CompletionResult) void {
                 if (self.completion_notified) return;
                 self.completion_notified = true;
@@ -201,7 +466,13 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
 
             fn deinit(self: *RequestSlot) void {
+                if (self.occupied and self.webtransport_candidate) self.owner.addWebTransportTombstone(self.id.value);
                 self.abort(error.ConnectionClosed);
+                if (self.webtransport_admitted) {
+                    self.wt_accept_uni.close(self.owner.io);
+                    self.wt_accept_bidi.close(self.owner.io);
+                    self.owner.closeWebTransportStreams(self, error.WebTransportSessionClosed);
+                }
                 if (self.arena) |*arena| arena.deinit();
                 self.* = .{};
             }
@@ -211,8 +482,27 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             occupied: bool = false,
             id: StreamId = undefined,
             stream_type: ?stream.Type = null,
+            fin_observed: bool = false,
             input: [config.qpack_instruction_bytes]u8 = undefined,
             input_len: usize = 0,
+        };
+
+        const PendingDatagram = struct {
+            occupied: bool = false,
+            session_id: u64 = 0,
+            payload: [datagram_payload_size]u8 = undefined,
+            length: usize = 0,
+        };
+
+        const PendingWireDatagram = struct {
+            occupied: bool = false,
+            payload: [datagram_payload_size + 8]u8 = undefined,
+            length: usize = 0,
+        };
+
+        const SessionTombstone = struct {
+            occupied: bool = false,
+            session_id: u64 = 0,
         };
 
         connection: *Connection,
@@ -221,6 +511,8 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         io: Io,
         active: bool = false,
         shutting_down: bool = false,
+        webtransport_stopping: std.atomic.Value(bool) = .init(false),
+        webtransport_submissions: std.atomic.Value(usize) = .init(0),
         final_goaway_sent: bool = false,
         highest_request_id: ?u64 = null,
         local_control: StreamId = undefined,
@@ -230,9 +522,21 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         peer_control: validation.ControlState = .{ .sender = .client },
         peer_max_field_section_size: u64 = std.math.maxInt(u64),
         peer_h3_datagram: bool = false,
+        peer_wt_enabled: bool = false,
+        peer_wt_initial_max_streams_uni: u64 = 0,
+        peer_wt_initial_max_streams_bidi: u64 = 0,
+        peer_wt_initial_max_data: u64 = 0,
         peer_settings_received: bool = false,
+        peer_settings_resumed: bool = false,
         requests: [config.max_requests]RequestSlot = @splat(.{}),
         unidirectional: [config.max_peer_unidirectional_streams]UniSlot = @splat(.{}),
+        webtransport_streams: [config.max_pending_webtransport_streams]WebTransportStreamSlot = @splat(.{}),
+        pending_webtransport_datagrams: [datagram_capacity]PendingDatagram = @splat(.{}),
+        pending_pre_settings_datagrams: [datagram_capacity]PendingWireDatagram = @splat(.{}),
+        webtransport_tombstones: [config.max_requests]SessionTombstone = @splat(.{}),
+        webtransport_tombstones_saturated: bool = false,
+        webtransport_session_cursor: usize = 0,
+        webtransport_datagram_cursor: usize = 0,
         tasks: Io.Group = .init,
         message_storage: [config.control_queue_capacity]Message = undefined,
         messages: MessageQueue = undefined,
@@ -265,10 +569,24 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         pub fn deinit(self: *Self) void {
+            self.webtransport_stopping.store(true, .release);
+            if (self.messages_initialized) {
+                while (self.webtransport_submissions.load(.acquire) != 0) {
+                    _ = self.processMessages() catch {};
+                    std.Thread.yield() catch {};
+                }
+                _ = self.processMessages() catch {};
+            } else std.debug.assert(self.webtransport_submissions.load(.acquire) == 0);
             for (&self.requests) |*slot| if (slot.occupied or slot.arena != null) slot.abort(error.ConnectionClosed);
+            for (&self.requests) |*slot| if (slot.occupied and slot.webtransport_admitted) {
+                _ = self.recordWebTransportClose(slot, 0, "");
+                self.closeWebTransportStreams(slot, error.ConnectionClosed);
+            };
+            _ = self.processMessages() catch {};
             self.tasks.cancel(self.io);
             self.pending_tasks = 0;
             for (&self.requests) |*slot| if (slot.occupied or slot.arena != null) slot.deinit();
+            for (&self.webtransport_streams) |*slot| if (slot.occupied) slot.clear();
             self.active = false;
         }
 
@@ -302,14 +620,18 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             var progressed = try self.processMessages();
             self.checkResponseDeadlines();
             progressed += try self.returnCredits();
+            progressed += try self.returnWebTransportCredits();
             while (self.connection.nextStreamEvent()) |event| {
                 progressed += 1;
                 try self.handleEvent(event, now);
+                try self.resumeAfterPeerSettings();
                 progressed += try self.returnCredits();
+                progressed += try self.returnWebTransportCredits();
                 progressed += try self.processMessages();
             }
             progressed += try self.processIncomingDatagrams();
             progressed += try self.flushOutgoingDatagrams();
+            progressed += try self.flushWebTransportStreams();
             try self.retryRequests(now);
             progressed += try self.processMessages();
             var budget = config.output_batch_size;
@@ -332,6 +654,9 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             const maximum_client_bidi_id = (@as(u64, 1) << 62) - 4;
             const length = try frame.encode(&encoded, .{ .frame_type = .goaway, .payload = .{ .goaway = maximum_client_bidi_id } });
             try self.writeAll(self.local_control, encoded[0..length]);
+            for (&self.requests) |*slot| if (slot.occupied and slot.webtransport_established) {
+                slot.webtransport_draining.store(true, .release);
+            };
             self.shutting_down = true;
         }
 
@@ -352,6 +677,13 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             _ = now;
         }
 
+        fn submitWebTransportOperation(self: *Self, operation: *WebTransportOperation) !void {
+            _ = self.webtransport_submissions.fetchAdd(1, .acq_rel);
+            defer _ = self.webtransport_submissions.fetchSub(1, .acq_rel);
+            if (self.webtransport_stopping.load(.acquire)) return error.WebTransportSessionClosed;
+            try self.messages.putOne(self.io, .{ .webtransport_operation = operation });
+        }
+
         fn processMessages(self: *Self) !usize {
             var progressed: usize = 0;
             var buffer: [16]Message = undefined;
@@ -360,7 +692,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 if (count == 0) return progressed;
                 progressed += count;
                 for (buffer[0..count]) |message| switch (message) {
-                    .response_ready => |slot| self.startResponse(slot) catch |err| self.failRequest(slot, .internal_error, err),
+                    .response_ready => |slot| self.startResponse(slot) catch |err| self.failRequest(slot, if (err == error.WebTransportSessionLimit) .request_rejected else .internal_error, err),
                     .task_done => |done| {
                         std.debug.assert(self.pending_tasks != 0);
                         self.pending_tasks -= 1;
@@ -381,6 +713,13 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                             operation.err = err;
                         };
                         operation.done.set(self.io);
+                    },
+                    .webtransport_operation => |operation| {
+                        const complete = self.processWebTransportOperation(operation) catch |err| blk: {
+                            operation.err = err;
+                            break :blk true;
+                        };
+                        if (complete) operation.done.set(self.io);
                     },
                 };
             }
@@ -417,7 +756,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 .receive_finished => |id| try self.receiveFinished(id, now),
                 .send_finished => |id| self.sendFinished(id),
                 .reset => |item| try self.resetReceived(item.id),
-                .stopped => |item| self.stopped(item.id),
+                .stopped => |item| self.stopped(item.id, item.application_error),
             }
         }
 
@@ -437,15 +776,23 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         fn readable(self: *Self, id: StreamId, now: u64) !void {
+            if (self.findWebTransportStream(id)) |wt_slot| return self.processWebTransportBytes(wt_slot);
             if (id.direction() == .unidirectional) {
                 const bytes = try self.connection.streamReadable(id);
                 if (bytes.len == 0) return;
                 const slot = self.findUni(id) orelse return error.UnknownUnidirectionalStream;
-                try append(&slot.input, &slot.input_len, bytes);
-                try self.connection.consumeStream(id, bytes.len);
-                return self.processUni(slot, now);
+                const amount: usize = if (config.enable_webtransport and slot.stream_type == null) 1 else bytes.len;
+                try append(&slot.input, &slot.input_len, bytes[0..amount]);
+                try self.connection.consumeStream(id, amount);
+                try self.processUni(slot, now);
+                if (slot.occupied and (slot.stream_type != null or self.peer_settings_received) and (try self.connection.streamReadable(id)).len != 0) try self.readable(id, now);
+                return;
             }
             const slot = self.findRequest(id) orelse return error.UnknownRequestStream;
+            if (comptime config.enable_webtransport) {
+                const classification = try self.classifyBidirectional(slot);
+                if (classification == null or classification.?) return;
+            }
             if (slot.output_done and !slot.tunnel) return;
             self.processRequestBytes(slot, now) catch |err| switch (err) {
                 error.Blocked => return,
@@ -457,6 +804,10 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         fn processRequestBytes(self: *Self, slot: *RequestSlot, now: u64) !void {
             _ = now;
+            if (slot.webtransport_closed.load(.acquire)) {
+                const remaining = try self.connection.streamReadable(slot.id);
+                if (remaining.len != 0) return error.MessageError;
+            }
             while (slot.occupied) {
                 if (slot.payload_staged != 0) return;
                 if (slot.wire) |wire| {
@@ -494,6 +845,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     if (body_bytes.len == 0) return;
                     if (slot.capsule_requested and !slot.capsule_decided) return;
                     if (slot.datagram_active) {
+                        if (slot.webtransport_candidate and !slot.webtransport_established) return;
                         const amount = @min(body_bytes.len, wire.length - slot.payload_seen);
                         try self.processCapsuleBytes(slot, body_bytes[0..amount]);
                         try self.connection.consumeStream(slot.id, amount);
@@ -539,8 +891,12 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             slot.frame_storage[slot.frame_len] = bytes[0];
             slot.frame_len += 1;
             try self.connection.consumeStream(slot.id, 1);
+            if (varint.decode(slot.frame_storage[0..slot.frame_len]) catch null) |type_value| {
+                if (type_value.value == wt_constants.bidirectional_stream_signal) return error.UnexpectedWebTransportStreamSignal;
+            }
             slot.wire = try parseWireHeader(slot.frame_storage[0..slot.frame_len]);
             if (slot.wire) |wire| {
+                if (@intFromEnum(wire.frame_type) == wt_constants.bidirectional_stream_signal) return error.UnexpectedWebTransportStreamSignal;
                 if (wire.length > config.max_frame_size) return error.FrameTooLarge;
                 if (wire.frame_type.isForbiddenHttp2()) return error.ForbiddenHttp2Frame;
             }
@@ -581,7 +937,10 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                         slot.initial_field_count = slot.field_count;
                         slot.head = head;
                         slot.content_length = head.content_length;
-                        slot.capsule_requested = config.enable_datagrams and head.method.is(.CONNECT) and capsuleProtocolEnabled(head.headers);
+                        slot.webtransport_candidate = config.enable_webtransport and head.method.is(.CONNECT) and
+                            head.protocol != null and std.mem.eql(u8, head.protocol.?, wt_constants.upgrade_token);
+                        slot.capsule_requested = config.enable_datagrams and head.method.is(.CONNECT) and
+                            (slot.webtransport_candidate or capsuleProtocolEnabled(head.headers));
                         if (head.content_length != null or head.method.is(.CONNECT)) try self.ensureRequest(slot, true);
                     } else {
                         const trailers = semantics.validateTrailers(section_fields) catch return error.MessageError;
@@ -604,6 +963,13 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         fn ensureRequest(self: *Self, slot: *RequestSlot, present: bool) !void {
             if (slot.dispatched) return;
             const head = slot.head orelse return error.MessageError;
+            if (slot.webtransport_candidate) {
+                if (!self.peer_settings_received) return;
+                if (!webtransport_policy.requirementsMet(self.connection, self.peer_wt_enabled, self.peer_h3_datagram)) {
+                    self.failRequest(slot, .message_error, error.WebTransportRequirementsNotMet);
+                    return;
+                }
+            }
             slot.arena = std.heap.ArenaAllocator.init(self.allocator);
             const allocator = slot.arena.?.allocator();
             const state_value = try allocator.create(RequestBody.State);
@@ -618,6 +984,10 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
             slot.body_state = state_value;
             slot.request = try request_adapter.build(head, .init(state_value));
+            if (slot.webtransport_candidate) webtransport_policy.validateRequest(slot.request.?) catch {
+                self.failRequest(slot, .message_error, error.InvalidWebTransportRequest);
+                return;
+            };
             slot.dispatched = true;
             self.pending_tasks += 1;
             self.tasks.concurrent(self.io, dispatchTask, .{ self, slot }) catch |err| {
@@ -628,9 +998,19 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         fn receiveFinished(self: *Self, id: StreamId, now: u64) !void {
+            if (self.findWebTransportStream(id)) |wt_slot| {
+                wt_slot.fin_observed = true;
+                try self.finishWebTransportInput(wt_slot);
+                return;
+            }
             if (id.direction() == .unidirectional) {
                 if (self.findUni(id)) |slot| {
+                    if (!self.peer_settings_received and slot.stream_type == null) {
+                        slot.fin_observed = true;
+                        return;
+                    }
                     try self.processUni(slot, now);
+                    if (!slot.occupied) return;
                     if (slot.input_len != 0 or slot.stream_type == null) return error.Truncated;
                     try self.peer_streams.closed(slot.stream_type.?);
                     slot.occupied = false;
@@ -664,23 +1044,67 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             slot.receive_finished = true;
             slot.datagrams.finishIncoming();
             if (slot.input) |input| input.finish();
+            if (slot.webtransport_established) self.remoteTerminateWebTransport(slot, 0, "", error.WebTransportSessionClosed);
         }
 
         fn sendFinished(self: *Self, id: StreamId) void {
+            if (self.findWebTransportStream(id)) |slot| {
+                if (slot.pending_open != null) slot.completePendingOpen(error.WebTransportOpenAborted);
+                slot.send_finished = true;
+                self.collectWebTransportStreams();
+                return;
+            }
             if (self.findRequest(id)) |slot| slot.output_acked = true;
         }
 
         fn resetReceived(self: *Self, id: StreamId) !void {
-            _ = try self.connection.readStreamReset(id);
+            const reset_info = try self.connection.readStreamResetInfo(id);
+            if (self.findWebTransportStream(id)) |slot| {
+                if (!slot.associated) {
+                    slot.completePendingOpen(error.PeerReset);
+                    if (slot.id.direction() == .bidirectional) self.connection.resetStream(slot.id, wt_constants.wt_buffered_stream_rejected) catch {};
+                    slot.receive_finished = true;
+                    slot.send_finished = true;
+                    slot.recycle();
+                    return;
+                }
+                if (slot.pending_open != null) slot.completePendingOpen(error.PeerReset);
+                const header_on_receive: u64 = if (slot.local_initiated) 0 else slot.header_length;
+                if (reset_info.final_size < header_on_receive) {
+                    self.terminateWebTransport(slot.session, wt_constants.wt_flow_control_error, error.WebTransportFlowControlError);
+                    return;
+                }
+                const final_body_size = reset_info.final_size - header_on_receive;
+                if (slot.session.wt_flow_control_enabled and final_body_size > slot.receive_body_accounted) {
+                    slot.session.wt_receive_flow.receiveData(final_body_size - slot.receive_body_accounted) catch {
+                        self.terminateWebTransport(slot.session, wt_constants.wt_flow_control_error, error.WebTransportFlowControlError);
+                        return;
+                    };
+                    slot.receive_body_accounted = final_body_size;
+                }
+                if (slot.handle) |handle| handle.reset_code.store(reset_info.application_error, .release);
+                slot.receive_finished = true;
+                if (slot.input) |input| input.fail(mapWebTransportReset(reset_info.application_error));
+                self.collectWebTransportStreams();
+                return;
+            }
             if (self.findRequest(id)) |slot| {
                 if (!slot.tunnel) return self.failRequest(slot, .request_cancelled, error.PeerReset);
                 slot.input_direction_failed = true;
                 slot.receive_finished = true;
-                if (slot.input) |input| input.fail(error.PeerReset);
+                if (slot.webtransport_established) self.remoteTerminateWebTransport(slot, 0, "", error.PeerReset) else if (slot.input) |input| input.fail(error.PeerReset);
             }
         }
 
-        fn stopped(self: *Self, id: StreamId) void {
+        fn stopped(self: *Self, id: StreamId, code: u64) void {
+            if (self.findWebTransportStream(id)) |slot| {
+                if (slot.handle) |handle| handle.stop_code.store(code, .release);
+                if (slot.pending_open != null) slot.completePendingOpen(error.PeerStopped);
+                slot.send_finished = true;
+                if (slot.output) |output| output.abort(error.PeerStopped);
+                self.collectWebTransportStreams();
+                return;
+            }
             if (id.value == self.local_control.value or id.value == self.local_encoder.value or id.value == self.local_decoder.value) {
                 self.closeFor(error.ClosedCriticalStream, 0);
                 return;
@@ -690,7 +1114,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 slot.output_direction_failed = true;
                 slot.output_done = true;
                 slot.output_acked = true;
-                if (slot.output) |output| output.abort(error.PeerStopped);
+                if (slot.webtransport_established) self.remoteTerminateWebTransport(slot, 0, "", error.PeerStopped) else if (slot.output) |output| output.abort(error.PeerStopped);
                 slot.notifyCompletion(.{ .failure = error.PeerStopped });
             }
         }
@@ -713,10 +1137,525 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             return total;
         }
 
+        fn returnWebTransportCredits(self: *Self) !usize {
+            var total: usize = 0;
+            for (&self.webtransport_streams) |*slot| {
+                if (!slot.occupied or !slot.associated) continue;
+                const amount = slot.consumed_credit.swap(0, .acquire);
+                if (amount == 0) continue;
+                if (amount > slot.payload_staged) return error.ConsumeBeyondReadable;
+                try self.connection.consumeStream(slot.id, amount);
+                slot.payload_staged -= amount;
+                total += amount;
+                if (slot.payload_staged == 0) {
+                    try self.processWebTransportBytes(slot);
+                    try self.finishWebTransportInput(slot);
+                }
+            }
+            return total;
+        }
+
+        fn classifyBidirectional(self: *Self, request_slot: *RequestSlot) !?bool {
+            if (request_slot.frame_len != 0 or request_slot.wire != null or request_slot.head != null) return false;
+            const bytes = try self.connection.streamReadable(request_slot.id);
+            if (bytes.len == 0) return null;
+            const marker = varint.decode(bytes) catch return null;
+            if (marker.value != wt_constants.bidirectional_stream_signal) return false;
+            if (!self.peer_settings_received) return null;
+            const id = request_slot.id;
+            request_slot.* = .{};
+            if (!webtransport_policy.requirementsMet(self.connection, self.peer_wt_enabled, self.peer_h3_datagram)) {
+                try self.rejectBufferedWebTransportStream(id, .bidirectional);
+                return true;
+            }
+            try self.adoptWebTransportStream(id, .bidirectional);
+            return true;
+        }
+
+        fn adoptWebTransportStream(self: *Self, id: StreamId, direction: wt_flow.Direction) !void {
+            const slot = self.freeWebTransportStream() orelse {
+                try self.rejectBufferedWebTransportStream(id, direction);
+                return;
+            };
+            const generation = slot.generation +% 1;
+            slot.* = .{
+                .owner = self,
+                .occupied = true,
+                .generation = generation,
+                .id = id,
+                .direction = direction,
+                .parser = wt_stream.Parser.init(switch (direction) {
+                    .unidirectional => .unidirectional,
+                    .bidirectional => .bidirectional,
+                }),
+            };
+            try self.processWebTransportHeader(slot);
+        }
+
+        fn processWebTransportHeader(self: *Self, slot: *WebTransportStreamSlot) anyerror!void {
+            if (slot.parser.isComplete()) return;
+            const bytes = try self.connection.streamReadable(slot.id);
+            if (bytes.len == 0) return;
+            const progress = slot.parser.feed(bytes) catch |err| switch (err) {
+                error.InvalidSessionId => return error.InvalidSessionId,
+                error.UnexpectedStreamMarker => return error.UnexpectedWebTransportStreamSignal,
+            };
+            if (progress.consumed != 0) {
+                try self.connection.consumeStream(slot.id, progress.consumed);
+                slot.header_length += progress.consumed;
+            }
+            const session_id = progress.session_id orelse return;
+            slot.session_id = session_id;
+            if (self.findRequestValue(session_id)) |session_slot| {
+                if (!session_slot.webtransport_candidate or session_slot.webtransport_closed.load(.acquire)) return self.rejectAssociatedWebTransportStream(slot, wt_constants.wt_session_gone);
+                try self.associateWebTransportStream(slot, session_slot);
+            } else if (self.isWebTransportTombstone(session_id)) {
+                try self.rejectAssociatedWebTransportStream(slot, wt_constants.wt_session_gone);
+            } else if (self.webtransport_tombstones_saturated) {
+                try self.rejectAssociatedWebTransportStream(slot, wt_constants.wt_buffered_stream_rejected);
+            }
+        }
+
+        fn preparePendingWebTransportStreams(self: *Self, session_slot: *RequestSlot) !void {
+            for (&self.webtransport_streams) |*stream_slot| {
+                if (!stream_slot.occupied or stream_slot.prepared or stream_slot.session_id != session_slot.id.value) continue;
+                self.prepareWebTransportStream(stream_slot, session_slot) catch |err| switch (err) {
+                    error.WebTransportStreamCapacity => try self.rejectAssociatedWebTransportStream(stream_slot, wt_constants.wt_buffered_stream_rejected),
+                    else => return err,
+                };
+            }
+        }
+
+        fn prepareWebTransportStream(self: *Self, slot: *WebTransportStreamSlot, session_slot: *RequestSlot) !void {
+            if (slot.prepared) return;
+            if (self.webTransportSessionStreamCount(session_slot) >= webtransport_stream_quota) return error.WebTransportStreamCapacity;
+            if (session_slot.wt_flow_control_enabled) try session_slot.wt_receive_flow.receiveStream(slot.direction);
+            slot.session = session_slot;
+            slot.prepared = true;
+            slot.associated = true;
+            try self.initializeWebTransportPipes(slot, true);
+        }
+
+        fn associatePendingWebTransportStreams(self: *Self, session_slot: *RequestSlot) !void {
+            for (&self.webtransport_streams) |*stream_slot| {
+                if (!stream_slot.occupied or stream_slot.session_id != session_slot.id.value or stream_slot.delivered) continue;
+                try self.associateWebTransportStream(stream_slot, session_slot);
+            }
+        }
+
+        fn associateWebTransportStream(self: *Self, slot: *WebTransportStreamSlot, session_slot: *RequestSlot) anyerror!void {
+            if (!slot.prepared) {
+                if (!session_slot.webtransport_admitted) return;
+                self.prepareWebTransportStream(slot, session_slot) catch |err| switch (err) {
+                    error.WebTransportStreamCapacity => {
+                        try self.rejectAssociatedWebTransportStream(slot, wt_constants.wt_buffered_stream_rejected);
+                        return;
+                    },
+                    else => {
+                        self.terminateWebTransport(session_slot, wt_constants.wt_flow_control_error, error.WebTransportFlowControlError);
+                        return;
+                    },
+                };
+            }
+            if (!session_slot.webtransport_established or slot.delivered) return;
+            const queue = switch (slot.direction) {
+                .unidirectional => &session_slot.wt_accept_uni,
+                .bidirectional => &session_slot.wt_accept_bidi,
+            };
+            const added = try queue.put(self.io, &.{slot.public_stream}, 0);
+            if (added == 0) {
+                try self.rejectAssociatedWebTransportStream(slot, wt_constants.wt_buffered_stream_rejected);
+                return;
+            }
+            slot.delivered = true;
+            try self.processWebTransportBytes(slot);
+            try self.finishWebTransportInput(slot);
+        }
+
+        fn initializeWebTransportPipes(self: *Self, slot: *WebTransportStreamSlot, incoming: bool) !void {
+            const allocator = slot.session.arena.?.allocator();
+            const can_receive = incoming or slot.direction == .bidirectional;
+            const can_send = !incoming or slot.direction == .bidirectional;
+            slot.receive_finished = !can_receive;
+            slot.send_finished = !can_send;
+            var reader: ?*Io.Reader = null;
+            var writer: ?*Io.Writer = null;
+            if (can_receive) {
+                const storage = try allocator.alloc(u8, config.request_body_buffer_size);
+                const input = try allocator.create(inbound_body.Pipe);
+                input.* = try .init(self.io, storage, .{ .context = slot, .consumed_fn = WebTransportStreamSlot.credit });
+                slot.input = input;
+                reader = try input.activate(allocator);
+            }
+            if (can_send) {
+                const ring = try allocator.alloc(u8, config.response_body_buffer_size);
+                const writer_storage = try allocator.alloc(u8, config.response_writer_buffer_size);
+                const output = try allocator.create(outbound_body.Pipe);
+                output.* = try .init(self.io, ring, writer_storage, .{ .context = slot, .notify_fn = WebTransportStreamSlot.outputReady });
+                slot.output = output;
+                writer = &output.writer;
+            }
+            const handle = try allocator.create(WebTransportStreamHandle);
+            handle.* = .{ .slot = slot, .generation = slot.generation };
+            slot.handle = handle;
+            slot.public_stream = .{
+                .context = handle,
+                .stream_id = slot.id.value,
+                .direction = switch (slot.direction) {
+                    .unidirectional => .unidirectional,
+                    .bidirectional => .bidirectional,
+                },
+                .reader = reader,
+                .writer = writer,
+                .finish_fn = if (can_send) WebTransportStreamHandle.finish else null,
+                .reset_fn = if (can_send) WebTransportStreamHandle.reset else null,
+                .stop_fn = if (can_receive) WebTransportStreamHandle.stop else null,
+                .reset_info_fn = WebTransportStreamHandle.resetInfo,
+                .stop_info_fn = WebTransportStreamHandle.stopInfo,
+            };
+        }
+
+        fn processWebTransportBytes(self: *Self, slot: *WebTransportStreamSlot) anyerror!void {
+            if (!slot.parser.isComplete()) {
+                try self.processWebTransportHeader(slot);
+                if (!slot.parser.isComplete() or !slot.associated) return;
+            }
+            if (!slot.associated or !slot.session.webtransport_established or slot.receive_finished or slot.payload_staged != 0) return;
+            const input = slot.input orelse return;
+            const bytes = try self.connection.streamReadable(slot.id);
+            if (bytes.len == 0) return;
+            const amount = @min(bytes.len, input.writableLen());
+            if (amount == 0) return;
+            if (slot.session.wt_flow_control_enabled) {
+                slot.session.wt_receive_flow.receiveData(amount) catch {
+                    self.terminateWebTransport(slot.session, wt_constants.wt_flow_control_error, error.WebTransportFlowControlError);
+                    return;
+                };
+                slot.receive_body_accounted += amount;
+            }
+            try input.push(bytes[0..amount]);
+            slot.payload_staged = amount;
+        }
+
+        fn finishWebTransportInput(_: *Self, slot: *WebTransportStreamSlot) !void {
+            if (!slot.associated or !slot.fin_observed or slot.receive_finished or slot.payload_staged != 0) return;
+            if (!slot.parser.isComplete()) return error.Truncated;
+            slot.receive_finished = true;
+            if (slot.input) |input| input.finish();
+        }
+
+        fn flushWebTransportStreams(self: *Self) !usize {
+            var total: usize = 0;
+            var budget = config.output_batch_size;
+            var idle_sessions: usize = 0;
+            while (budget != 0 and idle_sessions < self.requests.len) {
+                const session_index = self.webtransport_session_cursor;
+                self.webtransport_session_cursor = (self.webtransport_session_cursor + 1) % self.requests.len;
+                const session_slot = &self.requests[session_index];
+                if (!session_slot.occupied or !session_slot.webtransport_established or session_slot.webtransport_closed.load(.acquire)) {
+                    idle_sessions += 1;
+                    continue;
+                }
+                const result = try self.flushOneWebTransportStream(session_slot);
+                if (!result.action) {
+                    idle_sessions += 1;
+                    continue;
+                }
+                idle_sessions = 0;
+                budget -= 1;
+                total += result.amount;
+            }
+            self.collectWebTransportStreams();
+            return total;
+        }
+
+        fn flushOneWebTransportStream(self: *Self, session_slot: *RequestSlot) !WebTransportFlush {
+            var visited: usize = 0;
+            while (visited < self.webtransport_streams.len) : (visited += 1) {
+                const index = (session_slot.wt_stream_cursor + visited) % self.webtransport_streams.len;
+                const slot = &self.webtransport_streams[index];
+                if (!slot.occupied or !slot.associated or slot.session != session_slot or slot.send_finished) continue;
+                if (slot.local_initiated and slot.header_sent < slot.header_length) {
+                    const written = try self.tryWrite(slot.id, slot.header[slot.header_sent..slot.header_length]);
+                    if (written == 0) continue;
+                    slot.header_sent += written;
+                    session_slot.wt_stream_cursor = (index + 1) % self.webtransport_streams.len;
+                    if (slot.header_sent == slot.header_length) if (slot.pending_open) |operation| {
+                        operation.result_stream = slot.public_stream;
+                        slot.pending_open = null;
+                        operation.done.set(self.io);
+                    };
+                    return .{ .amount = written, .action = true };
+                }
+                const output = slot.output orelse continue;
+                if (output.failure()) |err| {
+                    slot.completePendingOpen(err);
+                    slot.send_finished = true;
+                    session_slot.wt_stream_cursor = (index + 1) % self.webtransport_streams.len;
+                    return .{ .action = true };
+                }
+                const bytes = output.peek(config.max_frame_size);
+                if (bytes.len != 0) {
+                    const amount = if (session_slot.wt_flow_control_enabled) blk: {
+                        const allowance = session_slot.wt_send_flow.dataAllowance();
+                        if (allowance == 0) continue;
+                        break :blk @min(bytes.len, std.math.cast(usize, allowance) orelse bytes.len);
+                    } else bytes.len;
+                    const written = try self.tryWrite(slot.id, bytes[0..amount]);
+                    if (written == 0) continue;
+                    if (session_slot.wt_flow_control_enabled) try session_slot.wt_send_flow.sendData(written);
+                    output.consume(written);
+                    session_slot.wt_stream_cursor = (index + 1) % self.webtransport_streams.len;
+                    return .{ .amount = written, .action = true };
+                }
+                if (output.isFinished()) {
+                    try self.connection.finishStream(slot.id);
+                    slot.send_finished = true;
+                    session_slot.wt_stream_cursor = (index + 1) % self.webtransport_streams.len;
+                    return .{ .action = true };
+                }
+            }
+            return .{};
+        }
+
+        fn processWebTransportOperation(self: *Self, operation: *WebTransportOperation) !bool {
+            switch (operation.kind) {
+                .open_uni, .open_bidi => {
+                    const session_slot = self.sessionForOperation(operation) orelse return error.WebTransportSessionClosed;
+                    return self.beginOpenWebTransportStream(session_slot, if (operation.kind == .open_uni) .unidirectional else .bidirectional, operation);
+                },
+                .finish => {
+                    _ = try self.streamForOperation(operation);
+                },
+                .reset => {
+                    const slot = try self.streamForOperation(operation);
+                    try self.resetWebTransportSend(slot, wt_error_codes.toHttp(operation.application_error));
+                    slot.send_finished = true;
+                    if (slot.output) |output| output.abort(error.StreamReset);
+                    self.collectWebTransportStreams();
+                },
+                .stop => {
+                    const slot = try self.streamForOperation(operation);
+                    try self.connection.stopSending(slot.id, wt_error_codes.toHttp(operation.application_error));
+                    slot.receive_finished = true;
+                    if (slot.input) |input| input.fail(error.StreamStopped);
+                    self.collectWebTransportStreams();
+                },
+                .close => {
+                    const session_slot = self.sessionForOperation(operation) orelse return error.WebTransportSessionClosed;
+                    _ = self.recordWebTransportClose(session_slot, operation.application_error, operation.message);
+                    try session_slot.output.?.finish();
+                    self.closeWebTransportStreams(session_slot, error.WebTransportSessionClosed);
+                },
+                .drain => {
+                    const session_slot = self.sessionForOperation(operation) orelse return error.WebTransportSessionClosed;
+                    session_slot.webtransport_draining.store(true, .release);
+                },
+                .exporter => {
+                    const session_slot = self.sessionForOperation(operation) orelse return error.WebTransportSessionClosed;
+                    try webtransport_policy.exportKeyingMaterial(self.connection, session_slot.id.value, operation.label, operation.exporter_context, operation.exporter_output);
+                },
+            }
+            return true;
+        }
+
+        fn streamForOperation(_: *Self, operation: *WebTransportOperation) !*WebTransportStreamSlot {
+            const slot = operation.stream orelse return error.UnknownWebTransportStream;
+            if (!slot.occupied or slot.generation != operation.expected_generation) return error.StaleWebTransportStream;
+            return slot;
+        }
+
+        fn sessionForOperation(_: *Self, operation: *WebTransportOperation) ?*RequestSlot {
+            const slot = operation.session orelse return null;
+            if (!slot.occupied or !slot.webtransport_established or slot.webtransport_closed.load(.acquire)) return null;
+            return slot;
+        }
+
+        fn beginOpenWebTransportStream(self: *Self, session_slot: *RequestSlot, direction: wt_flow.Direction, operation: *WebTransportOperation) !bool {
+            if (session_slot.webtransport_closed.load(.acquire)) return error.WebTransportSessionClosed;
+            if (session_slot.wt_flow_control_enabled and session_slot.wt_send_flow.streamAllowance(direction) == 0) return error.StreamsBlocked;
+            if (self.webTransportSessionStreamCount(session_slot) >= webtransport_stream_quota) return error.WebTransportStreamCapacity;
+            const slot = self.freeWebTransportStream() orelse return error.WebTransportStreamCapacity;
+            const id = switch (direction) {
+                .unidirectional => try self.connection.openUnidirectionalStream(),
+                .bidirectional => try self.connection.openBidirectionalStream(),
+            };
+            const generation = slot.generation +% 1;
+            slot.* = .{
+                .owner = self,
+                .session = session_slot,
+                .occupied = true,
+                .prepared = true,
+                .associated = true,
+                .delivered = true,
+                .local_initiated = true,
+                .generation = generation,
+                .session_id = session_slot.id.value,
+                .id = id,
+                .direction = direction,
+                .parser = wt_stream.Parser.init(switch (direction) {
+                    .unidirectional => .unidirectional,
+                    .bidirectional => .bidirectional,
+                }),
+            };
+            slot.header_length = wt_stream.write(&slot.header, switch (direction) {
+                .unidirectional => .unidirectional,
+                .bidirectional => .bidirectional,
+            }, session_slot.id.value) catch |err| {
+                self.connection.resetStream(id, wt_constants.wt_session_gone) catch {};
+                slot.recycle();
+                return err;
+            };
+            self.initializeWebTransportPipes(slot, false) catch |err| {
+                self.connection.resetStream(id, wt_constants.wt_session_gone) catch {};
+                slot.recycle();
+                return err;
+            };
+            if (session_slot.wt_flow_control_enabled) session_slot.wt_send_flow.openStream(direction) catch unreachable;
+            errdefer {
+                self.connection.resetStream(id, wt_constants.wt_session_gone) catch {};
+                slot.recycle();
+            }
+            const written = try self.tryWrite(id, slot.header[0..slot.header_length]);
+            slot.header_sent = written;
+            if (written == slot.header_length) {
+                operation.result_stream = slot.public_stream;
+                return true;
+            }
+            slot.pending_open = operation;
+            return false;
+        }
+
+        fn admitWebTransport(self: *Self, slot: *RequestSlot) !void {
+            if (slot.webtransport_admitted) return;
+            var admitted: usize = 0;
+            for (self.requests) |candidate| if (candidate.occupied and candidate.webtransport_admitted and !candidate.webtransport_closed.load(.acquire)) {
+                admitted += 1;
+            };
+            const local_flow = config.webtransportFlowControlEnabled();
+            const peer_flow = self.peer_wt_initial_max_streams_uni != 0 or self.peer_wt_initial_max_streams_bidi != 0 or self.peer_wt_initial_max_data != 0;
+            const flow_control_enabled = local_flow and peer_flow;
+            if (admitted >= effective_webtransport_session_limit or (admitted != 0 and !flow_control_enabled))
+                return error.WebTransportSessionLimit;
+            slot.wt_accept_uni = .init(&slot.wt_accept_uni_storage);
+            slot.wt_accept_bidi = .init(&slot.wt_accept_bidi_storage);
+            slot.wt_flow_control_enabled = flow_control_enabled;
+            slot.wt_send_flow = try .init(self.peer_wt_initial_max_data, self.peer_wt_initial_max_streams_uni, self.peer_wt_initial_max_streams_bidi);
+            slot.wt_receive_flow = try .init(config.webtransport_initial_max_data, config.webtransport_initial_max_streams_uni, config.webtransport_initial_max_streams_bidi);
+            slot.webtransport_session = .{
+                .context = slot,
+                .session_id = slot.id.value,
+                .protocol = slot.webtransport_protocol,
+                .datagrams = &slot.datagram_channel,
+                .accept_uni_fn = RequestSlot.acceptUni,
+                .accept_bidi_fn = RequestSlot.acceptBidi,
+                .open_uni_fn = RequestSlot.openUni,
+                .open_bidi_fn = RequestSlot.openBidi,
+                .close_fn = RequestSlot.closeWebTransport,
+                .drain_fn = RequestSlot.drainWebTransport,
+                .exporter_fn = RequestSlot.exportWebTransport,
+                .close_info_fn = RequestSlot.webTransportCloseInfo,
+                .draining_fn = RequestSlot.webTransportDraining,
+            };
+            slot.webtransport_admitted = true;
+            try self.preparePendingWebTransportStreams(slot);
+        }
+
+        fn establishWebTransport(self: *Self, slot: *RequestSlot) !void {
+            if (slot.webtransport_established) return;
+            if (!slot.webtransport_admitted) return error.WebTransportNotAdmitted;
+            slot.webtransport_established = true;
+            try self.associatePendingWebTransportStreams(slot);
+            self.deliverPendingWebTransportDatagrams(slot);
+            try self.processRequestBytes(slot, 0);
+        }
+
+        fn recordWebTransportClose(self: *Self, slot: *RequestSlot, code: u32, message: []const u8) bool {
+            if (slot.webtransport_closed.load(.acquire)) return false;
+            const amount = @min(message.len, slot.webtransport_close_message.len);
+            @memcpy(slot.webtransport_close_message[0..amount], message[0..amount]);
+            slot.webtransport_close_message_len = amount;
+            slot.webtransport_close_code = code;
+            slot.webtransport_closed.store(true, .release);
+            slot.wt_accept_uni.close(slot.owner.io);
+            slot.wt_accept_bidi.close(slot.owner.io);
+            slot.datagrams.finishIncoming();
+            slot.datagrams.finishOutgoing();
+            self.addWebTransportTombstone(slot.id.value);
+            self.discardPendingWebTransportDatagrams(slot.id.value);
+            self.rejectPendingWebTransportStreams(slot.id.value, wt_constants.wt_session_gone);
+            return true;
+        }
+
+        fn remoteTerminateWebTransport(self: *Self, slot: *RequestSlot, code: u32, message: []const u8, cause: anyerror) void {
+            if (!self.recordWebTransportClose(slot, code, message)) return;
+            self.closeWebTransportStreams(slot, cause);
+            if (slot.output) |output| output.finish() catch {
+                self.connection.resetStream(slot.id, wt_constants.wt_session_gone) catch {};
+            } else self.connection.resetStream(slot.id, wt_constants.wt_session_gone) catch {};
+            self.connection.stopSending(slot.id, wt_constants.wt_session_gone) catch {};
+        }
+
+        fn terminateWebTransport(self: *Self, slot: *RequestSlot, code: u64, cause: anyerror) void {
+            if (!self.recordWebTransportClose(slot, 0, "")) return;
+            self.connection.resetStream(slot.id, code) catch {};
+            self.connection.stopSending(slot.id, code) catch {};
+            self.closeWebTransportStreams(slot, cause);
+        }
+
+        fn resetWebTransportSend(self: *Self, slot: *WebTransportStreamSlot, code: u64) !void {
+            if (slot.local_initiated) {
+                if (slot.header_sent != slot.header_length) return error.WebTransportHeaderPending;
+                return self.connection.resetStreamAt(slot.id, code, slot.header_length);
+            }
+            return self.connection.resetStream(slot.id, code);
+        }
+
+        fn closeWebTransportStreams(self: *Self, session_slot: *RequestSlot, cause: anyerror) void {
+            for (&self.webtransport_streams) |*slot| {
+                if (!slot.occupied or !slot.associated or slot.session != session_slot) continue;
+                slot.fail(cause);
+                slot.completePendingOpen(cause);
+                if (!slot.send_finished) self.resetWebTransportSend(slot, wt_constants.wt_session_gone) catch {
+                    self.connection.resetStream(slot.id, wt_constants.wt_session_gone) catch {};
+                };
+                if (!slot.receive_finished) self.connection.stopSending(slot.id, wt_constants.wt_session_gone) catch {};
+                slot.send_finished = true;
+                slot.receive_finished = true;
+            }
+            self.collectWebTransportStreams();
+        }
+
+        fn rejectBufferedWebTransportStream(self: *Self, id: StreamId, direction: wt_flow.Direction) !void {
+            if (direction == .bidirectional) try self.connection.resetStream(id, wt_constants.wt_buffered_stream_rejected);
+            try self.connection.stopSending(id, wt_constants.wt_buffered_stream_rejected);
+        }
+
+        fn rejectAssociatedWebTransportStream(self: *Self, slot: *WebTransportStreamSlot, code: u64) !void {
+            if (slot.id.direction() == .bidirectional) try self.resetWebTransportSend(slot, code);
+            try self.connection.stopSending(slot.id, code);
+            slot.send_finished = true;
+            slot.receive_finished = true;
+            slot.clear();
+        }
+
+        fn collectWebTransportStreams(self: *Self) void {
+            for (&self.webtransport_streams) |*slot| {
+                if (!slot.occupied or !slot.send_finished or !slot.receive_finished) continue;
+                slot.recycle();
+            }
+        }
+
+        fn mapWebTransportReset(code: u64) anyerror {
+            _ = wt_error_codes.fromHttp(code) catch return error.WebTransportProtocolReset;
+            return error.WebTransportApplicationReset;
+        }
+
         fn startResponse(self: *Self, slot: *RequestSlot) !void {
             if (!slot.occupied or slot.response == null) return;
             const response = &slot.response.?;
             try validateTakeover(slot.request.?.method, response.*);
+            if (slot.webtransport_candidate and response.status.class() == .success) try self.admitWebTransport(slot);
             const maximum: u32 = @intCast(@min(self.peer_max_field_section_size, std.math.maxInt(u32)));
             const plan = try response_semantics.plan(slot.request.?.method, response.*, maximum);
             if (response.body == .stream) try trailer_policy.validateNames(response.body.stream.trailer_names, config.max_response_trailer_count, config.max_response_trailer_size);
@@ -743,6 +1682,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 if (!slot.response_headers_sent) continue;
                 if (slot.tunnel and !slot.handshake_complete) {
                     slot.handshake_complete = true;
+                    if (slot.webtransport_candidate) try self.establishWebTransport(slot);
                     slot.response_started.set(self.io);
                 }
                 if (slot.tunnel) {
@@ -885,6 +1825,15 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         fn failRequest(self: *Self, slot: *RequestSlot, code: errors.Code, err: anyerror) void {
             if (!slot.occupied) return;
+            if (slot.webtransport_candidate) {
+                if (slot.webtransport_admitted) {
+                    if (self.recordWebTransportClose(slot, 0, "")) self.closeWebTransportStreams(slot, err);
+                } else {
+                    self.addWebTransportTombstone(slot.id.value);
+                    self.discardPendingWebTransportDatagrams(slot.id.value);
+                    self.rejectPendingWebTransportStreams(slot.id.value, wt_constants.wt_session_gone);
+                }
+            }
             slot.datagrams.fail(err);
             if (slot.input) |input| input.fail(err);
             if (slot.output) |output| output.abort(err);
@@ -952,9 +1901,17 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             };
             exchange.beginFinal();
             try validateTakeover(slot.request.?.method, response);
+            if (slot.webtransport_candidate) {
+                if (response.status.class() == .success) {
+                    if (response.takeover == null or !response.takeover.?.is_webtransport) return error.WebTransportTakeoverRequired;
+                    slot.webtransport_protocol = try webtransport_policy.negotiatedProtocol(allocator, slot.head.?.headers, response);
+                } else if (response.takeover != null) return error.WebTransportTakeoverOnRejectedResponse;
+            } else if (response.takeover) |takeover| {
+                if (takeover.is_webtransport) return error.WebTransportTakeoverRequiresWebTransportRequest;
+            }
             if (response.takeover != null) slot.tunnel = true;
             if (config.enable_datagrams and slot.tunnel and response.takeover.?.accepts_datagrams and
-                slot.capsule_requested and capsuleProtocolEnabled(response.headers))
+                slot.capsule_requested and (slot.webtransport_candidate or capsuleProtocolEnabled(response.headers)))
             {
                 try validateCapsuleMessages(slot.head.?.headers, response);
                 slot.datagram_active = true;
@@ -985,9 +1942,21 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             try self.messages.putOne(self.io, .{ .response_ready = slot });
             try slot.response_started.wait(self.io);
             if (slot.output_done) return;
-            if (slot.tunnel) return self.runTunnel(slot, allocator);
+            if (slot.tunnel) {
+                if (slot.webtransport_candidate) return self.runWebTransport(slot);
+                return self.runTunnel(slot, allocator);
+            }
             if (slot.suppress_response_body or response.body != .stream) return;
             try self.runProducer(slot, allocator);
+        }
+
+        fn runWebTransport(_: *Self, slot: *RequestSlot) !void {
+            defer slot.datagrams.finishOutgoing();
+            var takeover = &slot.response.?.takeover.?;
+            takeover.runWebTransport(&slot.webtransport_session) catch |err| {
+                if (!slot.webtransport_closed.load(.acquire)) return err;
+            };
+            if (!slot.webtransport_closed.load(.acquire)) try slot.webtransport_session.close(0, "");
         }
 
         fn runTunnel(_: *Self, slot: *RequestSlot, allocator: std.mem.Allocator) !void {
@@ -1163,19 +2132,19 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 return 0;
             }
             var count: usize = 0;
+            if (self.peer_settings_received) {
+                for (&self.pending_pre_settings_datagrams) |*entry| {
+                    if (!entry.occupied) continue;
+                    entry.occupied = false;
+                    try self.processIncomingDatagram(entry.payload[0..entry.length]);
+                    count += 1;
+                }
+            }
             while (self.connection.nextDatagram()) |wire| {
-                if (!self.peer_settings_received or !self.peer_h3_datagram) return error.H3DatagramNotNegotiated;
-                const parsed = capsule.datagram.parseHttp3(wire) catch return error.MalformedHttpDatagram;
-                const stream_id_value = try parsed.streamId();
-                if (self.findRequestValue(stream_id_value)) |slot| {
-                    if (!slot.receive_finished) {
-                        if (!slot.datagram_active) {
-                            self.failRequest(slot, .h3_datagram_error, error.H3DatagramNotNegotiated);
-                        } else slot.datagrams.deliver(parsed.payload) catch |err| switch (err) {
-                            error.DatagramQueueFull, error.DatagramTooLarge, error.DatagramChannelClosed => {},
-                            else => return err,
-                        };
-                    }
+                if (!self.peer_settings_received) {
+                    self.bufferPreSettingsDatagram(wire);
+                } else {
+                    try self.processIncomingDatagram(wire);
                 }
                 try self.connection.consumeDatagram();
                 count += 1;
@@ -1183,35 +2152,65 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             return count;
         }
 
+        fn processIncomingDatagram(self: *Self, wire: []const u8) !void {
+            if (!self.peer_h3_datagram) return error.H3DatagramNotNegotiated;
+            const parsed = capsule.datagram.parseHttp3(wire) catch return error.MalformedHttpDatagram;
+            const stream_id_value = try parsed.streamId();
+            if (self.findRequestValue(stream_id_value)) |slot| {
+                if (!slot.receive_finished) {
+                    if (!slot.datagram_active and !slot.webtransport_candidate) {
+                        self.failRequest(slot, .h3_datagram_error, error.H3DatagramNotNegotiated);
+                    } else slot.datagrams.deliver(parsed.payload) catch |err| switch (err) {
+                        error.DatagramQueueFull, error.DatagramTooLarge, error.DatagramChannelClosed => {},
+                        else => return err,
+                    };
+                }
+            } else if (!self.isWebTransportTombstone(stream_id_value) and !self.webtransport_tombstones_saturated) {
+                self.bufferPendingWebTransportDatagram(stream_id_value, parsed.payload);
+            }
+        }
+
+        fn bufferPreSettingsDatagram(self: *Self, wire: []const u8) void {
+            if (wire.len > datagram_payload_size + 8) return;
+            for (&self.pending_pre_settings_datagrams) |*entry| if (!entry.occupied) {
+                entry.* = .{ .occupied = true, .length = wire.len };
+                @memcpy(entry.payload[0..wire.len], wire);
+                return;
+            };
+        }
+
         fn flushOutgoingDatagrams(self: *Self) !usize {
             if (comptime !config.enable_datagrams) return 0;
             var count: usize = 0;
-            for (&self.requests) |*slot| {
+            var visited: usize = 0;
+            while (visited < self.requests.len and count < config.output_batch_size) : (visited += 1) {
+                const index = (self.webtransport_datagram_cursor + visited) % self.requests.len;
+                const slot = &self.requests[index];
                 if (!slot.occupied or !slot.datagram_active or slot.datagram_mode != .quic) continue;
-                while (slot.datagrams.outgoing.peek()) |payload| {
-                    var encoded: [config.datagram_max_payload + 8]u8 = undefined;
-                    const length = try capsule.datagram.encodeHttp3(&encoded, .{
-                        .quarter_stream_id = slot.id.value / 4,
-                        .payload = payload,
-                    });
-                    self.connection.enqueueDatagram(encoded[0..length]) catch |err| switch (err) {
-                        error.DatagramQueueFull => break,
-                        error.DatagramDisabled, error.DatagramNotNegotiated, error.DatagramTooLarge => {
-                            try slot.datagrams.outgoing.consume();
-                            slot.datagrams.fail(err);
-                            self.failRequest(slot, .h3_datagram_error, err);
-                            break;
-                        },
-                        else => return err,
-                    };
-                    try slot.datagrams.outgoing.consume();
-                    count += 1;
-                }
+                const payload = slot.datagrams.outgoing.peek() orelse continue;
+                var encoded: [config.datagram_max_payload + 8]u8 = undefined;
+                const length = try capsule.datagram.encodeHttp3(&encoded, .{
+                    .quarter_stream_id = slot.id.value / 4,
+                    .payload = payload,
+                });
+                self.connection.enqueueDatagram(encoded[0..length]) catch |err| switch (err) {
+                    error.DatagramQueueFull => break,
+                    error.DatagramDisabled, error.DatagramNotNegotiated, error.DatagramTooLarge => {
+                        try slot.datagrams.outgoing.consume();
+                        slot.datagrams.fail(err);
+                        self.failRequest(slot, .h3_datagram_error, err);
+                        continue;
+                    },
+                    else => return err,
+                };
+                try slot.datagrams.outgoing.consume();
+                count += 1;
             }
+            if (self.requests.len != 0) self.webtransport_datagram_cursor = (self.webtransport_datagram_cursor + visited) % self.requests.len;
             return count;
         }
 
-        fn processCapsuleBytes(_: *Self, slot: *RequestSlot, bytes: []const u8) !void {
+        fn processCapsuleBytes(self: *Self, slot: *RequestSlot, bytes: []const u8) !void {
             var cursor: usize = 0;
             while (cursor < bytes.len) {
                 const progress = try slot.capsule_parser.feed(bytes[cursor..]);
@@ -1221,32 +2220,134 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     .begin => |header| {
                         slot.capsule_type = header.capsule_type;
                         slot.capsule_payload_len = 0;
-                        slot.capsule_discard = header.capsule_type == .datagram and header.length > config.datagram_max_payload;
-                        if (slot.capsule_discard) slot.datagrams.dropIncoming();
-                        if (header.capsule_type == .datagram and !slot.capsule_discard) {
-                            if (header.length == 0) slot.datagrams.deliver("") catch |err| switch (err) {
+                        const payload_limit: u64 = if (slot.webtransport_candidate) wt_capsule_payload_size else config.datagram_max_payload;
+                        if (slot.webtransport_candidate and isKnownWebTransportCapsule(header.capsule_type) and header.length > payload_limit) return error.MalformedCapsule;
+                        slot.capsule_discard = header.length > payload_limit;
+                        if (slot.capsule_discard and header.capsule_type == .datagram) slot.datagrams.dropIncoming();
+                        if (!slot.capsule_discard and header.length == 0) {
+                            if (slot.webtransport_candidate) {
+                                try self.processCompleteWebTransportCapsule(slot, header.capsule_type, "");
+                            } else if (header.capsule_type == .datagram) slot.datagrams.deliver("") catch |err| switch (err) {
                                 error.DatagramQueueFull, error.DatagramChannelClosed => {},
                                 else => return err,
                             };
                         }
                     },
                     .data => |data| {
-                        if (slot.capsule_type != .datagram or slot.capsule_discard) continue;
+                        if (slot.capsule_discard) continue;
+                        if (!slot.webtransport_candidate and slot.capsule_type != .datagram) continue;
                         if (data.bytes.len > slot.capsule_payload.len - slot.capsule_payload_len) return error.DatagramTooLarge;
                         @memcpy(slot.capsule_payload[slot.capsule_payload_len..][0..data.bytes.len], data.bytes);
                         slot.capsule_payload_len += data.bytes.len;
-                        if (data.final) slot.datagrams.deliver(slot.capsule_payload[0..slot.capsule_payload_len]) catch |err| switch (err) {
-                            error.DatagramQueueFull, error.DatagramChannelClosed => {},
-                            else => return err,
-                        };
+                        if (data.final) {
+                            if (slot.webtransport_candidate) {
+                                try self.processCompleteWebTransportCapsule(slot, slot.capsule_type, slot.capsule_payload[0..slot.capsule_payload_len]);
+                                if (slot.webtransport_closed.load(.acquire) and cursor < bytes.len) return error.MessageError;
+                            } else slot.datagrams.deliver(slot.capsule_payload[0..slot.capsule_payload_len]) catch |err| switch (err) {
+                                error.DatagramQueueFull, error.DatagramChannelClosed => {},
+                                else => return err,
+                            };
+                        }
                     },
                 };
             }
         }
 
-        fn processUni(self: *Self, slot: *UniSlot, now: u64) !void {
+        fn isWebTransportFlowControlCapsule(capsule_type: capsule.Type) bool {
+            return switch (@intFromEnum(capsule_type)) {
+                wt_constants.wt_max_data,
+                wt_constants.wt_max_streams_bidi,
+                wt_constants.wt_max_streams_uni,
+                wt_constants.wt_data_blocked,
+                wt_constants.wt_streams_blocked_bidi,
+                wt_constants.wt_streams_blocked_uni,
+                => true,
+                else => false,
+            };
+        }
+
+        fn isKnownWebTransportCapsule(capsule_type: capsule.Type) bool {
+            return switch (@intFromEnum(capsule_type)) {
+                wt_constants.wt_close_session,
+                wt_constants.wt_drain_session,
+                wt_constants.wt_max_data,
+                wt_constants.wt_max_stream_data,
+                wt_constants.wt_max_streams_bidi,
+                wt_constants.wt_max_streams_uni,
+                wt_constants.wt_data_blocked,
+                wt_constants.wt_stream_data_blocked,
+                wt_constants.wt_streams_blocked_bidi,
+                wt_constants.wt_streams_blocked_uni,
+                => true,
+                else => false,
+            };
+        }
+
+        fn processCompleteWebTransportCapsule(self: *Self, slot: *RequestSlot, capsule_type: capsule.Type, payload: []const u8) !void {
+            if (!slot.wt_flow_control_enabled and isWebTransportFlowControlCapsule(capsule_type)) return;
+            const value = wt_capsule.parse(.{ .capsule_type = capsule_type, .value = payload }) catch |err| switch (err) {
+                error.InvalidUtf8, error.InvalidCapsuleLength, error.CloseMessageTooLong => {
+                    self.failRequest(slot, .message_error, err);
+                    return;
+                },
+                error.ProhibitedWebTransportCapsule, error.InvalidStreamLimit => {
+                    self.terminateWebTransport(slot, wt_constants.wt_flow_control_error, err);
+                    return;
+                },
+                else => return err,
+            };
+            switch (value) {
+                .close_session => |close| self.remoteTerminateWebTransport(slot, close.application_error_code, close.message, error.WebTransportSessionClosed),
+                .drain_session => slot.webtransport_draining.store(true, .release),
+                .max_streams => |limit| {
+                    if (!slot.wt_flow_control_enabled) return;
+                    slot.wt_send_flow.updateMaxStreams(limit.direction, limit.maximum) catch |err| {
+                        self.terminateWebTransport(slot, wt_constants.wt_flow_control_error, err);
+                    };
+                },
+                .max_data => |maximum| {
+                    if (!slot.wt_flow_control_enabled) return;
+                    slot.wt_send_flow.updateMaxData(maximum) catch |err| {
+                        self.terminateWebTransport(slot, wt_constants.wt_flow_control_error, err);
+                    };
+                },
+                .streams_blocked, .data_blocked => {},
+                .unknown => {},
+            }
+        }
+
+        fn processUni(self: *Self, slot: *UniSlot, now: u64) anyerror!void {
             if (slot.stream_type == null) {
                 const prefix = stream.parsePrefix(slot.input[0..slot.input_len]) catch return;
+                if (config.enable_webtransport and @intFromEnum(prefix.stream_type) == wt_constants.unidirectional_stream_type) {
+                    if (!self.peer_settings_received) return;
+                    const id = slot.id;
+                    if (!webtransport_policy.requirementsMet(self.connection, self.peer_wt_enabled, self.peer_h3_datagram)) {
+                        slot.occupied = false;
+                        try self.connection.stopSending(id, wt_constants.wt_buffered_stream_rejected);
+                        return;
+                    }
+                    const wt_slot = self.freeWebTransportStream() orelse {
+                        slot.occupied = false;
+                        try self.connection.stopSending(id, wt_constants.wt_buffered_stream_rejected);
+                        return;
+                    };
+                    const generation = wt_slot.generation +% 1;
+                    wt_slot.* = .{
+                        .owner = self,
+                        .occupied = true,
+                        .generation = generation,
+                        .id = id,
+                        .direction = .unidirectional,
+                        .parser = wt_stream.Parser.init(.unidirectional),
+                    };
+                    const progress = try wt_slot.parser.feed(slot.input[0..slot.input_len]);
+                    wt_slot.header_length = progress.consumed;
+                    wt_slot.fin_observed = slot.fin_observed;
+                    slot.occupied = false;
+                    try self.processWebTransportHeader(wt_slot);
+                    return;
+                }
                 try self.peer_streams.observe(prefix.stream_type, .client, false);
                 slot.stream_type = prefix.stream_type;
                 removePrefix(&slot.input, &slot.input_len, prefix.consumed);
@@ -1258,32 +2359,64 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 .push => return error.ClientOpenedPushStream,
                 _ => slot.input_len = 0,
             }
+            if (slot.fin_observed) {
+                if (slot.input_len != 0) return error.Truncated;
+                try self.peer_streams.closed(slot.stream_type.?);
+                slot.occupied = false;
+            }
         }
 
-        fn processControl(self: *Self, slot: *UniSlot) !void {
+        fn processControl(self: *Self, slot: *UniSlot) anyerror!void {
             var consumed: usize = 0;
             while (consumed < slot.input_len) {
                 const parsed = frame.parse(slot.input[consumed..slot.input_len]) catch |err| switch (err) {
                     error.Truncated => break,
                     else => return err,
                 };
+                const previous_goaway = self.peer_control.last_goaway;
                 try self.peer_control.observe(parsed.frame);
                 if (parsed.frame.payload == .settings) try self.applySettings(parsed.frame.payload.settings);
+                if (parsed.frame.payload == .goaway and self.peer_control.last_goaway != previous_goaway) {
+                    for (&self.requests) |*request_slot| if (request_slot.occupied and request_slot.webtransport_established) {
+                        request_slot.webtransport_draining.store(true, .release);
+                    };
+                }
                 consumed += parsed.consumed;
             }
             removePrefix(&slot.input, &slot.input_len, consumed);
         }
 
-        fn applySettings(self: *Self, bytes: []const u8) !void {
+        fn applySettings(self: *Self, bytes: []const u8) anyerror!void {
             var iterator = settings.iterator(bytes);
             while (try iterator.next()) |entry| switch (entry.id) {
                 .max_field_section_size => self.peer_max_field_section_size = entry.value,
                 .qpack_max_table_capacity => {},
                 .qpack_blocked_streams => self.encoder.?.max_blocked_streams = @min(@as(usize, @intCast(entry.value)), config.qpack_blocked_streams),
                 .h3_datagram => self.peer_h3_datagram = try settings.h3DatagramEnabled(entry.value),
+                .wt_enabled => self.peer_wt_enabled = try settings.webTransportEnabled(entry.value),
+                .wt_initial_max_streams_uni => {
+                    if (entry.value > wt_constants.maximum_streams) return error.InvalidWebTransportFlowControlSetting;
+                    self.peer_wt_initial_max_streams_uni = entry.value;
+                },
+                .wt_initial_max_streams_bidi => {
+                    if (entry.value > wt_constants.maximum_streams) return error.InvalidWebTransportFlowControlSetting;
+                    self.peer_wt_initial_max_streams_bidi = entry.value;
+                },
+                .wt_initial_max_data => self.peer_wt_initial_max_data = entry.value,
                 else => {},
             };
             self.peer_settings_received = true;
+        }
+
+        fn resumeAfterPeerSettings(self: *Self) anyerror!void {
+            if (!self.peer_settings_received or self.peer_settings_resumed) return;
+            self.peer_settings_resumed = true;
+            for (&self.unidirectional) |*slot| if (slot.occupied and slot.stream_type == null) try self.readable(slot.id, 0);
+            for (&self.requests) |*slot| {
+                if (!slot.occupied) continue;
+                if (slot.webtransport_candidate and !slot.dispatched) try self.ensureRequest(slot, slot.input != null);
+                if (slot.head == null and (try self.connection.streamReadable(slot.id)).len != 0) try self.readable(slot.id, 0);
+            }
         }
 
         fn processEncoderInstructions(self: *Self, slot: *UniSlot, now: u64) !void {
@@ -1359,7 +2492,8 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         fn writeSettings(self: *Self) !void {
-            var payload: [64]u8 = undefined;
+            if (config.enable_webtransport and !webtransport_policy.localRequirementsMet(self.connection)) return error.WebTransportLocalRequirementsNotMet;
+            var payload: [128]u8 = undefined;
             var cursor: usize = 0;
             const entries = [_]settings.Entry{
                 .{ .id = .qpack_max_table_capacity, .value = config.qpack_capacity },
@@ -1373,7 +2507,13 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             if (config.enable_datagrams) {
                 cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .h3_datagram, .value = 1 });
             }
-            var encoded: [80]u8 = undefined;
+            if (config.enable_webtransport) {
+                cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .wt_enabled, .value = 1 });
+                cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .wt_initial_max_streams_uni, .value = config.webtransport_initial_max_streams_uni });
+                cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .wt_initial_max_streams_bidi, .value = config.webtransport_initial_max_streams_bidi });
+                cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .wt_initial_max_data, .value = config.webtransport_initial_max_data });
+            }
+            var encoded: [128]u8 = undefined;
             const length = try frame.encode(&encoded, .{ .frame_type = .settings, .payload = .{ .settings = payload[0..cursor] } });
             try self.writeAll(self.local_control, encoded[0..length]);
         }
@@ -1410,6 +2550,50 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             self.connection.close(code, null, @errorName(cause), now);
         }
 
+        fn addWebTransportTombstone(self: *Self, session_id: u64) void {
+            for (&self.webtransport_tombstones) |*entry| if (entry.occupied and entry.session_id == session_id) return;
+            for (&self.webtransport_tombstones) |*entry| if (!entry.occupied) {
+                entry.* = .{ .occupied = true, .session_id = session_id };
+                return;
+            };
+            self.webtransport_tombstones_saturated = true;
+        }
+
+        fn isWebTransportTombstone(self: *const Self, session_id: u64) bool {
+            for (self.webtransport_tombstones) |entry| if (entry.occupied and entry.session_id == session_id) return true;
+            return false;
+        }
+
+        fn rejectPendingWebTransportStreams(self: *Self, session_id: u64, code: u64) void {
+            for (&self.webtransport_streams) |*slot| {
+                if (!slot.occupied or slot.prepared or slot.session_id != session_id) continue;
+                self.rejectAssociatedWebTransportStream(slot, code) catch slot.clear();
+            }
+        }
+
+        fn bufferPendingWebTransportDatagram(self: *Self, session_id: u64, payload: []const u8) void {
+            if (payload.len > datagram_payload_size) return;
+            for (&self.pending_webtransport_datagrams) |*entry| if (!entry.occupied) {
+                entry.* = .{ .occupied = true, .session_id = session_id, .length = payload.len };
+                @memcpy(entry.payload[0..payload.len], payload);
+                return;
+            };
+        }
+
+        fn deliverPendingWebTransportDatagrams(self: *Self, slot: *RequestSlot) void {
+            for (&self.pending_webtransport_datagrams) |*entry| {
+                if (!entry.occupied or entry.session_id != slot.id.value) continue;
+                slot.datagrams.deliver(entry.payload[0..entry.length]) catch {};
+                entry.occupied = false;
+            }
+        }
+
+        fn discardPendingWebTransportDatagrams(self: *Self, session_id: u64) void {
+            for (&self.pending_webtransport_datagrams) |*entry| {
+                if (entry.occupied and entry.session_id == session_id) entry.occupied = false;
+            }
+        }
+
         fn findRequest(self: *Self, id: StreamId) ?*RequestSlot {
             return self.findRequestValue(id.value);
         }
@@ -1428,6 +2612,21 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         fn freeUni(self: *Self) ?*UniSlot {
             for (&self.unidirectional) |*slot| if (!slot.occupied) return slot;
             return null;
+        }
+        fn findWebTransportStream(self: *Self, id: StreamId) ?*WebTransportStreamSlot {
+            for (&self.webtransport_streams) |*slot| if (slot.occupied and slot.id.value == id.value) return slot;
+            return null;
+        }
+        fn freeWebTransportStream(self: *Self) ?*WebTransportStreamSlot {
+            for (&self.webtransport_streams) |*slot| if (!slot.occupied) return slot;
+            return null;
+        }
+        fn webTransportSessionStreamCount(self: *const Self, session_slot: *const RequestSlot) usize {
+            var count: usize = 0;
+            for (self.webtransport_streams) |slot| {
+                if (slot.occupied and slot.associated and slot.session == session_slot) count += 1;
+            }
+            return count;
         }
 
         fn append(destination: []u8, length: *usize, bytes: []const u8) !void {

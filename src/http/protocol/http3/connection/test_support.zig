@@ -28,10 +28,15 @@ pub const FakeConnection = struct {
         opened: bool = false,
         input: [2048]u8 = undefined,
         input_len: usize = 0,
+        input_total: u64 = 0,
+        reset_final_size: ?u64 = null,
+        reset_received_reliable_size: ?u64 = null,
         output: [4096]u8 = undefined,
         output_len: usize = 0,
         finished: bool = false,
         reset_code: ?u64 = null,
+        received_reset_code: ?u64 = null,
+        reset_reliable_size: ?u64 = null,
         stop_code: ?u64 = null,
     };
 
@@ -40,7 +45,13 @@ pub const FakeConnection = struct {
     event_start: usize = 0,
     event_end: usize = 0,
     next_uni: u64 = 0,
+    next_bidi: u64 = 0,
+    reset_stream_at_supported: bool = false,
     close_code: ?u64 = null,
+    exporter_label: [64]u8 = undefined,
+    exporter_label_len: usize = 0,
+    exporter_context: [528]u8 = undefined,
+    exporter_context_len: usize = 0,
     consumed_total: usize = 0,
     write_limit: usize = std.math.maxInt(usize),
     writes_blocked: bool = false,
@@ -50,6 +61,10 @@ pub const FakeConnection = struct {
     received_datagram_count: usize = 0,
     sent_datagrams: [8]DatagramEntry = @splat(.{}),
     sent_datagram_count: usize = 0,
+    operation_hook_context: ?*anyopaque = null,
+    operation_hook: ?*const fn (*anyopaque) void = null,
+    write_log: [256]StreamId = undefined,
+    write_log_count: usize = 0,
 
     pub fn feedDatagram(self: *@This(), payload: []const u8) !void {
         if (payload.len > 2048) return error.DatagramTooLarge;
@@ -90,6 +105,26 @@ pub const FakeConnection = struct {
         };
     }
 
+    pub fn exportKeyingMaterial(self: *@This(), label: []const u8, context: []const u8, destination: []u8) !void {
+        if (label.len > self.exporter_label.len or context.len > self.exporter_context.len) return error.ExporterInputTooLarge;
+        @memcpy(self.exporter_label[0..label.len], label);
+        self.exporter_label_len = label.len;
+        @memcpy(self.exporter_context[0..context.len], context);
+        self.exporter_context_len = context.len;
+        for (destination, 0..) |*byte, index| byte.* = @truncate(index ^ context.len);
+    }
+
+    pub fn beforeWebTransportOperationEnqueue(self: *@This()) void {
+        if (self.operation_hook) |hook| hook(self.operation_hook_context.?);
+    }
+
+    pub fn openBidirectionalStream(self: *@This()) !StreamId {
+        const id = try StreamId.fromParts(.server, .bidirectional, self.next_bidi);
+        self.next_bidi += 1;
+        _ = try self.ensure(id);
+        return id;
+    }
+
     pub fn openUnidirectionalStream(self: *@This()) !StreamId {
         const id = try StreamId.fromParts(.server, .unidirectional, self.next_uni);
         self.next_uni += 1;
@@ -122,8 +157,16 @@ pub const FakeConnection = struct {
     }
 
     pub fn readStreamReset(self: *@This(), id: StreamId) !u64 {
-        _ = self.find(id) orelse return error.StreamNotFound;
-        return 0;
+        return (try self.readStreamResetInfo(id)).application_error;
+    }
+
+    pub fn readStreamResetInfo(self: *@This(), id: StreamId) !quic.StreamResetInfo {
+        const slot = self.find(id) orelse return error.StreamNotFound;
+        return .{
+            .application_error = slot.received_reset_code orelse 0,
+            .final_size = slot.reset_final_size orelse slot.input_total,
+            .reliable_size = slot.reset_received_reliable_size,
+        };
     }
 
     pub fn writeStream(self: *@This(), id: StreamId, bytes: []const u8) !usize {
@@ -133,6 +176,10 @@ pub const FakeConnection = struct {
         if (amount == 0 and bytes.len != 0) return error.SendBufferFull;
         @memcpy(slot.output[slot.output_len .. slot.output_len + amount], bytes[0..amount]);
         slot.output_len += amount;
+        if (amount != 0 and self.write_log_count < self.write_log.len) {
+            self.write_log[self.write_log_count] = id;
+            self.write_log_count += 1;
+        }
         return amount;
     }
 
@@ -142,6 +189,22 @@ pub const FakeConnection = struct {
 
     pub fn resetStream(self: *@This(), id: StreamId, code: u64) !void {
         (self.find(id) orelse return error.StreamNotFound).reset_code = code;
+    }
+
+    pub fn resetStreamAt(self: *@This(), id: StreamId, code: u64, reliable_size: u64) !void {
+        if (!self.reset_stream_at_supported) return error.ResetStreamAtNotNegotiated;
+        const slot = self.find(id) orelse return error.StreamNotFound;
+        if (reliable_size > slot.output_len) return error.ReliableSizeBeyondWritten;
+        slot.reset_code = code;
+        slot.reset_reliable_size = reliable_size;
+    }
+
+    pub fn peerSupportsResetStreamAt(self: *const @This()) bool {
+        return self.reset_stream_at_supported;
+    }
+
+    pub fn localSupportsResetStreamAt(self: *const @This()) bool {
+        return self.reset_stream_at_supported;
     }
 
     pub fn stopSending(self: *@This(), id: StreamId, code: u64) !void {
@@ -162,6 +225,7 @@ pub const FakeConnection = struct {
             if (bytes.len > slot.input.len - slot.input_len) return error.ReceiveBufferFull;
             @memcpy(slot.input[slot.input_len .. slot.input_len + bytes.len], bytes);
             slot.input_len += bytes.len;
+            slot.input_total += bytes.len;
             try self.push(.{ .readable = id });
         }
         if (finish) try self.push(.{ .receive_finished = id });
@@ -172,7 +236,17 @@ pub const FakeConnection = struct {
     }
 
     pub fn peerReset(self: *@This(), id: StreamId, code: u64) !void {
-        _ = try self.ensure(id);
+        const slot = try self.ensure(id);
+        slot.received_reset_code = code;
+        slot.reset_final_size = slot.input_total;
+        try self.push(.{ .reset = .{ .id = id, .application_error = code } });
+    }
+
+    pub fn peerResetAtFinalSize(self: *@This(), id: StreamId, code: u64, final_size: u64, reliable_size: ?u64) !void {
+        const slot = try self.ensure(id);
+        slot.received_reset_code = code;
+        slot.reset_final_size = final_size;
+        slot.reset_received_reliable_size = reliable_size;
         try self.push(.{ .reset = .{ .id = id, .application_error = code } });
     }
 

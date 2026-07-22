@@ -196,14 +196,127 @@ pub const DatagramChannel = struct {
     }
 };
 
+/// One native WebTransport data stream. The reader and writer are bounded pipes
+/// owned by the HTTP/3 controller; applications never access QUIC directly.
+/// This is a borrowed handle valid only for the duration of the enclosing
+/// WebTransport takeover callback. Copies must not be retained after it returns.
+pub const WebTransportStream = struct {
+    context: *anyopaque,
+    stream_id: u64,
+    direction: Direction,
+    reader: ?*std.Io.Reader,
+    writer: ?*std.Io.Writer,
+    finish_fn: ?*const fn (*anyopaque) anyerror!void,
+    reset_fn: ?*const fn (*anyopaque, u32) anyerror!void,
+    stop_fn: ?*const fn (*anyopaque, u32) anyerror!void,
+    reset_info_fn: *const fn (*anyopaque) ?WebTransportStreamError,
+    stop_info_fn: *const fn (*anyopaque) ?WebTransportStreamError,
+
+    pub const Direction = enum { unidirectional, bidirectional };
+
+    pub fn finish(self: *WebTransportStream) !void {
+        const callback = self.finish_fn orelse return error.StreamNotSendable;
+        return callback(self.context);
+    }
+
+    pub fn reset(self: *WebTransportStream, application_error: u32) !void {
+        const callback = self.reset_fn orelse return error.StreamNotSendable;
+        return callback(self.context, application_error);
+    }
+
+    pub fn stop(self: *WebTransportStream, application_error: u32) !void {
+        const callback = self.stop_fn orelse return error.StreamNotReceivable;
+        return callback(self.context, application_error);
+    }
+
+    /// Returns the peer's RESET_STREAM application code unchanged. A null
+    /// application code means the stream was reset with a protocol code.
+    pub fn resetInfo(self: *const WebTransportStream) ?WebTransportStreamError {
+        return self.reset_info_fn(self.context);
+    }
+
+    /// Returns the peer's STOP_SENDING application code unchanged. A null
+    /// application code means STOP_SENDING carried a protocol code.
+    pub fn stopInfo(self: *const WebTransportStream) ?WebTransportStreamError {
+        return self.stop_info_fn(self.context);
+    }
+};
+
+pub const WebTransportStreamError = struct {
+    application_error: ?u32,
+};
+
+pub const WebTransportClose = struct {
+    application_error: u32,
+    message: []const u8,
+};
+
+/// Type-erased server-side draft-ietf-webtrans-http3-16 session. Every method
+/// crosses a bounded controller queue or a bounded stream/datagram pipe. This is
+/// borrowed for the duration of the WebTransport takeover callback only; it and
+/// all stream handles obtained from it become invalid when that callback returns.
+pub const WebTransportSession = struct {
+    context: *anyopaque,
+    session_id: u64,
+    protocol: ?[]const u8,
+    datagrams: *DatagramChannel,
+    accept_uni_fn: *const fn (*anyopaque) anyerror!?WebTransportStream,
+    accept_bidi_fn: *const fn (*anyopaque) anyerror!?WebTransportStream,
+    open_uni_fn: *const fn (*anyopaque) anyerror!WebTransportStream,
+    open_bidi_fn: *const fn (*anyopaque) anyerror!WebTransportStream,
+    close_fn: *const fn (*anyopaque, u32, []const u8) anyerror!void,
+    drain_fn: *const fn (*anyopaque) anyerror!void,
+    exporter_fn: *const fn (*anyopaque, []const u8, []const u8, []u8) anyerror!void,
+    close_info_fn: *const fn (*anyopaque) ?WebTransportClose,
+    draining_fn: *const fn (*anyopaque) bool,
+
+    pub fn acceptUnidirectionalStream(self: *WebTransportSession) !?WebTransportStream {
+        return self.accept_uni_fn(self.context);
+    }
+
+    pub fn acceptBidirectionalStream(self: *WebTransportSession) !?WebTransportStream {
+        return self.accept_bidi_fn(self.context);
+    }
+
+    pub fn openUnidirectionalStream(self: *WebTransportSession) !WebTransportStream {
+        return self.open_uni_fn(self.context);
+    }
+
+    pub fn openBidirectionalStream(self: *WebTransportSession) !WebTransportStream {
+        return self.open_bidi_fn(self.context);
+    }
+
+    pub fn close(self: *WebTransportSession, application_error: u32, message: []const u8) !void {
+        return self.close_fn(self.context, application_error, message);
+    }
+
+    pub fn drain(self: *WebTransportSession) !void {
+        return self.drain_fn(self.context);
+    }
+
+    pub fn exportKeyingMaterial(self: *WebTransportSession, label: []const u8, context: []const u8, output: []u8) !void {
+        return self.exporter_fn(self.context, label, context, output);
+    }
+
+    pub fn closeInfo(self: *WebTransportSession) ?WebTransportClose {
+        return self.close_info_fn(self.context);
+    }
+
+    pub fn isDraining(self: *WebTransportSession) bool {
+        return self.draining_fn(self.context);
+    }
+};
+
 /// Type-erased control transfer after an HTTP upgrade or successful CONNECT.
 pub const Takeover = struct {
     context: *anyopaque,
     run_fn: *const fn (*anyopaque, *std.Io.Reader, *std.Io.Writer, ?*DatagramChannel) anyerror!void,
+    webtransport_fn: ?*const fn (*anyopaque, *WebTransportSession) anyerror!void = null,
     finalize_fn: ?*const fn (*anyopaque) void,
     lifecycle: *Lifecycle,
     kind: Kind,
     accepts_datagrams: bool = false,
+    is_webtransport: bool = false,
 
     pub const Kind = union(enum) {
         upgrade: []const u8,
@@ -277,6 +390,44 @@ pub const Takeover = struct {
         };
     }
 
+    /// Creates a draft-16 WebTransport handler whose effective signature is
+    /// `run(*Handler, *WebTransportSession) !void`.
+    pub fn initWebTransport(allocator: std.mem.Allocator, handler: anytype) std.mem.Allocator.Error!Takeover {
+        const Handler = @TypeOf(handler);
+        if (!@hasDecl(Handler, "run")) @compileError("WebTransport handler must declare run");
+        const Box = struct {
+            lifecycle: Lifecycle = .{},
+            handler: Handler,
+        };
+        const Adapter = struct {
+            fn legacy(_: *anyopaque, _: *std.Io.Reader, _: *std.Io.Writer, _: ?*DatagramChannel) anyerror!void {
+                return error.WebTransportSessionRequired;
+            }
+
+            fn run(context: *anyopaque, session: *WebTransportSession) anyerror!void {
+                const typed: *Handler = @ptrCast(@alignCast(context));
+                return typed.run(session);
+            }
+
+            fn finalize(context: *anyopaque) void {
+                const typed: *Handler = @ptrCast(@alignCast(context));
+                typed.finalize();
+            }
+        };
+        const box = try allocator.create(Box);
+        box.* = .{ .handler = handler };
+        return .{
+            .context = &box.handler,
+            .run_fn = Adapter.legacy,
+            .webtransport_fn = Adapter.run,
+            .finalize_fn = if (@hasDecl(Handler, "finalize")) Adapter.finalize else null,
+            .lifecycle = &box.lifecycle,
+            .kind = .tunnel,
+            .accepts_datagrams = true,
+            .is_webtransport = true,
+        };
+    }
+
     pub fn run(self: *Takeover, input: *std.Io.Reader, output: *std.Io.Writer) !void {
         return self.runTunnel(input, output, null);
     }
@@ -285,6 +436,13 @@ pub const Takeover = struct {
         if (self.lifecycle.ran) return error.TakeoverAlreadyRun;
         self.lifecycle.ran = true;
         return self.run_fn(self.context, input, output, datagrams);
+    }
+
+    pub fn runWebTransport(self: *Takeover, session: *WebTransportSession) !void {
+        if (self.lifecycle.ran) return error.TakeoverAlreadyRun;
+        const callback = self.webtransport_fn orelse return error.NotWebTransportTakeover;
+        self.lifecycle.ran = true;
+        return callback(self.context, session);
     }
 
     pub fn finalize(self: *Takeover) void {

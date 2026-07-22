@@ -124,13 +124,14 @@ pub const RequestState = struct {
 pub fn errorCode(cause: anyerror) errors.Code {
     return switch (cause) {
         error.MissingSettings => .missing_settings,
-        error.DuplicateSetting, error.ReservedHttp2Setting, error.DuplicateSettingsFrame, error.InvalidH3DatagramSetting => .settings_error,
+        error.DuplicateSetting, error.ReservedHttp2Setting, error.DuplicateSettingsFrame, error.InvalidH3DatagramSetting, error.InvalidWebTransportSetting, error.InvalidWebTransportFlowControlSetting => .settings_error,
         error.DuplicateCriticalStream, error.ClientOpenedPushStream => .stream_creation_error,
         error.ClosedCriticalStream => .closed_critical_stream,
-        error.InvalidGoawayId, error.GoawayIdIncreased, error.PushIdDecreased, error.PushDisabled => .id_error,
+        error.InvalidGoawayId, error.GoawayIdIncreased, error.PushIdDecreased, error.PushDisabled, error.InvalidSessionId => .id_error,
         error.RequestIncomplete => .request_incomplete,
         error.ResponseIncomplete => .message_error,
         error.FrameUnexpected, error.FrameAfterTrailers, error.DataBeforeHeaders, error.HeaderClassificationRequired, error.ForbiddenHttp2Frame => .frame_unexpected,
+        error.UnexpectedWebTransportStreamSignal => .frame_error,
         error.Truncated, error.InvalidFramePayload, error.FrameTooLarge => .frame_error,
         else => .general_protocol_error,
     };

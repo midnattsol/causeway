@@ -2,12 +2,18 @@ const std = @import("std");
 const Io = std.Io;
 const http3 = @import("http/protocol/http3/root.zig");
 const Session = http3.Session;
-const Response = @import("http/message/response.zig").Response;
+const response_module = @import("http/message/response.zig");
+const Response = response_module.Response;
+const Headers = @import("http/message/headers.zig").Headers;
+const webtransport_policy = @import("http/protocol/http3/connection/webtransport.zig");
+const transport_parameters = @import("quic/crypto/transport_parameters.zig");
+const quic_frame = @import("quic/frame/root.zig");
 const support = @import("http/protocol/http3/connection/test_support.zig");
 
 const FakeConnection = support.FakeConnection;
 const Code = http3.ErrorCode;
 const qpack = http3.qpack;
+const wt = http3.webtransport;
 
 const State = struct { requests: std.atomic.Value(usize) = .init(0) };
 const Dispatcher = struct {
@@ -197,6 +203,198 @@ test "compliance: malformed QPACK field sections and critical streams use RFC 92
     try expectConnectionError(qpack.errors.decompression_failed_code, &.{.{ .id = 0, .bytes = "\x01\x03\x00\x00\xff" }});
     try expectConnectionError(qpack.errors.encoder_stream_error_code, &.{.{ .id = 2, .bytes = "\x02\x00" }});
     try expectConnectionError(qpack.errors.decoder_stream_error_code, &.{.{ .id = 2, .bytes = "\x03\x80" }});
+}
+
+test "compliance: WebTransport draft-16 codepoints SETTINGS and required QUIC transport parameters" {
+    const constants = wt.constants;
+    try std.testing.expectEqualStrings("draft-ietf-webtrans-http3-16", wt.specification);
+    try std.testing.expectEqual(@as(u8, 16), wt.draft_version);
+    try std.testing.expectEqualStrings("webtransport-h3", wt.upgrade_token);
+
+    const codepoints = [_]struct { actual: u64, expected: u64 }{
+        .{ .actual = constants.settings_wt_enabled, .expected = 0x2c7cf000 },
+        .{ .actual = constants.settings_wt_initial_max_data, .expected = 0x2b61 },
+        .{ .actual = constants.settings_wt_initial_max_streams_uni, .expected = 0x2b64 },
+        .{ .actual = constants.settings_wt_initial_max_streams_bidi, .expected = 0x2b65 },
+        .{ .actual = constants.unidirectional_stream_type, .expected = 0x54 },
+        .{ .actual = constants.bidirectional_stream_signal, .expected = 0x41 },
+        .{ .actual = constants.wt_close_session, .expected = 0x2843 },
+        .{ .actual = constants.wt_drain_session, .expected = 0x78ae },
+        .{ .actual = constants.wt_max_data, .expected = 0x190b4d3d },
+        .{ .actual = constants.wt_max_stream_data, .expected = 0x190b4d3e },
+        .{ .actual = constants.wt_max_streams_bidi, .expected = 0x190b4d3f },
+        .{ .actual = constants.wt_max_streams_uni, .expected = 0x190b4d40 },
+        .{ .actual = constants.wt_data_blocked, .expected = 0x190b4d41 },
+        .{ .actual = constants.wt_stream_data_blocked, .expected = 0x190b4d42 },
+        .{ .actual = constants.wt_streams_blocked_bidi, .expected = 0x190b4d43 },
+        .{ .actual = constants.wt_streams_blocked_uni, .expected = 0x190b4d44 },
+        .{ .actual = constants.wt_buffered_stream_rejected, .expected = 0x3994bd84 },
+        .{ .actual = constants.wt_session_gone, .expected = 0x170d7b68 },
+        .{ .actual = constants.wt_flow_control_error, .expected = 0x045d4487 },
+        .{ .actual = constants.wt_alpn_error, .expected = 0x0817b3dd },
+        .{ .actual = constants.wt_requirements_not_met, .expected = 0x212c0d48 },
+    };
+    for (codepoints) |case| try std.testing.expectEqual(case.expected, case.actual);
+    try std.testing.expectEqual(@as(u64, 0x24), quic_frame.reset_stream_at_type);
+
+    var encoded: [64]u8 = undefined;
+    var cursor: usize = 0;
+    const settings_entries = [_]http3.settings.Entry{
+        .{ .id = .enable_connect_protocol, .value = 1 },
+        .{ .id = .h3_datagram, .value = 1 },
+        .{ .id = .wt_enabled, .value = 1 },
+        .{ .id = .wt_initial_max_data, .value = 1024 },
+        .{ .id = .wt_initial_max_streams_uni, .value = 3 },
+        .{ .id = .wt_initial_max_streams_bidi, .value = 4 },
+    };
+    for (settings_entries) |entry| cursor += try http3.settings.encodeEntry(encoded[cursor..], entry);
+    try http3.settings.validate(encoded[0..cursor]);
+    var iterator = http3.settings.iterator(encoded[0..cursor]);
+    for (settings_entries) |expected| try std.testing.expectEqual(expected, (try iterator.next()).?);
+    try std.testing.expect((try iterator.next()) == null);
+    try std.testing.expectError(error.InvalidH3DatagramSetting, http3.settings.h3DatagramEnabled(2));
+    try std.testing.expectError(error.InvalidWebTransportSetting, http3.settings.webTransportEnabled(2));
+
+    const peer_parameters = try transport_parameters.parse("\x1d\x00\x40\x20\x01\x01", .client);
+    try std.testing.expect(peer_parameters.reset_stream_at);
+    try std.testing.expectEqual(@as(u64, 1), peer_parameters.max_datagram_frame_size);
+    try std.testing.expectError(error.InvalidResetStreamAt, transport_parameters.parse("\x1d\x01\x00", .client));
+}
+
+test "compliance: WebTransport draft-16 stream headers identify direction and CONNECT session" {
+    const cases = [_]struct { kind: wt.stream.Kind, expected: []const u8 }{
+        .{ .kind = .unidirectional, .expected = "\x40\x54\x00payload" },
+        .{ .kind = .bidirectional, .expected = "\x40\x41\x00payload" },
+    };
+    for (cases) |case| {
+        var wire: [32]u8 = undefined;
+        const header_length = try wt.stream.write(&wire, case.kind, 0);
+        @memcpy(wire[header_length..][0..7], "payload");
+        try std.testing.expectEqualSlices(u8, case.expected, wire[0 .. header_length + 7]);
+        const parsed = try wt.stream.parse(wire[0 .. header_length + 7], case.kind);
+        try std.testing.expectEqual(@as(u64, 0), parsed.session_id);
+        try std.testing.expectEqualStrings("payload", parsed.payload);
+    }
+    try std.testing.expectError(error.InvalidSessionId, wt.stream.encodedLength(.bidirectional, 1));
+    try std.testing.expectError(error.UnexpectedStreamMarker, wt.stream.parse("\x40\x54\x00", .bidirectional));
+    try std.testing.expectError(error.Truncated, wt.stream.parse("\x40\x41", .bidirectional));
+}
+
+test "compliance: WebTransport draft-16 application errors map around reserved HTTP/3 codepoints" {
+    const application_codes = [_]u32{ 0, 1, 29, 30, 31, 0xffff, 0x7fff_ffff, 0xffff_ffff };
+    for (application_codes) |application_code| {
+        const mapped = wt.error_codes.toHttp(application_code);
+        try std.testing.expect((mapped - 0x21) % 0x1f != 0);
+        try std.testing.expectEqual(application_code, try wt.error_codes.fromHttp(mapped));
+    }
+    try std.testing.expectEqual(wt.error_codes.first_http_code, wt.error_codes.toHttp(0));
+    try std.testing.expectEqual(wt.error_codes.last_http_code, wt.error_codes.toHttp(std.math.maxInt(u32)));
+    try std.testing.expectError(error.NotApplicationError, wt.error_codes.fromHttp(wt.error_codes.first_http_code - 1));
+
+    var reserved = wt.error_codes.first_http_code;
+    while ((reserved - 0x21) % 0x1f != 0) : (reserved += 1) {}
+    try std.testing.expectError(error.ReservedHttp3Code, wt.error_codes.fromHttp(reserved));
+}
+
+test "compliance: WebTransport draft-16 capsules reject prohibited types and retain unknown types" {
+    const Capsule = http3.capsule.Capsule;
+    const close_raw = Capsule{
+        .capsule_type = @enumFromInt(wt.constants.wt_close_session),
+        .value = "\x01\x02\x03\x04bye",
+    };
+    const close = (try wt.capsule.parse(close_raw)).close_session;
+    try std.testing.expectEqual(@as(u32, 0x01020304), close.application_error_code);
+    try std.testing.expectEqualStrings("bye", close.message);
+
+    const drain = try wt.capsule.parse(.{ .capsule_type = @enumFromInt(wt.constants.wt_drain_session), .value = "" });
+    try std.testing.expect(drain == .drain_session);
+    try std.testing.expectError(error.InvalidCapsuleLength, wt.capsule.parse(.{
+        .capsule_type = @enumFromInt(wt.constants.wt_drain_session),
+        .value = "\x00",
+    }));
+    for ([_]u64{ wt.constants.wt_max_stream_data, wt.constants.wt_stream_data_blocked }) |capsule_type| {
+        try std.testing.expectError(error.ProhibitedWebTransportCapsule, wt.capsule.parse(.{
+            .capsule_type = @enumFromInt(capsule_type),
+            .value = "\x00",
+        }));
+    }
+    const unknown_raw = Capsule{ .capsule_type = @enumFromInt(0x1f), .value = "extension" };
+    const unknown = (try wt.capsule.parse(unknown_raw)).unknown;
+    try std.testing.expectEqual(@as(u64, 0x1f), @intFromEnum(unknown.capsule_type));
+    try std.testing.expectEqualStrings("extension", unknown.value);
+}
+
+test "compliance: WebTransport draft-16 requires bilateral SETTINGS and QUIC extensions" {
+    const Connection = struct {
+        local_reset: bool = true,
+        peer_reset: bool = true,
+        receive_datagrams: bool = true,
+        send_datagrams: bool = true,
+
+        pub fn localSupportsResetStreamAt(self: @This()) bool {
+            return self.local_reset;
+        }
+        pub fn peerSupportsResetStreamAt(self: @This()) bool {
+            return self.peer_reset;
+        }
+        pub fn datagramCapabilities(self: @This()) struct {
+            receive: bool,
+            send: bool,
+            max_receive_frame_size: u64,
+            max_send_frame_size: u64,
+        } {
+            return .{
+                .receive = self.receive_datagrams,
+                .send = self.send_datagrams,
+                .max_receive_frame_size = if (self.receive_datagrams) 1200 else 0,
+                .max_send_frame_size = if (self.send_datagrams) 1200 else 0,
+            };
+        }
+    };
+
+    const complete = Connection{};
+    try std.testing.expect(webtransport_policy.localRequirementsMet(complete));
+    try std.testing.expect(webtransport_policy.requirementsMet(complete, true, true));
+    try std.testing.expect(!webtransport_policy.requirementsMet(complete, false, true));
+    try std.testing.expect(!webtransport_policy.requirementsMet(complete, true, false));
+    try std.testing.expect(!webtransport_policy.requirementsMet(Connection{ .local_reset = false }, true, true));
+    try std.testing.expect(!webtransport_policy.requirementsMet(Connection{ .peer_reset = false }, true, true));
+    try std.testing.expect(!webtransport_policy.requirementsMet(Connection{ .receive_datagrams = false }, true, true));
+    try std.testing.expect(!webtransport_policy.requirementsMet(Connection{ .send_datagrams = false }, true, true));
+}
+
+test "compliance: WebTransport protocol selection and exporter context follow draft-16" {
+    const request_headers = Headers{ .items = &.{.{
+        .name = "wt-available-protocols",
+        .value = "\"chat\", \"fallback\"",
+    }} };
+    const selected_response = Response{ .status = .ok, .headers = .{ .items = &.{.{
+        .name = "wt-protocol",
+        .value = "\"chat\"",
+    }} } };
+    const selected = (try webtransport_policy.negotiatedProtocol(std.testing.allocator, request_headers, selected_response)).?;
+    defer std.testing.allocator.free(selected);
+    try std.testing.expectEqualStrings("chat", selected);
+
+    const unoffered_response = Response{ .status = .ok, .headers = .{ .items = &.{.{
+        .name = "wt-protocol",
+        .value = "\"other\"",
+    }} } };
+    try std.testing.expectError(error.WebTransportProtocolNotOffered, webtransport_policy.negotiatedProtocol(
+        std.testing.allocator,
+        request_headers,
+        unoffered_response,
+    ));
+
+    var context_storage: [64]u8 = undefined;
+    const context = try webtransport_policy.exporterContext(&context_storage, 0x0102030405060708, "app", "context");
+    try std.testing.expectEqualSlices(
+        u8,
+        "\x01\x02\x03\x04\x05\x06\x07\x08\x03app\x07context",
+        context,
+    );
+    var too_long: [256]u8 = @splat('x');
+    try std.testing.expectError(error.ExporterLabelTooLong, webtransport_policy.exporterContext(&context_storage, 0, &too_long, ""));
 }
 
 test "compliance: blocked QPACK request resumes after encoder instructions" {

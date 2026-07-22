@@ -9,6 +9,8 @@ const Session = @import("session.zig").Session;
 const Headers = @import("../../../message/headers.zig").Headers;
 const response_module = @import("../../../message/response.zig");
 const Response = response_module.Response;
+const wt = @import("../webtransport/root.zig");
+const capsule = @import("../capsule/root.zig");
 
 const support = @import("test_support.zig");
 
@@ -50,6 +52,41 @@ fn encodeDatagramConnectHead(destination: []u8, path: []const u8) !usize {
         .{ .name = ":authority", .value = "example.test" },
         .{ .name = ":path", .value = path },
         .{ .name = "capsule-protocol", .value = "?1;test=accepted" },
+    }, "");
+}
+
+fn encodeWebTransportSettings(destination: []u8) !usize {
+    var payload: [96]u8 = undefined;
+    var cursor: usize = 0;
+    cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .h3_datagram, .value = 1 });
+    cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .wt_enabled, .value = 1 });
+    cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .wt_initial_max_streams_uni, .value = 4 });
+    cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .wt_initial_max_streams_bidi, .value = 4 });
+    cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .wt_initial_max_data, .value = 1024 });
+    destination[0] = 0;
+    return 1 + try frame.encode(destination[1..], .{ .frame_type = .settings, .payload = .{ .settings = payload[0..cursor] } });
+}
+
+fn encodeWebTransportSettingsWithoutFlowControl(destination: []u8) !usize {
+    var payload: [96]u8 = undefined;
+    var cursor: usize = 0;
+    cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .h3_datagram, .value = 1 });
+    cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .wt_enabled, .value = 1 });
+    cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .wt_initial_max_streams_uni, .value = 0 });
+    cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .wt_initial_max_streams_bidi, .value = 0 });
+    cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .wt_initial_max_data, .value = 0 });
+    destination[0] = 0;
+    return 1 + try frame.encode(destination[1..], .{ .frame_type = .settings, .payload = .{ .settings = payload[0..cursor] } });
+}
+
+fn encodeWebTransportConnect(destination: []u8) !usize {
+    return support.encodeRequestFields(destination, 0, &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "webtransport-h3" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = ":path", .value = "/wt" },
+        .{ .name = "wt-available-protocols", .value = "\"chat\", \"fallback\"" },
     }, "");
 }
 
@@ -323,6 +360,345 @@ test "HTTP/3 native datagrams negotiate, associate, overflow explicitly, and sen
     const parsed = try @import("../capsule/datagram.zig").parseHttp3(sent.bytes[0..sent.length]);
     try std.testing.expectEqual(@as(u64, 0), parsed.quarter_stream_id);
     try std.testing.expectEqualStrings("reply", parsed.payload);
+}
+
+test "WebTransport draft-16 controller serves optimistic streams datagrams exporter drain and close" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.enable_webtransport = true;
+        value.datagram_queue_capacity = 4;
+        value.datagram_max_payload = 64;
+        value.max_capsule_length = 1200;
+        value.max_pending_webtransport_streams = 4;
+        value.request_body_buffer_size = 32;
+        value.response_body_buffer_size = 32;
+        value.response_writer_buffer_size = 8;
+        value.webtransport_initial_max_streams_uni = 4;
+        value.webtransport_initial_max_streams_bidi = 4;
+        value.webtransport_initial_max_data = 1024;
+        break :blk value;
+    };
+    const State = struct {
+        completed: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+        stage: std.atomic.Value(u8) = .init(0),
+    };
+    const Handler = struct {
+        state: *State,
+        pub fn run(self: *@This(), session: *response_module.WebTransportSession) !void {
+            errdefer self.state.failed.store(true, .release);
+            try std.testing.expectEqual(@as(u64, 0), session.session_id);
+            try std.testing.expectEqualStrings("chat", session.protocol.?);
+            try std.testing.expectEqual(response_module.DatagramChannel.Mode.quic, session.datagrams.mode());
+            self.state.stage.store(1, .release);
+
+            var key: [16]u8 = undefined;
+            try session.exportKeyingMaterial("app", "context", &key);
+            self.state.stage.store(2, .release);
+
+            var bidi = (try session.acceptBidirectionalStream()) orelse return error.ExpectedBidirectionalStream;
+            self.state.stage.store(21, .release);
+            var bidi_payload: [4]u8 = undefined;
+            try bidi.reader.?.readSliceAll(&bidi_payload);
+            try std.testing.expectEqualStrings("bidi", &bidi_payload);
+            self.state.stage.store(3, .release);
+            try bidi.writer.?.writeAll("echo-bidi");
+            try bidi.finish();
+
+            var uni = (try session.acceptUnidirectionalStream()) orelse return error.ExpectedUnidirectionalStream;
+            var uni_payload: [3]u8 = undefined;
+            try uni.reader.?.readSliceAll(&uni_payload);
+            try std.testing.expectEqualStrings("uni", &uni_payload);
+            self.state.stage.store(4, .release);
+
+            var datagram_payload: [16]u8 = undefined;
+            const datagram_length = (try session.datagrams.receive(&datagram_payload)).?;
+            try std.testing.expectEqualStrings("client-dg", datagram_payload[0..datagram_length]);
+            self.state.stage.store(5, .release);
+            try session.datagrams.send("server-dg");
+
+            var server_uni = try session.openUnidirectionalStream();
+            try server_uni.writer.?.writeAll("server-u");
+            try server_uni.finish();
+            var server_bidi = try session.openBidirectionalStream();
+            try server_bidi.writer.?.writeAll("server-b");
+            try server_bidi.finish();
+
+            try session.drain();
+            try std.testing.expect(session.isDraining());
+            try session.close(7, "done");
+            self.state.completed.store(true, .release);
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .{ .items = &.{
+                .{ .name = "wt-protocol", .value = "\"chat\"" },
+            } }, try response_module.Takeover.initWebTransport(
+                context.execution.allocator,
+                Handler{ .state = context.execution.state },
+            ));
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(12));
+    const io = threaded.io();
+    var transport: FakeConnection = .{};
+    transport.reset_stream_at_supported = true;
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 128, .peer_max_frame_size = 128 };
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+
+    const incoming_bidi = try support.requestId(1);
+    try transport.feed(incoming_bidi, "\x40", false);
+    _ = try session.poll(1);
+    try transport.feed(incoming_bidi, "\x41\x00bidi", true);
+
+    const incoming_uni = try support.clientUniId(1);
+    try transport.feed(incoming_uni, "\x40\x54\x00uni", true);
+
+    var datagram_wire: [32]u8 = undefined;
+    const datagram_length = try @import("../capsule/datagram.zig").encodeHttp3(&datagram_wire, .{ .quarter_stream_id = 0, .payload = "client-dg" });
+    try transport.feedDatagram(datagram_wire[0..datagram_length]);
+
+    var request_bytes: [512]u8 = undefined;
+    const request_length = try encodeWebTransportConnect(&request_bytes);
+    const connect_id = try support.requestId(0);
+    try transport.feed(connect_id, request_bytes[0..request_length], false);
+
+    var settings_bytes: [128]u8 = undefined;
+    const settings_length = try encodeWebTransportSettings(&settings_bytes);
+    try transport.feed(try support.clientUniId(0), settings_bytes[0..settings_length], false);
+
+    for (0..500) |step| {
+        _ = try session.poll(2 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.completed.load(.acquire) and transport.sent_datagram_count != 0) break;
+    }
+    try std.testing.expect(!state.failed.load(.acquire));
+    if (!state.completed.load(.acquire)) {
+        std.debug.print("WebTransport test stalled at stage {d}\n", .{state.stage.load(.acquire)});
+        for (session.webtransport_streams) |item| if (item.occupied) std.debug.print("  stream={d} sid={d} associated={} delivered={} staged={} fin={}\n", .{ item.id.value, item.session_id, item.associated, item.delivered, item.payload_staged, item.fin_observed });
+        for (&session.requests) |*request_slot| if (request_slot.occupied and request_slot.webtransport_established) {
+            var queued: [4]response_module.WebTransportStream = undefined;
+            const count = try request_slot.wt_accept_bidi.get(io, &queued, 0);
+            std.debug.print("  connect={d} bidi queued={d}\n", .{ request_slot.id.value, count });
+        };
+    }
+    try std.testing.expect(state.completed.load(.acquire));
+    try std.testing.expectEqualStrings("EXPORTER-WebTransport", transport.exporter_label[0..transport.exporter_label_len]);
+    try std.testing.expectEqualSlices(u8, "\x00\x00\x00\x00\x00\x00\x00\x00\x03app\x07context", transport.exporter_context[0..transport.exporter_context_len]);
+
+    const server_uni_id = try stream_id.Id.fromParts(.server, .unidirectional, 3);
+    const parsed_server_uni = try wt.stream.parse(transport.output(server_uni_id), .unidirectional);
+    try std.testing.expectEqualStrings("server-u", parsed_server_uni.payload);
+    const server_bidi_id = try stream_id.Id.fromParts(.server, .bidirectional, 0);
+    const parsed_server_bidi = try wt.stream.parse(transport.output(server_bidi_id), .bidirectional);
+    try std.testing.expectEqualStrings("server-b", parsed_server_bidi.payload);
+    try std.testing.expectEqualStrings("echo-bidi", transport.output(incoming_bidi));
+
+    const sent_datagram = transport.sent_datagrams[0];
+    const parsed_datagram = try @import("../capsule/datagram.zig").parseHttp3(sent_datagram.bytes[0..sent_datagram.length]);
+    try std.testing.expectEqual(@as(u64, 0), parsed_datagram.quarter_stream_id);
+    try std.testing.expectEqualStrings("server-dg", parsed_datagram.payload);
+
+    var frames = frame.Parser{ .bytes = transport.output(connect_id) };
+    try std.testing.expectEqual(frame.Type.headers, (try frames.next()).?.frame_type);
+    var capsule_bytes: [128]u8 = undefined;
+    var capsule_length: usize = 0;
+    while (try frames.next()) |item| if (item.payload == .data) {
+        const bytes = item.payload.data;
+        @memcpy(capsule_bytes[capsule_length..][0..bytes.len], bytes);
+        capsule_length += bytes.len;
+    };
+    var capsule_iterator = capsule.iterator(capsule_bytes[0..capsule_length], .{ .max_capsule_length = 1200 });
+    try std.testing.expect((try wt.capsule.parse((try capsule_iterator.next()).?)) == .drain_session);
+    const close = (try wt.capsule.parse((try capsule_iterator.next()).?)).close_session;
+    try std.testing.expectEqual(@as(u32, 7), close.application_error_code);
+    try std.testing.expectEqualStrings("done", close.message);
+}
+
+test "WebTransport stream finish makes progress with a full ring and buffered writer" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.enable_webtransport = true;
+        value.datagram_max_payload = 64;
+        value.datagram_queue_capacity = 4;
+        value.max_capsule_length = 1200;
+        value.response_body_buffer_size = 4;
+        value.response_writer_buffer_size = 4;
+        break :blk value;
+    };
+    const State = struct {
+        completed: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+    };
+    const Handler = struct {
+        state: *State,
+        pub fn run(self: *@This(), session: *response_module.WebTransportSession) !void {
+            errdefer self.state.failed.store(true, .release);
+            var outgoing = try session.openUnidirectionalStream();
+            try outgoing.writer.?.writeAll("abcd");
+            try outgoing.writer.?.flush();
+            try outgoing.writer.?.writeAll("efgh");
+            try outgoing.finish();
+            self.state.completed.store(true, .release);
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .empty, try response_module.Takeover.initWebTransport(
+                context.execution.allocator,
+                Handler{ .state = context.execution.state },
+            ));
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{ .reset_stream_at_supported = true, .write_limit = 1 };
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 128, .peer_max_frame_size = 128 };
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    var settings_bytes: [128]u8 = undefined;
+    try transport.feed(try support.clientUniId(0), settings_bytes[0..try encodeWebTransportSettings(&settings_bytes)], false);
+    var request_bytes: [512]u8 = undefined;
+    try transport.feed(try support.requestId(0), request_bytes[0..try encodeWebTransportConnect(&request_bytes)], false);
+
+    for (0..500) |step| {
+        _ = try session.poll(step + 1);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.completed.load(.acquire)) break;
+    }
+    try std.testing.expect(!state.failed.load(.acquire));
+    try std.testing.expect(state.completed.load(.acquire));
+    const outgoing_id = try stream_id.Id.fromParts(.server, .unidirectional, 3);
+    const parsed = try wt.stream.parse(transport.output(outgoing_id), .unidirectional);
+    try std.testing.expectEqualStrings("abcdefgh", parsed.payload);
+}
+
+test "WebTransport disabled bilateral flow control permits one session and ignores flow capsules" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.enable_webtransport = true;
+        value.datagram_max_payload = 64;
+        value.datagram_queue_capacity = 4;
+        value.max_capsule_length = 1200;
+        value.webtransport_initial_max_streams_uni = 0;
+        value.webtransport_initial_max_streams_bidi = 0;
+        value.webtransport_initial_max_data = 0;
+        break :blk value;
+    };
+    const State = struct {
+        ready: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        completed: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+        io: Io = undefined,
+    };
+    const Handler = struct {
+        state: *State,
+        pub fn run(self: *@This(), session: *response_module.WebTransportSession) !void {
+            errdefer self.state.failed.store(true, .release);
+            var incoming = (try session.acceptBidirectionalStream()) orelse return error.ExpectedBidirectionalStream;
+            var payload: [2]u8 = undefined;
+            try incoming.reader.?.readSliceAll(&payload);
+            try std.testing.expectEqualStrings("in", &payload);
+            var outgoing = try session.openUnidirectionalStream();
+            try outgoing.writer.?.writeAll("out");
+            try outgoing.finish();
+            self.state.ready.store(true, .release);
+            while (!self.state.release.load(.acquire)) try Io.sleep(self.state.io, .fromMilliseconds(1), .awake);
+            self.state.completed.store(true, .release);
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .empty, try response_module.Takeover.initWebTransport(
+                context.execution.allocator,
+                Handler{ .state = context.execution.state },
+            ));
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{ .reset_stream_at_supported = true };
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 128, .peer_max_frame_size = 128 };
+    var state: State = .{ .io = io };
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    var settings_bytes: [128]u8 = undefined;
+    try transport.feed(try support.clientUniId(0), settings_bytes[0..try encodeWebTransportSettingsWithoutFlowControl(&settings_bytes)], false);
+    const incoming_id = try support.requestId(1);
+    try transport.feed(incoming_id, "\x40\x41\x00in", true);
+    var request_bytes: [512]u8 = undefined;
+    const connect_id = try support.requestId(0);
+    try transport.feed(connect_id, request_bytes[0..try encodeWebTransportConnect(&request_bytes)], false);
+
+    for (0..500) |step| {
+        _ = try session.poll(step + 1);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.ready.load(.acquire)) break;
+    }
+    try std.testing.expect(!state.failed.load(.acquire));
+    try std.testing.expect(state.ready.load(.acquire));
+    var request_index: ?usize = null;
+    for (session.requests, 0..) |request_slot, index| {
+        if (request_slot.occupied and request_slot.id.value == connect_id.value) request_index = index;
+    }
+    const request_slot = &session.requests[request_index.?];
+    try std.testing.expect(!request_slot.wt_flow_control_enabled);
+
+    var capsule_payload: [1028]u8 = undefined;
+    var capsule_wire: [256]u8 = undefined;
+    var capsule_length: usize = 0;
+    const values = [_]wt.capsule.Value{
+        .{ .max_streams = .{ .direction = .unidirectional, .maximum = 0 } },
+        .{ .streams_blocked = .{ .direction = .bidirectional, .maximum = 0 } },
+        .{ .max_data = 0 },
+        .{ .data_blocked = 0 },
+    };
+    for (values) |value| {
+        capsule_length += try wt.capsule.write(capsule_wire[capsule_length..], &capsule_payload, value, .{ .max_capsule_length = 1200 });
+    }
+    capsule_length += try capsule.encode(capsule_wire[capsule_length..], .{
+        .capsule_type = @enumFromInt(wt.constants.wt_max_streams_uni),
+        .value = "",
+    }, .{ .max_capsule_length = 1200 });
+    var data_wire: [320]u8 = undefined;
+    const data_length = try frame.encode(&data_wire, .{ .frame_type = .data, .payload = .{ .data = capsule_wire[0..capsule_length] } });
+    try transport.feed(connect_id, data_wire[0..data_length], false);
+    for (0..20) |step| {
+        _ = try session.poll(600 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(!request_slot.webtransport_closed.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), request_slot.wt_send_flow.maximum_data);
+    try std.testing.expectEqual([_]u64{ 0, 0 }, request_slot.wt_send_flow.maximum_streams);
+
+    state.release.store(true, .release);
+    for (0..100) |step| {
+        _ = try session.poll(700 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.completed.load(.acquire)) break;
+    }
+    try std.testing.expect(!state.failed.load(.acquire));
+    try std.testing.expect(state.completed.load(.acquire));
+    const outgoing_id = try stream_id.Id.fromParts(.server, .unidirectional, 3);
+    const parsed = try wt.stream.parse(transport.output(outgoing_id), .unidirectional);
+    try std.testing.expectEqualStrings("out", parsed.payload);
 }
 
 test "HTTP/3 native datagram capability loss fails the request without changing mode" {
@@ -1276,6 +1652,180 @@ test "HTTP/3 completed request slots are safely reused after task completion and
     try std.testing.expect(transport.find(second).?.reset_code == null);
 }
 
+test "WebTransport requires local transport parameters and defers stream parsing until peer SETTINGS" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.enable_webtransport = true;
+        value.max_capsule_length = 1200;
+        break :blk value;
+    };
+    const State = struct {};
+    const Dispatcher = struct {
+        pub fn dispatch(_: anytype) !Response {
+            return .{ .status = .ok };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var missing_reset: FakeConnection = .{};
+    missing_reset.datagrams = .{ .negotiated = true, .local_max_frame_size = 128, .peer_max_frame_size = 128 };
+    var state: State = .{};
+    var invalid = Session(State, Dispatcher, FakeConnection, config).init(&missing_reset, std.testing.allocator, &state, io);
+    defer invalid.deinit();
+    try std.testing.expectError(error.WebTransportLocalRequirementsNotMet, invalid.poll(1));
+
+    var transport: FakeConnection = .{ .reset_stream_at_supported = true };
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 128, .peer_max_frame_size = 128 };
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    const bidi = try support.requestId(0);
+    try transport.feed(bidi, "\x40\x41\x00pending", false);
+    _ = try session.poll(2);
+    try std.testing.expectEqual(@as(usize, 0), transport.consumed_total);
+    for (session.webtransport_streams) |slot| try std.testing.expect(!slot.occupied);
+
+    var settings_bytes: [128]u8 = undefined;
+    const settings_length = try encodeWebTransportSettings(&settings_bytes);
+    try transport.feed(try support.clientUniId(0), settings_bytes[0..settings_length], false);
+    _ = try session.poll(3);
+    var adopted = false;
+    for (session.webtransport_streams) |slot| {
+        if (slot.occupied and slot.id.value == bidi.value) adopted = true;
+    }
+    try std.testing.expect(adopted);
+}
+
+test "WebTransport rejects WT_STREAM frame type after HTTP request classification" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.enable_webtransport = true;
+        value.max_capsule_length = 1200;
+        break :blk value;
+    };
+    const State = struct {};
+    const Dispatcher = struct {
+        pub fn dispatch(_: anytype) !Response {
+            return .{ .status = .ok };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var transport: FakeConnection = .{ .reset_stream_at_supported = true };
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 128, .peer_max_frame_size = 128 };
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, threaded.io());
+    defer session.deinit();
+    var settings_bytes: [128]u8 = undefined;
+    const settings_length = try encodeWebTransportSettings(&settings_bytes);
+    try transport.feed(try support.clientUniId(0), settings_bytes[0..settings_length], false);
+    var request_bytes: [512]u8 = undefined;
+    var request_length = try encodeGetHead(&request_bytes);
+    @memcpy(request_bytes[request_length..][0..2], "\x40\x41");
+    request_length += 2;
+    try transport.feed(try support.requestId(0), request_bytes[0..request_length], false);
+    try std.testing.expectError(error.UnexpectedWebTransportStreamSignal, session.poll(1));
+    try std.testing.expectEqual(@as(?u64, @intFromEnum(@import("../error.zig").Code.frame_error)), transport.close_code);
+}
+
+test "WebTransport remote CLOSE is idempotent, closes CONNECT, and rejects trailing bytes" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.enable_webtransport = true;
+        value.datagram_max_payload = 64;
+        value.datagram_queue_capacity = 4;
+        value.max_capsule_length = 1200;
+        value.max_frame_size = 1200;
+        break :blk value;
+    };
+    const State = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        completed: std.atomic.Value(bool) = .init(false),
+        close_code: std.atomic.Value(u32) = .init(0),
+    };
+    const Handler = struct {
+        state: *State,
+        pub fn run(self: *@This(), session: *response_module.WebTransportSession) !void {
+            self.state.started.store(true, .release);
+            try std.testing.expect((try session.acceptUnidirectionalStream()) == null);
+            const info = session.closeInfo().?;
+            self.state.close_code.store(info.application_error, .release);
+            try std.testing.expectEqualStrings("peer", info.message);
+            self.state.completed.store(true, .release);
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .{ .items = &.{.{ .name = "wt-protocol", .value = "\"chat\"" }} }, try response_module.Takeover.initWebTransport(
+                context.execution.allocator,
+                Handler{ .state = context.execution.state },
+            ));
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{ .reset_stream_at_supported = true };
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 128, .peer_max_frame_size = 128 };
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    var settings_bytes: [128]u8 = undefined;
+    try transport.feed(try support.clientUniId(0), settings_bytes[0..try encodeWebTransportSettings(&settings_bytes)], false);
+    var request_bytes: [512]u8 = undefined;
+    const connect = try support.requestId(0);
+    try transport.feed(connect, request_bytes[0..try encodeWebTransportConnect(&request_bytes)], false);
+    for (0..100) |step| {
+        _ = try session.poll(1 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.started.load(.acquire)) break;
+    }
+    try std.testing.expect(state.started.load(.acquire));
+
+    var capsule_payload: [1028]u8 = undefined;
+    var capsule_wire: [1050]u8 = undefined;
+    const capsule_length = try wt.capsule.write(&capsule_wire, &capsule_payload, .{ .close_session = .{
+        .application_error_code = 42,
+        .message = "peer",
+    } }, .{ .max_capsule_length = 1200 });
+    var data_wire: [1100]u8 = undefined;
+    const data_length = try frame.encode(&data_wire, .{ .frame_type = .data, .payload = .{ .data = capsule_wire[0..capsule_length] } });
+    try transport.feed(connect, data_wire[0..data_length], false);
+    for (0..100) |step| {
+        _ = try session.poll(200 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.completed.load(.acquire) and transport.find(connect).?.finished) break;
+    }
+    try std.testing.expectEqual(@as(u32, 42), state.close_code.load(.acquire));
+    try std.testing.expect(transport.find(connect).?.finished);
+    try std.testing.expectEqual(@as(?u64, wt.constants.wt_session_gone), transport.find(connect).?.stop_code);
+
+    var trailing_transport: FakeConnection = .{ .reset_stream_at_supported = true };
+    trailing_transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 128, .peer_max_frame_size = 128 };
+    var trailing_state: State = .{};
+    var trailing_session = Session(State, Dispatcher, FakeConnection, config).init(&trailing_transport, std.testing.allocator, &trailing_state, io);
+    defer trailing_session.deinit();
+    try trailing_transport.feed(try support.clientUniId(0), settings_bytes[0..try encodeWebTransportSettings(&settings_bytes)], false);
+    try trailing_transport.feed(connect, request_bytes[0..try encodeWebTransportConnect(&request_bytes)], false);
+    for (0..100) |step| {
+        _ = try trailing_session.poll(400 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (trailing_state.started.load(.acquire)) break;
+    }
+    var close_plus_extra: [1060]u8 = undefined;
+    @memcpy(close_plus_extra[0..capsule_length], capsule_wire[0..capsule_length]);
+    close_plus_extra[capsule_length] = 0;
+    const trailing_length = try frame.encode(&data_wire, .{ .frame_type = .data, .payload = .{ .data = close_plus_extra[0 .. capsule_length + 1] } });
+    try trailing_transport.feed(connect, data_wire[0..trailing_length], false);
+    _ = try trailing_session.poll(600);
+    try std.testing.expectEqual(@as(?u64, @intFromEnum(@import("../error.zig").Code.message_error)), trailing_transport.find(connect).?.reset_code);
+}
+
 test "HTTP/3 session rejects a client push stream as a connection error" {
     const State = struct {};
     const Dispatcher = struct {
@@ -1294,4 +1844,557 @@ test "HTTP/3 session rejects a client push stream as a connection error" {
     try transport.feed(push, "\x01\x00", false);
     try std.testing.expectError(error.ClientOpenedPushStream, session.poll(1));
     try std.testing.expectEqual(@as(?u64, @intFromEnum(@import("../error.zig").Code.stream_creation_error)), transport.close_code);
+}
+
+test "WebTransport preserves reset and stop codes, accounts final size, and recycles slots by generation" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.enable_webtransport = true;
+        value.datagram_max_payload = 64;
+        value.datagram_queue_capacity = 4;
+        value.max_capsule_length = 1200;
+        value.max_pending_webtransport_streams = 1;
+        value.webtransport_initial_max_streams_bidi = 4;
+        value.webtransport_initial_max_streams_uni = 4;
+        value.webtransport_initial_max_data = 8;
+        break :blk value;
+    };
+    const State = struct {
+        first_ready: std.atomic.Value(bool) = .init(false),
+        advance: std.atomic.Value(bool) = .init(false),
+        second_ready: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        io: Io = undefined,
+        first: response_module.WebTransportStream = undefined,
+    };
+    const Handler = struct {
+        state: *State,
+        pub fn run(self: *@This(), session: *response_module.WebTransportSession) !void {
+            var first = (try session.acceptBidirectionalStream()).?;
+            self.state.first = first;
+            self.state.first_ready.store(true, .release);
+            while (!self.state.advance.load(.acquire)) try Io.sleep(self.state.io, .fromMilliseconds(1), .awake);
+            var second = (try session.acceptBidirectionalStream()).?;
+            try std.testing.expectError(error.StaleWebTransportStream, first.stop(1));
+            try second.reset(9);
+            self.state.second_ready.store(true, .release);
+            while (!self.state.release.load(.acquire)) try Io.sleep(self.state.io, .fromMilliseconds(1), .awake);
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .{ .items = &.{.{ .name = "wt-protocol", .value = "\"chat\"" }} }, try response_module.Takeover.initWebTransport(
+                context.execution.allocator,
+                Handler{ .state = context.execution.state },
+            ));
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{ .reset_stream_at_supported = true };
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 128, .peer_max_frame_size = 128 };
+    var state: State = .{ .io = io };
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    var settings_bytes: [128]u8 = undefined;
+    const settings_length = try encodeWebTransportSettings(&settings_bytes);
+    try transport.feed(try support.clientUniId(0), settings_bytes[0..settings_length], false);
+    var request_bytes: [512]u8 = undefined;
+    const request_length = try encodeWebTransportConnect(&request_bytes);
+    const connect = try support.requestId(0);
+    try transport.feed(connect, request_bytes[0..request_length], false);
+    const first_id = try support.requestId(1);
+    try transport.feed(first_id, "\x40\x41\x00", false);
+    for (0..100) |step| {
+        _ = try session.poll(1 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.first_ready.load(.acquire)) break;
+    }
+    const reset_code = wt.error_codes.toHttp(77);
+    const stop_code = wt.error_codes.toHttp(88);
+    try transport.peerResetAtFinalSize(first_id, reset_code, 3, 3);
+    try transport.peerStop(first_id, stop_code);
+    _ = try session.poll(200);
+    try std.testing.expectEqual(@as(?u32, 77), state.first.resetInfo().?.application_error);
+    try std.testing.expectEqual(@as(?u32, 88), state.first.stopInfo().?.application_error);
+
+    state.advance.store(true, .release);
+    const second_id = try support.requestId(2);
+    try transport.feed(second_id, "\x40\x41\x00", false);
+    for (0..100) |step| {
+        _ = try session.poll(201 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.second_ready.load(.acquire)) break;
+    }
+    try std.testing.expect(state.second_ready.load(.acquire));
+    try std.testing.expectEqual(@as(?u64, null), transport.find(second_id).?.reset_reliable_size);
+    try std.testing.expectEqual(@as(?u64, wt.error_codes.toHttp(9)), transport.find(second_id).?.reset_code);
+
+    try transport.peerResetAtFinalSize(second_id, wt.error_codes.toHttp(1), 12, 3);
+    _ = try session.poll(400);
+    try std.testing.expectEqual(@as(?u64, wt.constants.wt_flow_control_error), transport.find(connect).?.reset_code);
+    state.release.store(true, .release);
+}
+
+test "WebTransport GOAWAY drains sessions and excess admission is rejected before 2xx" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.enable_webtransport = true;
+        value.datagram_max_payload = 64;
+        value.datagram_queue_capacity = 4;
+        value.max_capsule_length = 1200;
+        value.max_requests = 3;
+        value.qpack_blocked_streams = 3;
+        value.max_webtransport_sessions = 1;
+        break :blk value;
+    };
+    const State = struct {
+        draining: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        io: Io = undefined,
+    };
+    const Handler = struct {
+        state: *State,
+        pub fn run(self: *@This(), session: *response_module.WebTransportSession) !void {
+            while (!session.isDraining() and !self.state.release.load(.acquire)) try Io.sleep(self.state.io, .fromMilliseconds(1), .awake);
+            if (session.isDraining()) self.state.draining.store(true, .release);
+            while (!self.state.release.load(.acquire)) try Io.sleep(self.state.io, .fromMilliseconds(1), .awake);
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .{ .items = &.{.{ .name = "wt-protocol", .value = "\"chat\"" }} }, try response_module.Takeover.initWebTransport(
+                context.execution.allocator,
+                Handler{ .state = context.execution.state },
+            ));
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{ .reset_stream_at_supported = true };
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 128, .peer_max_frame_size = 128 };
+    var state: State = .{ .io = io };
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    var settings_bytes: [128]u8 = undefined;
+    const settings_length = try encodeWebTransportSettings(&settings_bytes);
+    const control_id = try support.clientUniId(0);
+    try transport.feed(control_id, settings_bytes[0..settings_length], false);
+    var request_bytes: [512]u8 = undefined;
+    const request_length = try encodeWebTransportConnect(&request_bytes);
+    const first = try support.requestId(0);
+    try transport.feed(first, request_bytes[0..request_length], false);
+    for (0..100) |step| {
+        _ = try session.poll(1 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (session.requests[0].webtransport_established) break;
+    }
+    const second = try support.requestId(1);
+    try transport.feed(second, request_bytes[0..request_length], false);
+    for (0..100) |step| {
+        _ = try session.poll(200 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (transport.find(second).?.reset_code != null) break;
+    }
+    try std.testing.expectEqual(@as(?u64, @intFromEnum(@import("../error.zig").Code.request_rejected)), transport.find(second).?.reset_code);
+    try std.testing.expectEqual(@as(usize, 0), transport.output(second).len);
+
+    var goaway_wire: [16]u8 = undefined;
+    const goaway_length = try frame.encode(&goaway_wire, .{ .frame_type = .goaway, .payload = .{ .goaway = 0 } });
+    try transport.feed(control_id, goaway_wire[0..goaway_length], false);
+    for (0..100) |step| {
+        _ = try session.poll(400 + step);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.draining.load(.acquire)) break;
+    }
+    try std.testing.expect(state.draining.load(.acquire));
+    state.release.store(true, .release);
+}
+
+test "WebTransport pending open completes with error when STOP arrives under backpressure" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.enable_webtransport = true;
+        value.datagram_max_payload = 64;
+        value.datagram_queue_capacity = 4;
+        value.max_capsule_length = 1200;
+        break :blk value;
+    };
+    const State = struct {
+        start_open: std.atomic.Value(bool) = .init(false),
+        open_started: std.atomic.Value(bool) = .init(false),
+        completed: std.atomic.Value(bool) = .init(false),
+        io: Io = undefined,
+    };
+    const Handler = struct {
+        state: *State,
+        pub fn run(self: *@This(), session: *response_module.WebTransportSession) !void {
+            while (!self.state.start_open.load(.acquire)) try Io.sleep(self.state.io, .fromMilliseconds(1), .awake);
+            self.state.open_started.store(true, .release);
+            _ = session.openUnidirectionalStream() catch |err| {
+                try std.testing.expectEqual(error.PeerStopped, err);
+                self.state.completed.store(true, .release);
+                return;
+            };
+            return error.ExpectedOpenFailure;
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .empty, try response_module.Takeover.initWebTransport(
+                context.execution.allocator,
+                Handler{ .state = context.execution.state },
+            ));
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{ .reset_stream_at_supported = true };
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 128, .peer_max_frame_size = 128 };
+    var state: State = .{ .io = io };
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    var settings_bytes: [128]u8 = undefined;
+    try transport.feed(try support.clientUniId(0), settings_bytes[0..try encodeWebTransportSettings(&settings_bytes)], false);
+    var request_bytes: [512]u8 = undefined;
+    try transport.feed(try support.requestId(0), request_bytes[0..try encodeWebTransportConnect(&request_bytes)], false);
+    for (0..100) |step| {
+        _ = try session.poll(step + 1);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (session.requests[0].webtransport_established) break;
+    }
+    transport.writes_blocked = true;
+    state.start_open.store(true, .release);
+    for (0..100) |step| {
+        _ = try session.poll(step + 200);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        var pending = false;
+        for (session.webtransport_streams) |slot| {
+            if (slot.occupied and slot.pending_open != null) pending = true;
+        }
+        if (pending) break;
+    }
+    const opened = try stream_id.Id.fromParts(.server, .unidirectional, 3);
+    try transport.peerStop(opened, wt.error_codes.toHttp(1));
+    for (0..100) |step| {
+        _ = try session.poll(step + 400);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.completed.load(.acquire)) break;
+    }
+    try std.testing.expect(state.open_started.load(.acquire));
+    try std.testing.expect(state.completed.load(.acquire));
+    for (session.webtransport_streams) |slot| try std.testing.expect(slot.pending_open == null);
+}
+
+test "WebTransport owner rejects an operation whose generation changed after handle validation" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.enable_webtransport = true;
+        value.datagram_max_payload = 64;
+        value.datagram_queue_capacity = 4;
+        value.max_capsule_length = 1200;
+        value.max_pending_webtransport_streams = 1;
+        break :blk value;
+    };
+    const State = struct {
+        stream_ready: std.atomic.Value(bool) = .init(false),
+        invoke: std.atomic.Value(bool) = .init(false),
+        hook_entered: std.atomic.Value(bool) = .init(false),
+        release_hook: std.atomic.Value(bool) = .init(false),
+        stale_seen: std.atomic.Value(bool) = .init(false),
+        io: Io = undefined,
+
+        fn hook(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.hook_entered.store(true, .release);
+            while (!self.release_hook.load(.acquire)) std.Thread.yield() catch {};
+        }
+    };
+    const Handler = struct {
+        state: *State,
+        pub fn run(self: *@This(), session: *response_module.WebTransportSession) !void {
+            var incoming = (try session.acceptBidirectionalStream()).?;
+            self.state.stream_ready.store(true, .release);
+            while (!self.state.invoke.load(.acquire)) try Io.sleep(self.state.io, .fromMilliseconds(1), .awake);
+            incoming.stop(7) catch |err| {
+                try std.testing.expectEqual(error.StaleWebTransportStream, err);
+                self.state.stale_seen.store(true, .release);
+                return;
+            };
+            return error.ExpectedStaleOperation;
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .empty, try response_module.Takeover.initWebTransport(
+                context.execution.allocator,
+                Handler{ .state = context.execution.state },
+            ));
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var state: State = .{ .io = io };
+    var transport: FakeConnection = .{ .reset_stream_at_supported = true };
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 128, .peer_max_frame_size = 128 };
+    transport.operation_hook_context = &state;
+    transport.operation_hook = State.hook;
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    var settings_bytes: [128]u8 = undefined;
+    try transport.feed(try support.clientUniId(0), settings_bytes[0..try encodeWebTransportSettings(&settings_bytes)], false);
+    var request_bytes: [512]u8 = undefined;
+    try transport.feed(try support.requestId(0), request_bytes[0..try encodeWebTransportConnect(&request_bytes)], false);
+    const incoming_id = try support.requestId(1);
+    try transport.feed(incoming_id, "\x40\x41\x00", false);
+    for (0..100) |step| {
+        _ = try session.poll(step + 1);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.stream_ready.load(.acquire)) break;
+    }
+    state.invoke.store(true, .release);
+    while (!state.hook_entered.load(.acquire)) try Io.sleep(io, .fromMilliseconds(1), .awake);
+    try transport.peerResetAtFinalSize(incoming_id, wt.error_codes.toHttp(2), 3, 3);
+    try transport.peerStop(incoming_id, wt.error_codes.toHttp(3));
+    _ = try session.poll(200);
+    state.release_hook.store(true, .release);
+    for (0..100) |step| {
+        _ = try session.poll(step + 201);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.stale_seen.load(.acquire)) break;
+    }
+    try std.testing.expect(state.stale_seen.load(.acquire));
+}
+
+test "WebTransport reset of an optimistic unassociated stream is rejected safely" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.enable_webtransport = true;
+        value.datagram_max_payload = 64;
+        value.datagram_queue_capacity = 4;
+        value.max_capsule_length = 1200;
+        break :blk value;
+    };
+    const State = struct {};
+    const Dispatcher = struct {
+        pub fn dispatch(_: anytype) !Response {
+            return .{ .status = .not_found };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var transport: FakeConnection = .{ .reset_stream_at_supported = true };
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 128, .peer_max_frame_size = 128 };
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, threaded.io());
+    defer session.deinit();
+    var settings_bytes: [128]u8 = undefined;
+    try transport.feed(try support.clientUniId(0), settings_bytes[0..try encodeWebTransportSettings(&settings_bytes)], false);
+    const optimistic = try support.requestId(1);
+    try transport.feed(optimistic, "\x40\x41\x08", false);
+    try transport.peerResetAtFinalSize(optimistic, wt.error_codes.toHttp(5), 3, 3);
+    _ = try session.poll(1);
+    try std.testing.expectEqual(@as(?u64, wt.constants.wt_buffered_stream_rejected), transport.find(optimistic).?.reset_code);
+    for (session.webtransport_streams) |slot| try std.testing.expect(!slot.occupied);
+}
+
+test "WebTransport buffers bounded HTTP datagrams until peer SETTINGS" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.enable_webtransport = true;
+        value.datagram_max_payload = 16;
+        value.datagram_queue_capacity = 1;
+        value.max_capsule_length = 1200;
+        break :blk value;
+    };
+    const State = struct {};
+    const Dispatcher = struct {
+        pub fn dispatch(_: anytype) !Response {
+            return .{ .status = .not_found };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var transport: FakeConnection = .{ .reset_stream_at_supported = true };
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 128, .peer_max_frame_size = 128 };
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, threaded.io());
+    defer session.deinit();
+    var datagram_wire: [32]u8 = undefined;
+    const datagram_length = try @import("../capsule/datagram.zig").encodeHttp3(&datagram_wire, .{ .quarter_stream_id = 0, .payload = "early" });
+    try transport.feedDatagram(datagram_wire[0..datagram_length]);
+    try transport.feedDatagram(datagram_wire[0..datagram_length]);
+    _ = try session.poll(1);
+    try std.testing.expectEqual(@as(?u64, null), transport.close_code);
+    try std.testing.expect(session.pending_pre_settings_datagrams[0].occupied);
+    var settings_bytes: [128]u8 = undefined;
+    try transport.feed(try support.clientUniId(0), settings_bytes[0..try encodeWebTransportSettings(&settings_bytes)], false);
+    _ = try session.poll(2);
+    try std.testing.expect(!session.pending_pre_settings_datagrams[0].occupied);
+    try std.testing.expect(session.pending_webtransport_datagrams[0].occupied);
+    try std.testing.expectEqualStrings("early", session.pending_webtransport_datagrams[0].payload[0..session.pending_webtransport_datagrams[0].length]);
+}
+
+test "WebTransport tombstones ignore normal HTTP and saturate without eviction" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.enable_webtransport = true;
+        value.datagram_max_payload = 64;
+        value.datagram_queue_capacity = 2;
+        value.max_capsule_length = 1200;
+        value.max_requests = 2;
+        value.qpack_blocked_streams = 2;
+        break :blk value;
+    };
+    const State = struct {};
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return .{ .status = if (context.request.protocol != null) .forbidden else .ok };
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{ .reset_stream_at_supported = true };
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 128, .peer_max_frame_size = 128 };
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    var settings_bytes: [128]u8 = undefined;
+    try transport.feed(try support.clientUniId(0), settings_bytes[0..try encodeWebTransportSettings(&settings_bytes)], false);
+    var normal_bytes: [256]u8 = undefined;
+    const normal = try support.requestId(0);
+    try transport.feed(normal, normal_bytes[0..try encodeGetHead(&normal_bytes)], true);
+    for (0..100) |step| {
+        _ = try session.poll(step + 1);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (transport.find(normal).?.finished) break;
+    }
+    try transport.acknowledgeFinish(normal);
+    _ = try session.poll(150);
+    for (session.webtransport_tombstones) |entry| try std.testing.expect(!entry.occupied);
+
+    session.webtransport_tombstones[0] = .{ .occupied = true, .session_id = 40 };
+    session.webtransport_tombstones[1] = .{ .occupied = true, .session_id = 44 };
+    var request_bytes: [512]u8 = undefined;
+    const rejected = try support.requestId(2);
+    try transport.feed(rejected, request_bytes[0..try encodeWebTransportConnect(&request_bytes)], true);
+    for (0..100) |step| {
+        _ = try session.poll(step + 200);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (transport.find(rejected).?.finished) break;
+    }
+    try transport.acknowledgeFinish(rejected);
+    _ = try session.poll(350);
+    try std.testing.expect(session.webtransport_tombstones_saturated);
+    try std.testing.expectEqual(@as(u64, 40), session.webtransport_tombstones[0].session_id);
+    try std.testing.expectEqual(@as(u64, 44), session.webtransport_tombstones[1].session_id);
+
+    const unknown = try support.requestId(3);
+    try transport.feed(unknown, "\x40\x41\x30", false);
+    _ = try session.poll(400);
+    try std.testing.expectEqual(@as(?u64, wt.constants.wt_buffered_stream_rejected), transport.find(unknown).?.reset_code);
+    try std.testing.expectEqual(@as(?u64, wt.constants.wt_buffered_stream_rejected), transport.find(unknown).?.stop_code);
+}
+
+test "WebTransport scheduler is fair across two sessions and enforces per-session quota" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.enable_webtransport = true;
+        value.datagram_max_payload = 64;
+        value.datagram_queue_capacity = 4;
+        value.max_capsule_length = 1200;
+        value.max_requests = 2;
+        value.qpack_blocked_streams = 2;
+        value.max_webtransport_sessions = 2;
+        value.max_pending_webtransport_streams = 4;
+        value.output_batch_size = 16;
+        break :blk value;
+    };
+    const State = struct {
+        sessions_ready: std.atomic.Value(usize) = .init(0),
+        release_data: std.atomic.Value(bool) = .init(false),
+        data_ready: std.atomic.Value(usize) = .init(0),
+        quota_seen: std.atomic.Value(bool) = .init(false),
+        io: Io = undefined,
+    };
+    const Handler = struct {
+        state: *State,
+        pub fn run(self: *@This(), session: *response_module.WebTransportSession) !void {
+            var streams: [2]response_module.WebTransportStream = undefined;
+            const count: usize = if (session.session_id == 0) 2 else 1;
+            for (streams[0..count]) |*item| item.* = try session.openUnidirectionalStream();
+            if (session.session_id == 0) {
+                try std.testing.expectError(error.WebTransportStreamCapacity, session.openUnidirectionalStream());
+                self.state.quota_seen.store(true, .release);
+            }
+            _ = self.state.sessions_ready.fetchAdd(1, .acq_rel);
+            while (!self.state.release_data.load(.acquire)) try Io.sleep(self.state.io, .fromMilliseconds(1), .awake);
+            for (streams[0..count]) |*item| try item.writer.?.writeAll("data");
+            _ = self.state.data_ready.fetchAdd(1, .acq_rel);
+            for (streams[0..count]) |*item| try item.finish();
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .empty, try response_module.Takeover.initWebTransport(
+                context.execution.allocator,
+                Handler{ .state = context.execution.state },
+            ));
+        }
+    };
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(12));
+    const io = threaded.io();
+    var transport: FakeConnection = .{ .reset_stream_at_supported = true, .write_limit = 1 };
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 128, .peer_max_frame_size = 128 };
+    var state: State = .{ .io = io };
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    var settings_bytes: [128]u8 = undefined;
+    try transport.feed(try support.clientUniId(0), settings_bytes[0..try encodeWebTransportSettings(&settings_bytes)], false);
+    var request_bytes: [512]u8 = undefined;
+    try transport.feed(try support.requestId(0), request_bytes[0..try encodeWebTransportConnect(&request_bytes)], false);
+    try transport.feed(try support.requestId(1), request_bytes[0..try encodeWebTransportConnect(&request_bytes)], false);
+    for (0..500) |step| {
+        _ = try session.poll(step + 1);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.sessions_ready.load(.acquire) == 2) break;
+    }
+    try std.testing.expectEqual(@as(usize, 2), state.sessions_ready.load(.acquire));
+    try std.testing.expect(state.quota_seen.load(.acquire));
+    state.release_data.store(true, .release);
+    while (state.data_ready.load(.acquire) != 2) try Io.sleep(io, .fromMilliseconds(1), .awake);
+    transport.write_log_count = 0;
+    _ = try session.poll(1000);
+
+    var previous_session: ?u64 = null;
+    var observed: usize = 0;
+    for (transport.write_log[0..transport.write_log_count]) |id| {
+        if (id.initiator() != .server or id.direction() != .unidirectional or id.value < 14) continue;
+        const parsed = try wt.stream.parse(transport.output(id), .unidirectional);
+        if (previous_session) |previous| try std.testing.expect(previous != parsed.session_id);
+        previous_session = parsed.session_id;
+        observed += 1;
+        if (observed == 8) break;
+    }
+    try std.testing.expectEqual(@as(usize, 8), observed);
 }

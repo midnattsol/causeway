@@ -3,6 +3,12 @@
 pub const Code = enum(u64) {
     /// RFC 9297: malformed or unnegotiated HTTP/3 DATAGRAM payload.
     h3_datagram_error = 0x33,
+    /// draft-ietf-webtrans-http3-16 section 9.5.
+    wt_flow_control_error = 0x045d4487,
+    wt_alpn_error = 0x0817b3dd,
+    wt_session_gone = 0x170d7b68,
+    wt_requirements_not_met = 0x212c0d48,
+    wt_buffered_stream_rejected = 0x3994bd84,
     no_error = 0x100,
     general_protocol_error = 0x101,
     internal_error = 0x102,
