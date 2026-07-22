@@ -36,7 +36,12 @@ pub const Config = struct {
     max_response_trailer_size: usize = 8 * 1024,
     qpack_capacity: usize = 4096,
     qpack_entries: usize = 128,
-    qpack_blocked_streams: usize = 16,
+    /// Maximum peer encoder streams this server decoder permits to block.
+    /// This is advertised in SETTINGS_QPACK_BLOCKED_STREAMS.
+    qpack_decoder_blocked_streams: usize = 16,
+    /// Local cap for blocked streams produced by this server's encoder. The
+    /// peer's advertised limit can reduce it further.
+    qpack_encoder_blocked_streams: usize = 16,
     qpack_sections: usize = 32,
     qpack_instruction_bytes: usize = 4096,
     qpack_string_size: usize = 16 * 1024,
@@ -77,7 +82,9 @@ pub const Config = struct {
         if (self.request_body_timeout) |timeout| if (timeout.nanoseconds <= 0) @compileError("HTTP/3 request body timeout must be positive");
         if (self.response_write_timeout) |timeout| if (timeout.nanoseconds <= 0) @compileError("HTTP/3 response write timeout must be positive");
         if (self.qpack_entries == 0 or self.qpack_sections == 0) @compileError("HTTP/3 QPACK metadata limits must be non-zero");
-        if (self.qpack_blocked_streams > self.max_requests) @compileError("HTTP/3 QPACK blocked streams cannot exceed request slots");
+        if (self.qpack_decoder_blocked_streams > self.max_requests) @compileError("HTTP/3 QPACK decoder blocked streams cannot exceed request slots");
+        const encoder_stream_limit = self.max_requests + if (self.enable_server_push) self.max_pushes else 0;
+        if (self.qpack_encoder_blocked_streams > encoder_stream_limit) @compileError("HTTP/3 QPACK encoder blocked streams cannot exceed request plus push slots");
         if (self.enable_server_push) {
             if (self.max_pushes == 0) @compileError("HTTP/3 max_pushes must be non-zero when server push is enabled");
             if (self.max_pushes > (self.qpack_sections -| self.max_requests) / 2) @compileError("HTTP/3 QPACK sections need room for request responses, push promises, and push responses");
@@ -125,6 +132,18 @@ test "optional HTTP/3 features remain disabled with bounded defaults" {
     try std.testing.expect(config.webtransportFlowControlEnabled());
     try std.testing.expect(config.webtransport_initial_max_data <= config.max_webtransport_session_data);
     try std.testing.expect(config.max_webtransport_close_message_size <= 1024);
+    try std.testing.expectEqual(@as(usize, 16), config.qpack_decoder_blocked_streams);
+    try std.testing.expectEqual(@as(usize, 16), config.qpack_encoder_blocked_streams);
+}
+
+test "directional QPACK blocked stream limits permit explicit zero" {
+    const config = Config{
+        .qpack_decoder_blocked_streams = 0,
+        .qpack_encoder_blocked_streams = 7,
+    };
+    config.validate();
+    try std.testing.expectEqual(@as(usize, 0), config.qpack_decoder_blocked_streams);
+    try std.testing.expectEqual(@as(usize, 7), config.qpack_encoder_blocked_streams);
 }
 
 test "WebTransport opt-in accepts coherent draft-16 requirements" {

@@ -18,7 +18,8 @@ const http3_config: causeway.http.http3.Config = .{
     .max_peer_unidirectional_streams = 8,
     .max_body_size = 1024 * 1024,
     .max_response_body_size = 1024 * 1024,
-    .qpack_blocked_streams = 8,
+    .qpack_decoder_blocked_streams = 8,
+    .qpack_encoder_blocked_streams = 8,
 };
 
 const Http3Server = causeway.http.http3.Server(

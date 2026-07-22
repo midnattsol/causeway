@@ -30,7 +30,8 @@ const quic_limits: causeway.quic.connection.Limits = .{
 const http3_config: causeway.http.http3.Config = .{
     .max_requests = 16,
     .max_peer_unidirectional_streams = 8,
-    .qpack_blocked_streams = 8,
+    .qpack_decoder_blocked_streams = 8,
+    .qpack_encoder_blocked_streams = 8,
 };
 
 const Http3Server = causeway.http.http3.Server(
@@ -253,7 +254,9 @@ The peer's corresponding critical streams are unique and cannot close while the 
 
 QPACK uses caller-owned dynamic-table bytes and metadata, bounded blocked-stream tracking, bounded outstanding sections, and fixed scratch buffers. Requests blocked on a required insert count are retried after encoder instructions advance the decoder table. Encoder and decoder stream failures use the RFC 9204 application error codes.
 
-Server push is disabled. A client-created push stream is a connection error, and the response path does not emit `PUSH_PROMISE`.
+Server push is opt-in through `enable_server_push`. The client must first send `MAX_PUSH_ID`; without that allowance, push requests return an unavailable outcome and no Push ID is consumed. A handler can call `Context.push(PushRequest, Response)` before its final response starts. A `.promised` `PushOutcome` transfers ownership of the response to the HTTP/3 adapter, emits `PUSH_PROMISE` on the parent request stream, and serves the response on a server-initiated push stream. `.unavailable` is an expected bounded-admission result and leaves the response caller-owned.
+
+Push IDs are monotonic and never recycled. Client `CANCEL_PUSH` and `STOP_SENDING` on a push stream abort the producer and reset the push stream with `H3_REQUEST_CANCELLED`; duplicate cancellation remains idempotent after completion. Client GOAWAY carries a decreasing Push ID cutoff: no new ID at or above the cutoff is accepted, and affected pushes are cancelled. Shutdown stops accepting pushes immediately and includes active push slots, producers, pipes, queued operations, and their parent requests in drain completion. Client-created push streams remain a connection error.
 
 ## Streaming, flow control, and concurrent handlers
 
@@ -288,6 +291,7 @@ Timeout, peer reset, `STOP_SENDING`, connection close, and shutdown cancel block
 `causeway.http.http3.Config` bounds:
 
 - concurrent request slots (`max_requests`);
+- concurrent server-push response slots (`max_pushes`) when push is enabled;
 - peer unidirectional stream slots;
 - frame, header, field-section, body, and response sizes;
 - request and response body-pipe sizes;
@@ -296,7 +300,7 @@ Timeout, peer reset, `STOP_SENDING`, connection close, and shutdown cancel block
 - response trailers;
 - HTTP Datagram queue capacity, application payload, and capsule length;
 - WebTransport sessions, pending/active streams, per-session stream quota, initial bilateral stream/data credit, cumulative session data, and close-message length;
-- QPACK table bytes, metadata entries, blocked streams, outstanding sections, instruction buffering, and string scratch;
+- QPACK table bytes, metadata entries, decoder/encoder blocked streams, outstanding request/promise/push sections, instruction buffering, and string scratch;
 - request/response deadlines and shutdown duration.
 
 `causeway.quic.connection.Limits` bounds:
@@ -314,10 +318,10 @@ Timeout, peer reset, `STOP_SENDING`, connection close, and shutdown cancel block
 `max_streams` counts all concurrently active QUIC application streams, not only HTTP requests. It must leave room for every inbound stream advertised by the local transport parameters and for the three server critical streams. A practical requirement is:
 
 ```text
-max_streams >= initial_max_streams_bidi + initial_max_streams_uni + 3
+max_streams >= initial_max_streams_bidi + initial_max_streams_uni + 3 + max_pushes
 ```
 
-The HTTP/3 request concurrency should also be coherent with transport admission: `max_requests` should not exceed the intended client bidirectional stream concurrency, and `qpack_blocked_streams` cannot exceed `max_requests`.
+The `max_pushes` term is needed only when server push is enabled, and the peer's QUIC limit for server-initiated unidirectional streams must also leave room for those push streams. The HTTP/3 request concurrency should remain coherent with transport admission: `max_requests` should not exceed the intended client bidirectional stream concurrency. `qpack_decoder_blocked_streams` is advertised to the peer and cannot exceed `max_requests`; `qpack_encoder_blocked_streams` covers locally encoded request and push response streams and cannot exceed `max_requests + max_pushes` when push is enabled. `qpack_sections` must hold request responses plus both the parent-stream promise and push-stream response sections for every active push.
 
 `max_closed_streams` is separate from active concurrency. It retains receive-side final sizes after active slots are recycled so late or duplicate frames can still be validated. It must be nonzero and should be sized for the expected stream churn and packet reordering window.
 
@@ -326,8 +330,8 @@ The HTTP/3 request concurrency should also be coherent with transport admission:
 `Server.closeAll(now)` stops new endpoint admission and starts HTTP/3 draining. Each initialized session uses the RFC 9114 two-GOAWAY sequence:
 
 1. send an initial GOAWAY with the maximum client-initiated bidirectional stream ID, preventing no already-created request;
-2. reject later request streams while accepted handlers and response producers drain;
-3. after all accepted requests complete, send a final GOAWAY containing the first rejected stream ID.
+2. reject later request streams and new pushes while accepted handlers, response producers, push slots, and queued operations drain;
+3. after all accepted requests and pushes complete, send a final GOAWAY containing the first rejected stream ID.
 
 The server drives UDP output once more before initiating QUIC close so queued GOAWAY frames can be packetized. `shutdown_timeout` is the upper bound; expiry closes remaining connections even if application work has not drained. Callers should continue polling until `shutdownComplete()` becomes true.
 
@@ -366,7 +370,6 @@ These targets validate Causeway's own invariants and regression cases. They do n
 
 ## Explicit non-goals and current exclusions
 
-- Server push is disabled.
 - 0-RTT/early data and session resumption are unsupported.
 - WebTransport client mode and compatibility with drafts before `draft-ietf-webtrans-http3-16` are unsupported.
 - Reliable stream reset drafts before `draft-ietf-quic-reliable-stream-reset-09` are unsupported.

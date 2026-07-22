@@ -26,10 +26,17 @@ const FuzzState = struct { requests: std.atomic.Value(usize) = .init(0) };
 const FuzzDispatcher = struct {
     pub fn dispatch(context: anytype) !Response {
         _ = context.execution.state.requests.fetchAdd(1, .acq_rel);
+        _ = context.push(.{ .path = "/fuzz-push" }, .{ .status = .ok, .body = .{ .bytes = "push" } }) catch {};
         return .{ .status = .ok, .body = .{ .bytes = "ok" } };
     }
 };
-const FuzzSession = http3.Session(FuzzState, FuzzDispatcher, support.FakeConnection, support.small_config);
+const fuzz_config = blk: {
+    var value = support.small_config;
+    value.enable_server_push = true;
+    value.max_pushes = 1;
+    break :blk value;
+};
+const FuzzSession = http3.Session(FuzzState, FuzzDispatcher, support.FakeConnection, fuzz_config);
 
 test "fuzz HTTP/3 wire QPACK and complete sessions" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
@@ -75,8 +82,8 @@ fn fuzzConnection(io: std.Io, input: []const u8) void {
     while (cursor < input.len and operation < 64) : (operation += 1) {
         const instruction = input[cursor];
         cursor += 1;
-        const action = instruction % 10;
-        const ordinal: u64 = (instruction / 10) % 4;
+        const action = instruction % 12;
+        const ordinal: u64 = (instruction / 12) % 4;
 
         switch (action) {
             0, 2 => {
@@ -114,6 +121,14 @@ fn fuzzConnection(io: std.Io, input: []const u8) void {
             7 => {},
             8 => session.beginShutdown(now) catch break,
             9 => session.finishShutdown(now) catch break,
+            10 => {
+                const id = support.serverUniId(3 + ordinal) catch break;
+                transport.receiveStopped(id, instruction) catch break;
+            },
+            11 => {
+                const id = support.serverUniId(3 + ordinal) catch break;
+                transport.acknowledgeFinish(id) catch break;
+            },
             else => unreachable,
         }
 

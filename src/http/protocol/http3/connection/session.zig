@@ -565,6 +565,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             response_bytes_sent: u64 = 0,
             response_trailers: Headers = .empty,
             completion_notified: bool = false,
+            cancelled: bool = false,
             control: [response_control_size]u8 = undefined,
             control_len: usize = 0,
             control_sent: usize = 0,
@@ -590,11 +591,15 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 if (self.response) |*response| response.complete(result);
             }
 
-            fn fail(self: *PushSlot, err: anyerror) void {
+            fn failWithCode(self: *PushSlot, err: anyerror, code: errors.Code) void {
                 if (self.output) |output| output.abort(err);
                 self.notifyCompletion(.{ .failure = err });
-                self.owner.connection.resetStream(self.stream_id, @intFromEnum(errors.Code.internal_error)) catch {};
+                self.owner.connection.resetStream(self.stream_id, @intFromEnum(code)) catch {};
                 self.output_done = true;
+            }
+
+            fn fail(self: *PushSlot, err: anyerror) void {
+                self.failWithCode(err, .internal_error);
             }
 
             fn detachParent(self: *PushSlot) void {
@@ -790,7 +795,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         encoder: ?qpack.Encoder = null,
         decoder_bytes: [config.qpack_capacity]u8 = undefined,
         decoder_entries: [config.qpack_entries]qpack.table.Entry = undefined,
-        decoder_blocked: [config.qpack_blocked_streams]qpack.state.BlockedStream = undefined,
+        decoder_blocked: [config.qpack_decoder_blocked_streams]qpack.state.BlockedStream = undefined,
         decoder: ?qpack.Decoder = null,
         qpack_name_scratch: [config.qpack_string_size]u8 = undefined,
         qpack_value_scratch: [config.qpack_string_size]u8 = undefined,
@@ -856,8 +861,8 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 self.messages = .init(&self.message_storage);
                 self.messages_initialized = true;
             }
-            self.encoder = try qpack.Encoder.init(&self.encoder_bytes, &self.encoder_entries, &self.encoder_sections, config.qpack_capacity, config.qpack_blocked_streams);
-            self.decoder = try qpack.Decoder.init(&self.decoder_bytes, &self.decoder_entries, &self.decoder_blocked, config.qpack_capacity, config.qpack_blocked_streams);
+            self.encoder = try qpack.Encoder.init(&self.encoder_bytes, &self.encoder_entries, &self.encoder_sections, config.qpack_capacity, config.qpack_encoder_blocked_streams);
+            self.decoder = try qpack.Decoder.init(&self.decoder_bytes, &self.decoder_entries, &self.decoder_blocked, config.qpack_capacity, config.qpack_decoder_blocked_streams);
             self.local_control = try self.connection.openUnidirectionalStream();
             self.local_encoder = try self.connection.openUnidirectionalStream();
             self.local_decoder = try self.connection.openUnidirectionalStream();
@@ -913,19 +918,26 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 self.closeFor(err, now);
                 return err;
             };
+            self.shutting_down = true;
+            for (&self.requests) |*slot| if (slot.occupied) {
+                if (slot.webtransport_established) slot.webtransport_draining.store(true, .release);
+                if (slot.pending_push) |operation| {
+                    slot.pending_push = null;
+                    self.completePushOperation(operation, .{ .unavailable = .connection_draining });
+                }
+            };
             var encoded: [16]u8 = undefined;
             const maximum_client_bidi_id = (@as(u64, 1) << 62) - 4;
             const length = try frame.encode(&encoded, .{ .frame_type = .goaway, .payload = .{ .goaway = maximum_client_bidi_id } });
             try self.writeAll(self.local_control, encoded[0..length]);
-            for (&self.requests) |*slot| if (slot.occupied and slot.webtransport_established) {
-                slot.webtransport_draining.store(true, .release);
-            };
-            self.shutting_down = true;
         }
 
         pub fn drainComplete(self: *const Self) bool {
             if (!self.shutting_down) return false;
-            for (self.requests) |slot| if (slot.occupied) return false;
+            if (self.pending_tasks != 0 or self.push_submissions.load(.acquire) != 0 or self.webtransport_submissions.load(.acquire) != 0) return false;
+            for (self.requests) |slot| if (slot.occupied or slot.pending_push != null) return false;
+            for (self.pushes) |slot| if (slot.occupied) return false;
+            for (self.webtransport_streams) |slot| if (slot.occupied or slot.pending_open != null) return false;
             return true;
         }
 
@@ -992,7 +1004,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                         std.debug.assert(self.pending_tasks != 0);
                         self.pending_tasks -= 1;
                         done.slot.task_done = true;
-                        if (done.err) |err| self.failPush(done.slot, err);
+                        if (done.err) |err| if (!done.slot.cancelled) self.failPush(done.slot, err);
                     },
                     .webtransport_operation => |operation| {
                         const complete = WtController.processWebTransportOperation(self, operation) catch |err| blk: {
@@ -1579,7 +1591,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         fn stopped(self: *Self, id: StreamId, code: u64) void {
             if (self.findPush(id)) |slot| {
-                self.failPush(slot, error.PeerStopped);
+                self.cancelPush(slot, error.PeerStopped);
                 return;
             }
             if (self.findWebTransportStream(id)) |slot| {
@@ -1677,6 +1689,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     total += written;
                     if (promised.promise_sent != promised.promise_len) continue;
                     slot.promise = null;
+                    if (promised.cancelled) promised.detachParent();
                     if (slot.pending_push) |operation| {
                         slot.pending_push = null;
                         self.processPushOperation(operation);
@@ -1956,6 +1969,32 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 slot.detachParent();
                 slot.start.set(self.io);
             }
+        }
+
+        fn cancelPush(self: *Self, slot: *PushSlot, err: anyerror) void {
+            if (!slot.occupied or slot.cancelled) return;
+            slot.cancelled = true;
+            if (!slot.output_done) slot.failWithCode(err, .request_cancelled);
+            slot.start.set(self.io);
+            const parent = slot.parent orelse return;
+            if (parent.promise != slot or slot.promise_sent == 0) {
+                slot.detachParent();
+                if (parent.pending_push) |operation| {
+                    parent.pending_push = null;
+                    self.processPushOperation(operation);
+                }
+            }
+        }
+
+        fn cancelPushId(self: *Self, id: u62, err: anyerror) void {
+            for (&self.pushes) |*slot| if (slot.occupied and slot.id == id) {
+                self.cancelPush(slot, err);
+                return;
+            };
+        }
+
+        fn cancelPushesAtOrAbove(self: *Self, cutoff: u62) void {
+            for (&self.pushes) |*slot| if (slot.occupied and slot.id >= cutoff) self.cancelPush(slot, error.PushCancelled);
         }
 
         fn failPush(self: *Self, slot: *PushSlot, err: anyerror) void {
@@ -2549,11 +2588,16 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     try self.push_registry.setPeerMax(@intCast(value));
                 }
                 if (parsed.frame.payload == .cancel_push) {
-                    // Cancellation state and producer interruption are intentionally
-                    // deferred to the next server-push commit.
-                    try self.push_registry.cancel(@intCast(parsed.frame.payload.cancel_push));
+                    const id = parsed.frame.payload.cancel_push;
+                    if (id > std.math.maxInt(u62)) return error.InvalidPushId;
+                    try self.push_registry.cancel(@intCast(id));
+                    self.cancelPushId(@intCast(id), error.PushCancelled);
                 }
                 if (parsed.frame.payload == .goaway and self.peer_control.last_goaway != previous_goaway) {
+                    const cutoff = parsed.frame.payload.goaway;
+                    if (cutoff > std.math.maxInt(u62)) return error.InvalidGoawayId;
+                    try self.push_registry.setGoawayCutoff(@intCast(cutoff));
+                    self.cancelPushesAtOrAbove(@intCast(cutoff));
                     for (&self.requests) |*request_slot| if (request_slot.occupied and request_slot.webtransport_established) {
                         request_slot.webtransport_draining.store(true, .release);
                     };
@@ -2568,7 +2612,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             while (try iterator.next()) |entry| switch (entry.id) {
                 .max_field_section_size => self.peer_max_field_section_size = entry.value,
                 .qpack_max_table_capacity => {},
-                .qpack_blocked_streams => self.encoder.?.max_blocked_streams = @min(@as(usize, @intCast(entry.value)), config.qpack_blocked_streams),
+                .qpack_blocked_streams => self.encoder.?.max_blocked_streams = @min(@as(usize, @intCast(entry.value)), config.qpack_encoder_blocked_streams),
                 .h3_datagram => self.peer_h3_datagram = try settings.h3DatagramEnabled(entry.value),
                 .wt_enabled => self.peer_wt_enabled = try settings.webTransportEnabled(entry.value),
                 .wt_initial_max_streams_uni => {
@@ -2687,7 +2731,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             var cursor: usize = 0;
             const entries = [_]settings.Entry{
                 .{ .id = .qpack_max_table_capacity, .value = config.qpack_capacity },
-                .{ .id = .qpack_blocked_streams, .value = config.qpack_blocked_streams },
+                .{ .id = .qpack_blocked_streams, .value = config.qpack_decoder_blocked_streams },
                 .{ .id = .max_field_section_size, .value = config.max_field_section_size },
             };
             for (entries) |entry| cursor += try settings.encodeEntry(payload[cursor..], entry);

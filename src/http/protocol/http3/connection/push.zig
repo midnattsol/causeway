@@ -55,8 +55,9 @@ pub const Registry = struct {
         return id;
     }
 
-    /// Validates CANCEL_PUSH received from the client. Repetition is valid, but
-    /// an ID which has not yet been promised is a connection-level ID error.
+    /// Validates CANCEL_PUSH received from the client. Monotonic IDs make the
+    /// promised range a bounded, allocation-free tombstone registry: repetition
+    /// remains valid after slot recycling, while future IDs are ID errors.
     pub fn cancel(self: Registry, id: u62) !void {
         const largest = self.largest_promised orelse return error.InvalidPushId;
         if (id > largest) return error.InvalidPushId;
