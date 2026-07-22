@@ -16,6 +16,7 @@ pub const Field = static.Field;
 
 pub const Section = struct {
     active: bool = false,
+    generation: u64 = 0,
     stream_id: u62 = 0,
     required_insert_count: u62 = 0,
     first_absolute: u62 = 0,
@@ -28,10 +29,30 @@ pub const Encoder = struct {
     dynamic: table.Dynamic,
     sections: []Section,
     max_blocked_streams: usize,
+    next_section_generation: u64 = 0,
+
+    pub const Checkpoint = struct { next_section_generation: u64 };
 
     pub fn init(bytes: []u8, entries: []table.Entry, sections: []Section, maximum_capacity: usize, max_blocked_streams: usize) !Encoder {
         @memset(sections, .{});
         return .{ .dynamic = try table.Dynamic.init(bytes, entries, maximum_capacity, true), .sections = sections, .max_blocked_streams = max_blocked_streams };
+    }
+
+    /// Captures outstanding-section state without copying caller-owned storage.
+    /// No decoder instruction may be processed between this checkpoint and a
+    /// rollback; the encoder has a single owner.
+    pub fn checkpoint(self: Encoder) Checkpoint {
+        return .{ .next_section_generation = self.next_section_generation };
+    }
+
+    /// Releases only sections created after `checkpoint`, including their exact
+    /// dynamic-table references. Earlier sections on the same stream survive.
+    pub fn rollback(self: *Encoder, checkpoint_value: Checkpoint) !void {
+        if (checkpoint_value.next_section_generation > self.next_section_generation) return error.InvalidEncoderCheckpoint;
+        for (self.sections) |*section| {
+            if (section.active and section.generation >= checkpoint_value.next_section_generation) try self.release(section);
+        }
+        self.next_section_generation = checkpoint_value.next_section_generation;
     }
 
     pub fn setCapacity(self: *Encoder, stream: *Io.Writer, capacity: usize) !void {
@@ -108,10 +129,23 @@ pub const Encoder = struct {
         try field_wire.writePrefix(output, required, base, self.dynamic.maximum_capacity);
         try output.writeAll(staging.buffered());
         if (first_ref) |first| {
-            const slot = self.freeSection().?;
-            slot.* = .{ .active = true, .stream_id = stream_id, .required_insert_count = required, .first_absolute = first, .last_absolute = last_ref };
+            if (self.next_section_generation == std.math.maxInt(u64)) return error.SectionGenerationExhausted;
             var absolute = first;
-            while (absolute <= last_ref) : (absolute += 1) if (self.dynamic.entryAbsolute(absolute) != null) try self.dynamic.addReference(absolute);
+            while (absolute <= last_ref) : (absolute += 1) if (self.dynamic.entryAbsolute(absolute)) |entry| {
+                if (entry.references == std.math.maxInt(u32)) return error.TooManyReferences;
+            };
+            const slot = self.freeSection().?;
+            slot.* = .{
+                .active = true,
+                .generation = self.next_section_generation,
+                .stream_id = stream_id,
+                .required_insert_count = required,
+                .first_absolute = first,
+                .last_absolute = last_ref,
+            };
+            self.next_section_generation += 1;
+            absolute = first;
+            while (absolute <= last_ref) : (absolute += 1) if (self.dynamic.entryAbsolute(absolute) != null) self.dynamic.addReference(absolute) catch unreachable;
         }
     }
 
@@ -373,6 +407,58 @@ test "RFC Appendix B field blocks, blocking, acknowledgment, and round trip" {
     try decoder.writeSectionAcknowledgment(&decoder_stream, 4);
     try encoder.processDecoderStream(decoder_stream.buffered());
     try std.testing.expectEqual(@as(u62, 2), encoder.dynamic.known_received_count);
+}
+
+test "encoder checkpoint rolls back only new sections and exact dynamic references" {
+    var bytes: [128]u8 = undefined;
+    var entries: [4]table.Entry = undefined;
+    var sections: [4]Section = undefined;
+    var encoder = try Encoder.init(&bytes, &entries, &sections, 128, 4);
+    var instructions_storage: [64]u8 = undefined;
+    var instruction_writer: Io.Writer = .fixed(&instructions_storage);
+    try encoder.setCapacity(&instruction_writer, 128);
+    const absolute = try encoder.insertLiteral(&instruction_writer, "x-dynamic", "value", false);
+
+    var staging: [128]u8 = undefined;
+    var prior_storage: [128]u8 = undefined;
+    var prior: Io.Writer = .fixed(&prior_storage);
+    try encoder.encodeSection(&prior, 4, &.{.{ .name = "x-dynamic", .value = "value" }}, &staging, false);
+    try std.testing.expectEqual(@as(u32, 1), encoder.dynamic.entryAbsolute(absolute).?.references);
+
+    const checkpoint_value = encoder.checkpoint();
+    var first_storage: [128]u8 = undefined;
+    var first: Io.Writer = .fixed(&first_storage);
+    try encoder.encodeSection(&first, 4, &.{.{ .name = "x-dynamic", .value = "value" }}, &staging, false);
+    var second_storage: [128]u8 = undefined;
+    var second: Io.Writer = .fixed(&second_storage);
+    try encoder.encodeSection(&second, 8, &.{.{ .name = "x-dynamic", .value = "value" }}, &staging, false);
+    try std.testing.expectEqual(@as(u32, 3), encoder.dynamic.entryAbsolute(absolute).?.references);
+
+    try encoder.rollback(checkpoint_value);
+    try std.testing.expectEqual(@as(u32, 1), encoder.dynamic.entryAbsolute(absolute).?.references);
+    var active: usize = 0;
+    for (sections) |section| {
+        if (section.active) active += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), active);
+    try std.testing.expect(sections[0].active and sections[0].stream_id == 4);
+}
+
+test "failed field-section encoding leaves no section or dynamic reference" {
+    var bytes: [64]u8 = undefined;
+    var entries: [2]table.Entry = undefined;
+    var sections: [2]Section = undefined;
+    var encoder = try Encoder.init(&bytes, &entries, &sections, 64, 2);
+    var instruction_storage: [64]u8 = undefined;
+    var instruction_writer: Io.Writer = .fixed(&instruction_storage);
+    try encoder.setCapacity(&instruction_writer, 64);
+    const absolute = try encoder.insertLiteral(&instruction_writer, "x", "v", false);
+    var staging: [1]u8 = undefined;
+    var output_storage: [1]u8 = undefined;
+    var output: Io.Writer = .fixed(&output_storage);
+    try std.testing.expectError(error.WriteFailed, encoder.encodeSection(&output, 4, &.{.{ .name = "x", .value = "v" }}, &staging, false));
+    try std.testing.expectEqual(@as(u32, 0), encoder.dynamic.entryAbsolute(absolute).?.references);
+    for (sections) |section| try std.testing.expect(!section.active);
 }
 
 test "blocked stream limit and malformed references map to decompression failed" {

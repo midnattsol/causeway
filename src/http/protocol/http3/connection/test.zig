@@ -9,6 +9,7 @@ const Session = @import("session.zig").Session;
 const Headers = @import("../../../message/headers.zig").Headers;
 const response_module = @import("../../../message/response.zig");
 const Response = response_module.Response;
+const push_message = @import("../../../message/push.zig");
 const wt = @import("../webtransport/root.zig");
 const capsule = @import("../capsule/root.zig");
 
@@ -98,6 +99,13 @@ fn encodePeerSettings(destination: []u8, h3_datagram: bool) !usize {
         0;
     destination[0] = 0;
     return 1 + try frame.encode(destination[1..], .{ .frame_type = .settings, .payload = .{ .settings = payload[0..payload_len] } });
+}
+
+fn feedControlWithMaxPushId(transport: *FakeConnection, maximum: u64) !void {
+    var bytes: [64]u8 = undefined;
+    var length = try encodePeerSettings(&bytes, false);
+    length += try frame.encode(bytes[length..], .{ .frame_type = .max_push_id, .payload = .{ .max_push_id = maximum } });
+    try transport.feed(try support.clientUniId(0), bytes[0..length], false);
 }
 
 fn encodeGetHead(destination: []u8) !usize {
@@ -2397,4 +2405,630 @@ test "WebTransport scheduler is fair across two sessions and enforces per-sessio
         if (observed == 8) break;
     }
     try std.testing.expectEqual(@as(usize, 8), observed);
+}
+
+test "HTTP/3 server push is opt-in and requires MAX_PUSH_ID" {
+    const Enabled = comptime blk: {
+        var value = test_config;
+        value.enable_server_push = true;
+        value.max_pushes = 1;
+        break :blk value;
+    };
+    const State = struct { reason: std.atomic.Value(u8) = .init(0) };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            const outcome = try context.push(.{ .path = "/asset" }, .{ .status = .ok, .body = .{ .bytes = "asset" } });
+            const reason: u8 = switch (outcome) {
+                .promised => 255,
+                .unavailable => |value| @intCast(@intFromEnum(value) + 1),
+            };
+            context.execution.state.reason.store(reason, .release);
+            return .{ .status = .ok };
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var bytes: [512]u8 = undefined;
+
+    var disabled_transport: FakeConnection = .{};
+    var disabled_state: State = .{};
+    var disabled = Session(State, Dispatcher, FakeConnection, test_config).init(&disabled_transport, std.testing.allocator, &disabled_state, io);
+    defer disabled.deinit();
+    try disabled_transport.feed(try support.requestId(0), bytes[0..try encodeGetHead(&bytes)], true);
+    for (0..200) |step| {
+        _ = try disabled.poll(step + 1);
+        if (disabled_state.reason.load(.acquire) != 0) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(u8, @intFromEnum(push_message.PushUnavailable.server_disabled) + 1), disabled_state.reason.load(.acquire));
+
+    var enabled_transport: FakeConnection = .{};
+    var enabled_state: State = .{};
+    var enabled = Session(State, Dispatcher, FakeConnection, Enabled).init(&enabled_transport, std.testing.allocator, &enabled_state, io);
+    defer enabled.deinit();
+    try enabled_transport.feed(try support.requestId(0), bytes[0..try encodeGetHead(&bytes)], true);
+    for (0..200) |step| {
+        _ = try enabled.poll(step + 1);
+        if (enabled_state.reason.load(.acquire) != 0) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(u8, @intFromEnum(push_message.PushUnavailable.peer_disabled) + 1), enabled_state.reason.load(.acquire));
+    try std.testing.expectEqual(@as(u62, 0), enabled.push_registry.next_id);
+}
+
+test "HTTP/3 push capacity backpressures the parent and recycles slots without recycling IDs" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_server_push = true;
+        value.max_pushes = 1;
+        break :blk value;
+    };
+    const State = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        first_id: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+        second_capacity: std.atomic.Value(bool) = .init(false),
+        later_id: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+        peer_limit: std.atomic.Value(bool) = .init(false),
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            const call = context.execution.state.calls.fetchAdd(1, .acq_rel);
+            if (call == 0) {
+                const first = try context.push(.{ .path = "/a" }, .{ .status = .ok, .body = .{ .bytes = "a" } });
+                if (first == .promised) context.execution.state.first_id.store(first.promised, .release);
+                const second = try context.push(.{ .path = "/b" }, .{ .status = .ok, .body = .{ .bytes = "b" } });
+                if (second == .unavailable and second.unavailable == .capacity) context.execution.state.second_capacity.store(true, .release);
+            } else if (call == 1) {
+                const later = try context.push(.{ .path = "/c" }, .{ .status = .ok, .body = .{ .bytes = "c" } });
+                if (later == .promised) context.execution.state.later_id.store(later.promised, .release);
+            } else {
+                const limited = try context.push(.{ .path = "/d" }, .{ .status = .ok });
+                if (limited == .unavailable and limited.unavailable == .peer_limit_reached) context.execution.state.peer_limit.store(true, .release);
+            }
+            return .{ .status = .ok };
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{};
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    try session.activate();
+    try feedControlWithMaxPushId(&transport, 1);
+    _ = try session.poll(1);
+    transport.writes_blocked = true;
+    var bytes: [512]u8 = undefined;
+    const first_request = try support.requestId(0);
+    try transport.feed(first_request, bytes[0..try encodeGetHead(&bytes)], true);
+    for (0..200) |step| {
+        _ = try session.poll(step + 2);
+        if (state.first_id.load(.acquire) == 0) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(u64, 0), state.first_id.load(.acquire));
+    try std.testing.expect(!state.second_capacity.load(.acquire));
+    try std.testing.expect(!transport.find(first_request).?.finished);
+
+    transport.writes_blocked = false;
+    const first_push_stream = try support.serverUniId(3);
+    for (0..400) |step| {
+        _ = try session.poll(step + 300);
+        const push_slot = transport.find(first_push_stream);
+        if (state.second_capacity.load(.acquire) and transport.find(first_request).?.finished and push_slot != null and push_slot.?.finished) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(state.second_capacity.load(.acquire));
+    try std.testing.expect(transport.find(first_push_stream).?.finished);
+    try transport.acknowledgeFinish(first_push_stream);
+    try transport.acknowledgeFinish(first_request);
+    _ = try session.poll(750);
+    var parent_frames = frame.Parser{ .bytes = transport.output(first_request) };
+    const promise = (try parent_frames.next()).?;
+    try std.testing.expectEqual(frame.Type.push_promise, promise.frame_type);
+    try std.testing.expectEqual(@as(u64, 0), promise.payload.push_promise.push_id);
+
+    const second_request = try support.requestId(1);
+    try transport.feed(second_request, bytes[0..try encodeGetHead(&bytes)], true);
+    for (0..400) |step| {
+        _ = try session.poll(step + 800);
+        if (state.later_id.load(.acquire) == 1) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(u64, 1), state.later_id.load(.acquire));
+    for (0..400) |step| {
+        _ = try session.poll(step + 1300);
+        if (transport.find(second_request).?.finished) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try transport.acknowledgeFinish(second_request);
+    _ = try session.poll(1800);
+    const third_request = try support.requestId(2);
+    try transport.feed(third_request, bytes[0..try encodeGetHead(&bytes)], true);
+    for (0..200) |step| {
+        _ = try session.poll(step + 1900);
+        if (state.peer_limit.load(.acquire)) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(state.peer_limit.load(.acquire));
+    try std.testing.expectEqual(@as(u62, 2), session.push_registry.next_id);
+}
+
+test "HTTP/3 blocked push stream and invalid content length do not consume Push IDs" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_server_push = true;
+        value.max_pushes = 1;
+        break :blk value;
+    };
+    const State = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        blocked: std.atomic.Value(bool) = .init(false),
+        mismatch: std.atomic.Value(bool) = .init(false),
+        promised: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            const call = context.execution.state.calls.fetchAdd(1, .acq_rel);
+            if (call == 0) {
+                const outcome = try context.push(.{ .path = "/blocked" }, .{ .status = .ok });
+                if (outcome == .unavailable and outcome.unavailable == .stream_limit_reached) context.execution.state.blocked.store(true, .release);
+            } else {
+                _ = context.push(.{ .path = "/bad" }, .{
+                    .status = .ok,
+                    .headers = .{ .items = &.{.{ .name = "content-length", .value = "2" }} },
+                    .body = .{ .bytes = "bad" },
+                }) catch {
+                    context.execution.state.mismatch.store(true, .release);
+                };
+                const outcome = try context.push(.{ .path = "/good" }, .{ .status = .ok, .body = .{ .bytes = "ok" } });
+                if (outcome == .promised) context.execution.state.promised.store(outcome.promised, .release);
+            }
+            return .{ .status = .ok };
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{};
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    try session.activate();
+    try feedControlWithMaxPushId(&transport, 1);
+    _ = try session.poll(1);
+    transport.server_uni_limit = 3;
+    var bytes: [512]u8 = undefined;
+    try transport.feed(try support.requestId(0), bytes[0..try encodeGetHead(&bytes)], true);
+    for (0..200) |step| {
+        _ = try session.poll(step + 2);
+        if (state.blocked.load(.acquire)) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(state.blocked.load(.acquire));
+    try std.testing.expectEqual(@as(u62, 0), session.push_registry.next_id);
+
+    transport.server_uni_limit = std.math.maxInt(u64);
+    try transport.feed(try support.requestId(1), bytes[0..try encodeGetHead(&bytes)], true);
+    for (0..400) |step| {
+        _ = try session.poll(step + 300);
+        if (state.promised.load(.acquire) == 0) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(state.mismatch.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), state.promised.load(.acquire));
+}
+
+test "HTTP/3 push streams emit bytes streaming bodies trailers content length FIN and lifecycle once" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_server_push = true;
+        value.max_pushes = 2;
+        value.qpack_sections = 8;
+        value.response_body_buffer_size = 4;
+        value.response_writer_buffer_size = 3;
+        break :blk value;
+    };
+    const State = struct {
+        first_id: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+        second_id: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+        completions: std.atomic.Value(usize) = .init(0),
+        failures: std.atomic.Value(usize) = .init(0),
+        finalized: std.atomic.Value(usize) = .init(0),
+    };
+    const Observer = struct {
+        state: *State,
+        pub fn complete(self: *@This(), result: response_module.CompletionResult) void {
+            _ = self.state.completions.fetchAdd(1, .acq_rel);
+            if (result == .failure) _ = self.state.failures.fetchAdd(1, .acq_rel);
+        }
+    };
+    const Producer = struct {
+        state: *State,
+        pub fn produce(_: *@This(), writer: *Io.Writer) !void {
+            try writer.writeAll("stream");
+        }
+        pub fn trailers(_: *@This()) Headers {
+            return .{ .items = &.{.{ .name = "x-push-end", .value = "yes" }} };
+        }
+        pub fn finalize(self: *@This()) void {
+            _ = self.state.finalized.fetchAdd(1, .acq_rel);
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            var bytes_response = Response{
+                .status = .ok,
+                .headers = .{ .items = &.{.{ .name = "content-length", .value = "3" }} },
+                .body = .{ .bytes = "abc" },
+            };
+            bytes_response.completion = try response_module.Completion.create(
+                context.execution.allocator,
+                Observer{ .state = context.execution.state },
+                null,
+            );
+            const first = try context.push(.{ .path = "/bytes" }, bytes_response);
+            if (first == .promised) context.execution.state.first_id.store(first.promised, .release);
+
+            const body = try response_module.Stream.init(
+                context.execution.allocator,
+                Producer{ .state = context.execution.state },
+                .{ .content_length = 6, .trailer_names = &.{"x-push-end"} },
+            );
+            var stream_response = Response.streaming(.ok, .{
+                .items = &.{.{ .name = "content-length", .value = "6" }},
+            }, body);
+            stream_response.completion = try response_module.Completion.create(
+                context.execution.allocator,
+                Observer{ .state = context.execution.state },
+                null,
+            );
+            const second = try context.push(.{ .path = "/stream" }, stream_response);
+            if (second == .promised) context.execution.state.second_id.store(second.promised, .release);
+            return .{ .status = .ok };
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(12));
+    const io = threaded.io();
+    var transport: FakeConnection = .{ .write_limit = 1 };
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    try feedControlWithMaxPushId(&transport, 1);
+    var request_bytes: [512]u8 = undefined;
+    const parent = try support.requestId(0);
+    try transport.feed(parent, request_bytes[0..try encodeGetHead(&request_bytes)], true);
+    const first_stream = try support.serverUniId(3);
+    const second_stream = try support.serverUniId(4);
+    for (0..1000) |step| {
+        _ = try session.poll(step + 1);
+        const first_slot = transport.find(first_stream);
+        const second_slot = transport.find(second_stream);
+        if (first_slot != null and second_slot != null and first_slot.?.finished and second_slot.?.finished and
+            state.completions.load(.acquire) == 2 and state.finalized.load(.acquire) == 1) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(u64, 0), state.first_id.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), state.second_id.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), state.completions.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), state.failures.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), state.finalized.load(.acquire));
+    var occupied_before_ack: usize = 0;
+    for (session.pushes) |slot| {
+        if (slot.occupied) occupied_before_ack += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), occupied_before_ack);
+    try transport.acknowledgeFinish(first_stream);
+    try transport.acknowledgeFinish(second_stream);
+    _ = try session.poll(2000);
+    for (session.pushes) |slot| try std.testing.expect(!slot.occupied);
+
+    const first_wire = transport.output(first_stream);
+    const first_prefix = try stream.parsePrefix(first_wire);
+    try std.testing.expectEqual(stream.Type.push, first_prefix.stream_type);
+    try std.testing.expectEqual(@as(?u64, 0), first_prefix.push_id);
+    var first_frames = frame.Parser{ .bytes = first_wire[first_prefix.consumed..] };
+    try std.testing.expectEqual(frame.Type.headers, (try first_frames.next()).?.frame_type);
+    try std.testing.expectEqualStrings("abc", (try first_frames.next()).?.payload.data);
+    try std.testing.expect((try first_frames.next()) == null);
+
+    const second_wire = transport.output(second_stream);
+    const second_prefix = try stream.parsePrefix(second_wire);
+    try std.testing.expectEqual(stream.Type.push, second_prefix.stream_type);
+    try std.testing.expectEqual(@as(?u64, 1), second_prefix.push_id);
+    var second_frames = frame.Parser{ .bytes = second_wire[second_prefix.consumed..] };
+    try std.testing.expectEqual(frame.Type.headers, (try second_frames.next()).?.frame_type);
+    var body: [6]u8 = undefined;
+    var body_len: usize = 0;
+    while (try second_frames.next()) |item| {
+        if (item.frame_type == .headers) {
+            try std.testing.expectEqual(@as(usize, 6), body_len);
+            break;
+        }
+        try std.testing.expectEqual(frame.Type.data, item.frame_type);
+        @memcpy(body[body_len .. body_len + item.payload.data.len], item.payload.data);
+        body_len += item.payload.data.len;
+    }
+    try std.testing.expectEqualStrings("stream", body[0..body_len]);
+    try std.testing.expect((try second_frames.next()) == null);
+}
+
+test "HTTP/3 request slot waits for push ACK before max_requests one reuse" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.max_requests = 1;
+        value.qpack_blocked_streams = 1;
+        value.enable_server_push = true;
+        value.max_pushes = 1;
+        break :blk value;
+    };
+    const State = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        push_id: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+        reused: std.atomic.Value(bool) = .init(false),
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            const call = context.execution.state.calls.fetchAdd(1, .acq_rel);
+            if (call == 0) {
+                const outcome = try context.push(.{ .path = "/held" }, .{ .status = .ok, .body = .{ .bytes = "p" } });
+                if (outcome == .promised) context.execution.state.push_id.store(outcome.promised, .release);
+            } else context.execution.state.reused.store(true, .release);
+            return .{ .status = .ok };
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{};
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    try feedControlWithMaxPushId(&transport, 0);
+    var request_bytes: [512]u8 = undefined;
+    const first_request = try support.requestId(0);
+    const push_stream = try support.serverUniId(3);
+    try transport.feed(first_request, request_bytes[0..try encodeGetHead(&request_bytes)], true);
+    for (0..500) |step| {
+        _ = try session.poll(step + 1);
+        const push_slot = transport.find(push_stream);
+        if (transport.find(first_request).?.finished and push_slot != null and push_slot.?.finished) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(u64, 0), state.push_id.load(.acquire));
+    try transport.acknowledgeFinish(first_request);
+    _ = try session.poll(600);
+    try std.testing.expect(session.requests[0].occupied);
+    try std.testing.expectEqual(@as(usize, 1), session.requests[0].active_pushes);
+
+    try transport.acknowledgeFinish(push_stream);
+    _ = try session.poll(601);
+    try std.testing.expect(!session.requests[0].occupied);
+    const second_request = try support.requestId(1);
+    try transport.feed(second_request, request_bytes[0..try encodeGetHead(&request_bytes)], true);
+    for (0..200) |step| {
+        _ = try session.poll(step + 700);
+        if (state.reused.load(.acquire)) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(state.reused.load(.acquire));
+}
+
+test "HTTP/3 deinit completes a stack PushOperation pending behind promise backpressure" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_server_push = true;
+        value.max_pushes = 1;
+        break :blk value;
+    };
+    const State = struct {
+        first_promised: std.atomic.Value(bool) = .init(false),
+        pending_failed: std.atomic.Value(bool) = .init(false),
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            const first = try context.push(.{ .path = "/first" }, .{ .status = .ok, .body = .{ .bytes = "one" } });
+            context.execution.state.first_promised.store(first == .promised, .release);
+            _ = context.push(.{ .path = "/pending" }, .{ .status = .ok, .body = .{ .bytes = "two" } }) catch {
+                context.execution.state.pending_failed.store(true, .release);
+                return .{ .status = .ok };
+            };
+            return error.ExpectedPendingPushFailure;
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{};
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    try session.activate();
+    try feedControlWithMaxPushId(&transport, 1);
+    _ = try session.poll(1);
+    transport.writes_blocked = true;
+    var request_bytes: [512]u8 = undefined;
+    try transport.feed(try support.requestId(0), request_bytes[0..try encodeGetHead(&request_bytes)], true);
+    for (0..200) |step| {
+        _ = try session.poll(step + 2);
+        if (state.first_promised.load(.acquire)) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(state.first_promised.load(.acquire));
+    session.deinit();
+    try std.testing.expect(state.pending_failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), session.push_submissions.load(.acquire));
+}
+
+test "HTTP/3 default push timeout covers a blocked promise and aborts pending push safely" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_server_push = true;
+        value.max_pushes = 1;
+        value.response_write_timeout = .fromMilliseconds(5);
+        break :blk value;
+    };
+    const State = struct {
+        promised: std.atomic.Value(bool) = .init(false),
+        pending_failed: std.atomic.Value(bool) = .init(false),
+        completed_failure: std.atomic.Value(usize) = .init(0),
+        finalized: std.atomic.Value(usize) = .init(0),
+    };
+    const Observer = struct {
+        state: *State,
+        pub fn complete(self: *@This(), result: response_module.CompletionResult) void {
+            if (result == .failure) _ = self.state.completed_failure.fetchAdd(1, .acq_rel);
+        }
+    };
+    const Producer = struct {
+        state: *State,
+        pub fn produce(_: *@This(), writer: *Io.Writer) !void {
+            try writer.writeAll("body");
+        }
+        pub fn finalize(self: *@This()) void {
+            _ = self.state.finalized.fetchAdd(1, .acq_rel);
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            const stream_body = try response_module.Stream.init(context.execution.allocator, Producer{ .state = context.execution.state }, .{ .content_length = 4 });
+            var pushed = Response.streaming(.ok, .empty, stream_body);
+            pushed.completion = try response_module.Completion.create(context.execution.allocator, Observer{ .state = context.execution.state }, null);
+            const first = try context.push(.{ .path = "/timeout" }, pushed);
+            context.execution.state.promised.store(first == .promised, .release);
+            _ = context.push(.{ .path = "/pending" }, .{ .status = .ok }) catch {
+                context.execution.state.pending_failed.store(true, .release);
+                return .{ .status = .ok };
+            };
+            return error.ExpectedTimeout;
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{};
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    try session.activate();
+    try feedControlWithMaxPushId(&transport, 1);
+    _ = try session.poll(1);
+    transport.writes_blocked = true;
+    var request_bytes: [512]u8 = undefined;
+    const parent = try support.requestId(0);
+    try transport.feed(parent, request_bytes[0..try encodeGetHead(&request_bytes)], true);
+    for (0..200) |step| {
+        _ = try session.poll(step + 2);
+        if (state.promised.load(.acquire)) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(state.promised.load(.acquire));
+    try std.testing.expect(session.pushes[0].response.?.write_deadline != null);
+    try Io.sleep(io, .fromMilliseconds(10), .awake);
+    transport.writes_blocked = false;
+    for (0..300) |step| {
+        _ = session.poll(step + 300) catch {};
+        if (state.pending_failed.load(.acquire) and state.completed_failure.load(.acquire) == 1 and state.finalized.load(.acquire) == 1) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(state.pending_failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), state.completed_failure.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), state.finalized.load(.acquire));
+    try std.testing.expect(transport.find(parent).?.reset_code != null);
+}
+
+test "HTTP/3 precommit task failure rolls back only new QPACK sections and leaves Response caller-owned" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_server_push = true;
+        value.max_pushes = 1;
+        value.qpack_capacity = 256;
+        value.qpack_entries = 8;
+        break :blk value;
+    };
+    const State = struct {
+        failed: std.atomic.Value(bool) = .init(false),
+        produced: std.atomic.Value(usize) = .init(0),
+        finalized: std.atomic.Value(usize) = .init(0),
+    };
+    const Producer = struct {
+        state: *State,
+        pub fn produce(self: *@This(), _: *Io.Writer) !void {
+            _ = self.state.produced.fetchAdd(1, .acq_rel);
+        }
+        pub fn finalize(self: *@This()) void {
+            _ = self.state.finalized.fetchAdd(1, .acq_rel);
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            const body = try response_module.Stream.init(context.execution.allocator, Producer{ .state = context.execution.state }, .{ .content_length = 0 });
+            var pushed = Response.streaming(.ok, .{ .items = &.{.{ .name = "x-response", .value = "v" }} }, body);
+            _ = context.push(.{
+                .path = "/rollback",
+                .headers = .{ .items = &.{.{ .name = "x-request", .value = "v" }} },
+            }, pushed) catch {
+                context.execution.state.failed.store(true, .release);
+                pushed.body.finalize();
+                return .{ .status = .ok };
+            };
+            return error.ExpectedSpawnFailure;
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{ .fail_push_task_spawn = true };
+    var state: State = .{};
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    try session.activate();
+    var encoder_instructions: [256]u8 = undefined;
+    var instruction_writer: Io.Writer = .fixed(&encoder_instructions);
+    try session.encoder.?.setCapacity(&instruction_writer, 256);
+    const prior = try session.encoder.?.insertLiteral(&instruction_writer, "x-prior", "v", false);
+    const response_ref = try session.encoder.?.insertLiteral(&instruction_writer, "x-response", "v", false);
+    const request_ref = try session.encoder.?.insertLiteral(&instruction_writer, "x-request", "v", false);
+    var prior_staging: [128]u8 = undefined;
+    var prior_block_storage: [128]u8 = undefined;
+    var prior_block: Io.Writer = .fixed(&prior_block_storage);
+    try session.encoder.?.encodeSection(&prior_block, 0, &.{.{ .name = "x-prior", .value = "v" }}, &prior_staging, false);
+    try feedControlWithMaxPushId(&transport, 0);
+    var request_bytes: [512]u8 = undefined;
+    try transport.feed(try support.requestId(0), request_bytes[0..try encodeGetHead(&request_bytes)], true);
+    for (0..300) |step| {
+        _ = try session.poll(step + 1);
+        if (state.failed.load(.acquire)) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(state.failed.load(.acquire));
+    try std.testing.expectEqual(@as(u62, 0), session.push_registry.next_id);
+    try std.testing.expectEqual(@as(usize, 0), state.produced.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), state.finalized.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), session.encoder.?.dynamic.entryAbsolute(prior).?.references);
+    try std.testing.expectEqual(@as(u32, 0), session.encoder.?.dynamic.entryAbsolute(response_ref).?.references);
+    try std.testing.expectEqual(@as(u32, 0), session.encoder.?.dynamic.entryAbsolute(request_ref).?.references);
+    var active_sections: usize = 0;
+    for (session.encoder_sections) |section| {
+        if (section.active) active_sections += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), active_sections);
 }

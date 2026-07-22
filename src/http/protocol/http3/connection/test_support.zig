@@ -46,6 +46,7 @@ pub const FakeConnection = struct {
     event_end: usize = 0,
     next_uni: u64 = 0,
     next_bidi: u64 = 0,
+    server_uni_limit: u64 = std.math.maxInt(u64),
     reset_stream_at_supported: bool = false,
     close_code: ?u64 = null,
     exporter_label: [64]u8 = undefined,
@@ -63,6 +64,7 @@ pub const FakeConnection = struct {
     sent_datagram_count: usize = 0,
     operation_hook_context: ?*anyopaque = null,
     operation_hook: ?*const fn (*anyopaque) void = null,
+    fail_push_task_spawn: bool = false,
     write_log: [256]StreamId = undefined,
     write_log_count: usize = 0,
 
@@ -118,6 +120,14 @@ pub const FakeConnection = struct {
         if (self.operation_hook) |hook| hook(self.operation_hook_context.?);
     }
 
+    pub fn beforePushOperationEnqueue(self: *@This()) void {
+        if (self.operation_hook) |hook| hook(self.operation_hook_context.?);
+    }
+
+    pub fn beforePushTaskSpawn(self: *@This()) !void {
+        if (self.fail_push_task_spawn) return error.InjectedPushTaskSpawnFailure;
+    }
+
     pub fn openBidirectionalStream(self: *@This()) !StreamId {
         const id = try StreamId.fromParts(.server, .bidirectional, self.next_bidi);
         self.next_bidi += 1;
@@ -126,6 +136,7 @@ pub const FakeConnection = struct {
     }
 
     pub fn openUnidirectionalStream(self: *@This()) !StreamId {
+        if (self.next_uni >= self.server_uni_limit) return error.StreamLimitBlocked;
         const id = try StreamId.fromParts(.server, .unidirectional, self.next_uni);
         self.next_uni += 1;
         _ = try self.ensure(id);
@@ -313,6 +324,10 @@ pub fn requestId(ordinal: u64) !stream_id.Id {
 
 pub fn clientUniId(ordinal: u64) !stream_id.Id {
     return stream_id.Id.fromParts(.client, .unidirectional, ordinal);
+}
+
+pub fn serverUniId(ordinal: u64) !stream_id.Id {
+    return stream_id.Id.fromParts(.server, .unidirectional, ordinal);
 }
 
 pub fn encodeFieldSection(destination: []u8, stream: u62, fields: []const qpack.Field) !usize {

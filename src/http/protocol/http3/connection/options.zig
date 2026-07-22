@@ -14,6 +14,10 @@ pub const Config = struct {
     const webtransport_close_message_max: usize = 1024;
 
     max_requests: usize = 16,
+    /// Server push is opt-in. `max_pushes` bounds simultaneously owned push
+    /// responses; Push IDs remain monotonic and are never recycled.
+    enable_server_push: bool = false,
+    max_pushes: usize = 8,
     max_peer_unidirectional_streams: usize = 8,
     max_frame_size: usize = 16 * 1024,
     max_header_count: usize = 100,
@@ -74,6 +78,10 @@ pub const Config = struct {
         if (self.response_write_timeout) |timeout| if (timeout.nanoseconds <= 0) @compileError("HTTP/3 response write timeout must be positive");
         if (self.qpack_entries == 0 or self.qpack_sections == 0) @compileError("HTTP/3 QPACK metadata limits must be non-zero");
         if (self.qpack_blocked_streams > self.max_requests) @compileError("HTTP/3 QPACK blocked streams cannot exceed request slots");
+        if (self.enable_server_push) {
+            if (self.max_pushes == 0) @compileError("HTTP/3 max_pushes must be non-zero when server push is enabled");
+            if (self.max_pushes > (self.qpack_sections -| self.max_requests) / 2) @compileError("HTTP/3 QPACK sections need room for request responses, push promises, and push responses");
+        }
         if (self.max_field_section_size > self.max_header_bytes) @compileError("HTTP/3 max_field_section_size cannot exceed header storage");
         if (self.shutdown_timeout == 0) @compileError("HTTP/3 shutdown_timeout must be non-zero");
         if (self.enable_datagrams) {
@@ -106,9 +114,11 @@ pub const Config = struct {
 // Tests
 // -----------------------------------------------------------------------------
 
-test "WebTransport remains opt-in with bounded defaults" {
+test "optional HTTP/3 features remain disabled with bounded defaults" {
     const config = Config{};
     config.validate();
+    try std.testing.expect(!config.enable_server_push);
+    try std.testing.expect(config.max_pushes > 0);
     try std.testing.expect(!config.enable_webtransport);
     try std.testing.expectEqual(@as(usize, 1), config.max_webtransport_sessions);
     try std.testing.expect(config.max_pending_webtransport_streams > 0);

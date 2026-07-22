@@ -12,6 +12,9 @@ const Request = request_module.Request;
 const RequestBody = @import("../../../message/request_body.zig").RequestBody;
 const response_module = @import("../../../message/response.zig");
 const Response = response_module.Response;
+const push_message = @import("../../../message/push.zig");
+const PushOutcome = push_message.PushOutcome;
+const PushRequest = push_message.PushRequest;
 const DatagramChannel = response_module.DatagramChannel;
 const WebTransportSession = response_module.WebTransportSession;
 const WebTransportStream = response_module.WebTransportStream;
@@ -33,6 +36,7 @@ const request_adapter = @import("request.zig");
 const response_fields = @import("response.zig");
 const options_module = @import("options.zig");
 const datagram_pipe = @import("datagram.zig");
+const push_support = @import("push.zig");
 const webtransport_policy = @import("webtransport/policy.zig");
 const webtransport_controller = @import("webtransport/controller.zig");
 const webtransport = @import("../webtransport/root.zig");
@@ -111,6 +115,8 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         const Context = if (Locals) |LocalState| context_module.ContextWithLocals(State, LocalState) else context_module.Context(State);
         const frame_buffer_size = config.max_frame_size + 16;
         const response_control_size = config.max_response_header_bytes * 2 + 64;
+        const push_capacity = if (config.enable_server_push) config.max_pushes else 0;
+        const promise_buffer_size = config.max_header_bytes + 32;
         const datagram_capacity = if (config.enable_datagrams) config.datagram_queue_capacity else 0;
         const datagram_payload_size = if (config.enable_datagrams) config.datagram_max_payload else 0;
         const DatagramPipes = datagram_pipe.Pipes(datagram_capacity, datagram_payload_size);
@@ -256,6 +262,15 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         };
 
         const TaskDone = struct { slot: *RequestSlot, err: ?anyerror };
+        const PushTaskDone = struct { slot: *PushSlot, err: ?anyerror };
+        const PushOperation = struct {
+            parent: *RequestSlot,
+            request: PushRequest,
+            response: Response,
+            outcome: ?PushOutcome = null,
+            err: ?anyerror = null,
+            done: Io.Event = .unset,
+        };
         const Informational = struct {
             slot: *RequestSlot,
             status: std.http.Status,
@@ -267,6 +282,8 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             response_ready: *RequestSlot,
             task_done: TaskDone,
             informational: *Informational,
+            push_operation: *PushOperation,
+            push_task_done: PushTaskDone,
             webtransport_operation: *WebTransportOperation,
         };
         const MessageQueue = Io.Queue(Message);
@@ -362,6 +379,9 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             data_payload_sent: usize = 0,
             trailers_queued: bool = false,
             finish_queued: bool = false,
+            promise: ?*PushSlot = null,
+            pending_push: ?*PushOperation = null,
+            active_pushes: usize = 0,
 
             fn credit(raw: *anyopaque, amount: usize) void {
                 const self: *RequestSlot = @ptrCast(@alignCast(raw));
@@ -511,6 +531,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
             fn deinit(self: *RequestSlot) void {
                 if (self.occupied and self.webtransport_candidate) self.owner.addWebTransportTombstone(self.id.value);
+                self.owner.abortParentPushes(self, error.ConnectionClosed);
                 self.abort(error.ConnectionClosed);
                 if (self.webtransport_admitted) {
                     self.wt_accept_uni.close(self.owner.io);
@@ -518,6 +539,76 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     WtController.closeWebTransportStreams(self.owner, self, error.WebTransportSessionClosed);
                 }
                 if (self.arena) |*resources| _ = resources.release();
+                self.* = .{};
+            }
+        };
+
+        const PushSlot = struct {
+            owner: *Self = undefined,
+            occupied: bool = false,
+            parent: ?*RequestSlot = null,
+            id: u62 = 0,
+            stream_id: StreamId = undefined,
+            lease: ?RequestResources.Lease = null,
+            response: ?Response = null,
+            body_buffer: [config.response_body_buffer_size]u8 = undefined,
+            writer_buffer: [config.response_writer_buffer_size]u8 = undefined,
+            output_storage: outbound_body.Pipe = undefined,
+            output: ?*outbound_body.Pipe = null,
+            start: Io.Event = .unset,
+            task_done: bool = false,
+            suppress_body: bool = false,
+            finish_queued: bool = false,
+            output_acked: bool = false,
+            qpack_checkpoint: ?qpack.Encoder.Checkpoint = null,
+            expected_length: ?u64 = null,
+            response_bytes_sent: u64 = 0,
+            response_trailers: Headers = .empty,
+            completion_notified: bool = false,
+            control: [response_control_size]u8 = undefined,
+            control_len: usize = 0,
+            control_sent: usize = 0,
+            promise: [promise_buffer_size]u8 = undefined,
+            promise_len: usize = 0,
+            promise_sent: usize = 0,
+            bytes_offset: usize = 0,
+            data_header: [16]u8 = undefined,
+            data_header_len: usize = 0,
+            data_header_sent: usize = 0,
+            data_payload_len: usize = 0,
+            data_payload_sent: usize = 0,
+            trailers_queued: bool = false,
+            output_done: bool = false,
+            trailer_fields: [config.max_response_trailer_count]Header = undefined,
+            trailer_bytes: [config.max_response_trailer_size]u8 = undefined,
+
+            fn outputReady(_: *anyopaque) void {}
+
+            fn notifyCompletion(self: *PushSlot, result: response_module.CompletionResult) void {
+                if (self.completion_notified) return;
+                self.completion_notified = true;
+                if (self.response) |*response| response.complete(result);
+            }
+
+            fn fail(self: *PushSlot, err: anyerror) void {
+                if (self.output) |output| output.abort(err);
+                self.notifyCompletion(.{ .failure = err });
+                self.owner.connection.resetStream(self.stream_id, @intFromEnum(errors.Code.internal_error)) catch {};
+                self.output_done = true;
+            }
+
+            fn detachParent(self: *PushSlot) void {
+                const parent = self.parent orelse return;
+                if (parent.promise == self) parent.promise = null;
+                std.debug.assert(parent.active_pushes != 0);
+                parent.active_pushes -= 1;
+                self.parent = null;
+            }
+
+            fn recycle(self: *PushSlot) void {
+                std.debug.assert(self.parent == null);
+                if (self.response) |*response| response.body.finalize();
+                if (self.lease) |*lease| _ = lease.release();
                 self.* = .{};
             }
         };
@@ -659,6 +750,8 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         shutting_down: bool = false,
         webtransport_stopping: std.atomic.Value(bool) = .init(false),
         webtransport_submissions: std.atomic.Value(usize) = .init(0),
+        push_stopping: std.atomic.Value(bool) = .init(false),
+        push_submissions: std.atomic.Value(usize) = .init(0),
         final_goaway_sent: bool = false,
         highest_request_id: ?u64 = null,
         local_control: StreamId = undefined,
@@ -674,7 +767,9 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         peer_wt_initial_max_data: u64 = 0,
         peer_settings_received: bool = false,
         peer_settings_resumed: bool = false,
+        push_registry: push_support.Registry = .{},
         requests: [config.max_requests]RequestSlot = @splat(.{}),
+        pushes: [push_capacity]PushSlot = @splat(.{}),
         unidirectional: [config.max_peer_unidirectional_streams]UniSlot = @splat(.{}),
         webtransport_streams: [config.max_pending_webtransport_streams]WebTransportStreamSlot = @splat(.{}),
         pending_webtransport_datagrams: [datagram_capacity]PendingDatagram = @splat(.{}),
@@ -701,8 +796,13 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         qpack_value_scratch: [config.qpack_string_size]u8 = undefined,
         qpack_block: [config.max_response_header_bytes]u8 = undefined,
         qpack_staging: [config.max_response_header_bytes]u8 = undefined,
+        push_qpack_block: [config.max_header_bytes]u8 = undefined,
+        push_qpack_staging: [config.max_header_bytes]u8 = undefined,
         response_names: [config.max_response_header_bytes]u8 = undefined,
         response_field_storage: [config.max_header_count + 1]qpack.Field = undefined,
+        push_request_fields: [config.max_header_count + 4]qpack.Field = undefined,
+        push_validation_fields: [config.max_header_count + 4]Header = undefined,
+        push_request_names: [config.max_header_bytes]u8 = undefined,
 
         pub fn init(connection: *Connection, allocator: std.mem.Allocator, state_value: *State, io: Io) Self {
             return .{ .connection = connection, .allocator = allocator, .state = state_value, .io = io };
@@ -716,21 +816,35 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         pub fn deinit(self: *Self) void {
             self.webtransport_stopping.store(true, .release);
+            self.push_stopping.store(true, .release);
             if (self.messages_initialized) {
-                while (self.webtransport_submissions.load(.acquire) != 0) {
+                while (self.webtransport_submissions.load(.acquire) != 0 or self.push_submissions.load(.acquire) != 0) {
                     _ = self.processMessages() catch {};
                     std.Thread.yield() catch {};
                 }
                 _ = self.processMessages() catch {};
-            } else std.debug.assert(self.webtransport_submissions.load(.acquire) == 0);
-            for (&self.requests) |*slot| if (slot.occupied or slot.arena != null) slot.abort(error.ConnectionClosed);
+            } else {
+                std.debug.assert(self.webtransport_submissions.load(.acquire) == 0);
+                std.debug.assert(self.push_submissions.load(.acquire) == 0);
+            }
+            for (&self.requests) |*slot| if (slot.occupied or slot.arena != null) {
+                self.abortParentPushes(slot, error.ConnectionClosed);
+                slot.abort(error.ConnectionClosed);
+            };
+            for (&self.pushes) |*slot| if (slot.occupied) {
+                if (!slot.output_done) slot.fail(error.ConnectionClosed);
+                slot.detachParent();
+                slot.start.set(self.io);
+            };
             for (&self.requests) |*slot| if (slot.occupied and slot.webtransport_admitted) {
                 _ = WtController.recordWebTransportClose(self, slot, 0, "");
                 WtController.closeWebTransportStreams(self, slot, error.ConnectionClosed);
             };
             _ = self.processMessages() catch {};
             self.tasks.cancel(self.io);
+            _ = self.processMessages() catch {};
             self.pending_tasks = 0;
+            for (&self.pushes) |*slot| if (slot.occupied) slot.recycle();
             for (&self.requests) |*slot| if (slot.occupied or slot.arena != null) slot.deinit();
             for (&self.webtransport_streams) |*slot| if (slot.occupied) slot.clear();
             self.active = false;
@@ -788,6 +902,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 if (amount == 0) break;
                 progressed += amount;
             }
+            self.collectPushes();
             self.collectRequests();
             return progressed;
         }
@@ -825,6 +940,15 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             _ = now;
         }
 
+        fn submitPushOperation(self: *Self, operation: *PushOperation) !void {
+            _ = self.push_submissions.fetchAdd(1, .acq_rel);
+            defer _ = self.push_submissions.fetchSub(1, .acq_rel);
+            if (self.push_stopping.load(.acquire)) return error.ConnectionClosed;
+            if (comptime @hasDecl(Connection, "beforePushOperationEnqueue")) self.connection.beforePushOperationEnqueue();
+            if (self.push_stopping.load(.acquire)) return error.ConnectionClosed;
+            try self.messages.putOne(self.io, .{ .push_operation = operation });
+        }
+
         fn submitWebTransportOperation(self: *Self, operation: *WebTransportOperation) !void {
             _ = self.webtransport_submissions.fetchAdd(1, .acq_rel);
             defer _ = self.webtransport_submissions.fetchSub(1, .acq_rel);
@@ -845,6 +969,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                         std.debug.assert(self.pending_tasks != 0);
                         self.pending_tasks -= 1;
                         done.slot.task_done = true;
+                        for (&self.pushes) |*push_slot| if (push_slot.occupied and push_slot.parent == done.slot) push_slot.start.set(self.io);
                         if (done.err) |err| {
                             if (!(done.slot.tunnel and (done.slot.input_direction_failed or done.slot.output_direction_failed))) {
                                 self.failRequest(done.slot, if (done.slot.tunnel) .connect_error else .internal_error, err);
@@ -862,6 +987,13 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                         };
                         operation.done.set(self.io);
                     },
+                    .push_operation => |operation| self.processPushOperation(operation),
+                    .push_task_done => |done| {
+                        std.debug.assert(self.pending_tasks != 0);
+                        self.pending_tasks -= 1;
+                        done.slot.task_done = true;
+                        if (done.err) |err| self.failPush(done.slot, err);
+                    },
                     .webtransport_operation => |operation| {
                         const complete = WtController.processWebTransportOperation(self, operation) catch |err| blk: {
                             operation.err = err;
@@ -873,11 +1005,198 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
         }
 
+        fn completePushOperation(self: *Self, operation: *PushOperation, outcome: PushOutcome) void {
+            operation.outcome = outcome;
+            operation.done.set(self.io);
+        }
+
+        fn processPushOperation(self: *Self, operation: *PushOperation) void {
+            if (self.push_stopping.load(.acquire)) {
+                operation.err = error.ConnectionClosed;
+                operation.done.set(self.io);
+                return;
+            }
+            if (!operation.parent.occupied or operation.parent.output_done) {
+                operation.err = error.ParentRequestClosed;
+                operation.done.set(self.io);
+                return;
+            }
+            if (self.shutting_down) return self.completePushOperation(operation, .{ .unavailable = .connection_draining });
+            if (operation.parent.promise != null) {
+                std.debug.assert(operation.parent.pending_push == null);
+                operation.parent.pending_push = operation;
+                return;
+            }
+            if (self.push_registry.peer_max == null) return self.completePushOperation(operation, .{ .unavailable = .peer_disabled });
+            const push_id = self.push_registry.next() catch return self.completePushOperation(operation, .{ .unavailable = .peer_limit_reached });
+            const slot = self.freePush() orelse return self.completePushOperation(operation, .{ .unavailable = .capacity });
+            if (operation.parent.arena == null) {
+                operation.err = error.MissingRequestResources;
+                operation.done.set(self.io);
+                return;
+            }
+            const lease = operation.parent.arena.?.retain();
+            slot.* = .{
+                .owner = self,
+                .id = push_id,
+                .lease = lease,
+            };
+            slot.output_storage = outbound_body.Pipe.init(self.io, &slot.body_buffer, &slot.writer_buffer, .{ .context = slot, .notify_fn = PushSlot.outputReady }) catch |err| {
+                slot.recycle();
+                operation.err = err;
+                operation.done.set(self.io);
+                return;
+            };
+            slot.output = &slot.output_storage;
+            const push_stream = self.connection.openUnidirectionalStream() catch |err| {
+                slot.recycle();
+                if (err == error.StreamLimitBlocked) return self.completePushOperation(operation, .{ .unavailable = .stream_limit_reached });
+                operation.err = err;
+                operation.done.set(self.io);
+                return;
+            };
+            slot.stream_id = push_stream;
+            var accepted_response = operation.response;
+            if (accepted_response.write_deadline == null) if (config.response_write_timeout) |timeout| {
+                accepted_response.write_deadline = .fromNow(self.io, .{ .raw = timeout, .clock = .awake });
+            };
+            self.preparePush(slot, operation.parent, operation.request, accepted_response) catch |err| {
+                self.connection.resetStream(push_stream, @intFromEnum(errors.Code.internal_error)) catch {};
+                slot.recycle();
+                operation.err = err;
+                operation.done.set(self.io);
+                return;
+            };
+            if (comptime @hasDecl(Connection, "beforePushTaskSpawn")) self.connection.beforePushTaskSpawn() catch |err| {
+                self.rejectPreparedPush(slot, push_stream, operation, err);
+                return;
+            };
+            self.pending_tasks += 1;
+            self.tasks.concurrent(self.io, pushTask, .{ self, slot }) catch |err| {
+                self.pending_tasks -= 1;
+                self.rejectPreparedPush(slot, push_stream, operation, err);
+                return;
+            };
+            self.push_registry.commit(push_id) catch unreachable;
+            slot.qpack_checkpoint = null;
+            slot.occupied = true;
+            slot.parent = operation.parent;
+            operation.parent.active_pushes += 1;
+            operation.parent.promise = slot;
+            self.completePushOperation(operation, .{ .promised = push_id });
+        }
+
+        fn preparePush(self: *Self, slot: *PushSlot, parent: *RequestSlot, request: PushRequest, response: Response) !void {
+            if (response.takeover != null) return error.PushTakeoverForbidden;
+            const maximum: u32 = @intCast(@min(self.peer_max_field_section_size, std.math.maxInt(u32)));
+            const plan = try response_semantics.plan(request.method, response, maximum);
+            if (response.body == .stream) try trailer_policy.validateNames(response.body.stream.trailer_names, config.max_response_trailer_count, config.max_response_trailer_size);
+            if (response.body == .bytes and response.body.bytes.len > config.max_response_body_size) return error.ResponseBodyTooLarge;
+            if (request.headers.items.len + 4 > config.max_header_count) return error.TooManyHeaders;
+
+            var status_storage: [3]u8 = undefined;
+            const response_values = try response_fields.fields(response.status, response.headers, &self.response_field_storage, &self.response_names, &status_storage);
+            const promise_maximum: u32 = @intCast(@min(@as(u64, maximum), config.max_field_section_size));
+            const request_fields = try push_support.requestFields(
+                parent.request.?,
+                request,
+                &self.push_request_fields,
+                &self.push_validation_fields,
+                &self.push_request_names,
+                promise_maximum,
+            );
+            var prefix: [16]u8 = undefined;
+            const prefix_len = try stream.encodePrefix(&prefix, .push, slot.id);
+
+            const checkpoint_value = self.encoder.?.checkpoint();
+            slot.qpack_checkpoint = checkpoint_value;
+            errdefer self.rollbackPushQpack(slot);
+
+            @memcpy(slot.control[0..prefix_len], prefix[0..prefix_len]);
+            slot.control_len = prefix_len;
+            var response_writer: Io.Writer = .fixed(&self.qpack_block);
+            try self.encoder.?.encodeSection(&response_writer, @intCast(slot.stream_id.value), response_values, &self.qpack_staging, false);
+            slot.control_len += try frame.encode(slot.control[slot.control_len..], .{ .frame_type = .headers, .payload = .{ .headers = response_writer.buffered() } });
+
+            var promise_writer: Io.Writer = .fixed(&self.push_qpack_block);
+            try self.encoder.?.encodeSection(&promise_writer, @intCast(parent.id.value), request_fields, &self.push_qpack_staging, false);
+            slot.promise_len = try frame.encode(&slot.promise, .{ .frame_type = .push_promise, .payload = .{ .push_promise = .{
+                .push_id = slot.id,
+                .field_section = promise_writer.buffered(),
+            } } });
+            slot.suppress_body = !plan.produce_body;
+            slot.expected_length = plan.expected_length;
+            slot.response = response;
+        }
+
+        fn rollbackPushQpack(self: *Self, slot: *PushSlot) void {
+            const checkpoint_value = slot.qpack_checkpoint orelse return;
+            self.encoder.?.rollback(checkpoint_value) catch unreachable;
+            slot.qpack_checkpoint = null;
+        }
+
+        fn rejectPreparedPush(self: *Self, slot: *PushSlot, push_stream: StreamId, operation: *PushOperation, err: anyerror) void {
+            self.connection.resetStream(push_stream, @intFromEnum(errors.Code.internal_error)) catch {};
+            self.rollbackPushQpack(slot);
+            slot.response = null;
+            slot.recycle();
+            operation.err = err;
+            operation.done.set(self.io);
+        }
+
+        fn pushTask(self: *Self, slot: *PushSlot) Io.Cancelable!void {
+            slot.start.waitUncancelable(self.io);
+            var task_error: ?anyerror = null;
+            self.pushTaskRun(slot) catch |err| {
+                task_error = err;
+            };
+            self.messages.putOneUncancelable(self.io, .{ .push_task_done = .{ .slot = slot, .err = task_error } }) catch {};
+            if (task_error) |err| if (err == error.Canceled) return error.Canceled;
+        }
+
+        fn pushTaskRun(_: *Self, slot: *PushSlot) !void {
+            var response = &slot.response.?;
+            defer response.body.finalize();
+            if (slot.suppress_body or response.body != .stream) return;
+            var body = &response.body.stream;
+            body.produce(&slot.output.?.writer) catch |err| {
+                slot.output.?.abort(err);
+                return err;
+            };
+            slot.response_trailers = try copyPushTrailers(slot, body.trailers());
+            try trailer_policy.validateOutgoing(body.trailer_names, slot.response_trailers, config.max_response_trailer_count, config.max_response_trailer_size);
+            try slot.output.?.finish();
+        }
+
+        fn copyPushTrailers(slot: *PushSlot, headers: Headers) !Headers {
+            if (headers.items.len > slot.trailer_fields.len) return error.TooManyTrailers;
+            var cursor: usize = 0;
+            for (headers.items, slot.trailer_fields[0..headers.items.len]) |source, *destination| {
+                const needed = source.name.len + source.value.len;
+                if (needed > slot.trailer_bytes.len - cursor) return error.TrailersTooLarge;
+                const name = slot.trailer_bytes[cursor .. cursor + source.name.len];
+                @memcpy(name, source.name);
+                cursor += source.name.len;
+                const value = slot.trailer_bytes[cursor .. cursor + source.value.len];
+                @memcpy(value, source.value);
+                cursor += source.value.len;
+                destination.* = .{ .name = name, .value = value };
+            }
+            return .{ .items = slot.trailer_fields[0..headers.items.len] };
+        }
+
         pub fn nextDeadline(self: *const Self) ?u64 {
             var result: ?u64 = null;
             for (self.requests) |slot| {
                 if (!slot.occupied or slot.output_done or slot.response == null) continue;
                 if (slot.tunnel and slot.handshake_complete) continue;
+                const deadline = slot.response.?.write_deadline orelse continue;
+                if (deadline.clock != .awake) continue;
+                const value = std.math.cast(u64, deadline.raw.nanoseconds) orelse continue;
+                result = if (result) |current| @min(current, value) else value;
+            }
+            for (self.pushes) |slot| {
+                if (!slot.occupied or slot.output_done or slot.response == null) continue;
                 const deadline = slot.response.?.write_deadline orelse continue;
                 if (deadline.clock != .awake) continue;
                 const value = std.math.cast(u64, deadline.raw.nanoseconds) orelse continue;
@@ -894,6 +1213,11 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 if (deadline.clock.now(self.io).nanoseconds >= deadline.raw.nanoseconds) {
                     self.failRequest(slot, .request_cancelled, error.ResponseTimeout);
                 }
+            }
+            for (&self.pushes) |*slot| {
+                if (!slot.occupied or slot.output_done or slot.response == null) continue;
+                const deadline = slot.response.?.write_deadline orelse continue;
+                if (deadline.clock.now(self.io).nanoseconds >= deadline.raw.nanoseconds) self.failPush(slot, error.ResponseTimeout);
             }
         }
 
@@ -1196,6 +1520,10 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         fn sendFinished(self: *Self, id: StreamId) void {
+            if (self.findPush(id)) |slot| {
+                slot.output_acked = true;
+                return;
+            }
             if (self.findWebTransportStream(id)) |slot| {
                 if (slot.pending_open != null) slot.completePendingOpen(error.WebTransportOpenAborted);
                 slot.send_finished = true;
@@ -1242,6 +1570,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
             if (self.findRequest(id)) |slot| {
                 if (!slot.tunnel) return self.failRequest(slot, .request_cancelled, error.PeerReset);
+                self.abortParentPushes(slot, error.PeerReset);
                 slot.input_direction_failed = true;
                 slot.receive_finished = true;
                 if (slot.webtransport_established) WtController.remoteTerminateWebTransport(self, slot, 0, "", error.PeerReset) else if (slot.input) |input| input.fail(error.PeerReset);
@@ -1249,6 +1578,10 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         fn stopped(self: *Self, id: StreamId, code: u64) void {
+            if (self.findPush(id)) |slot| {
+                self.failPush(slot, error.PeerStopped);
+                return;
+            }
             if (self.findWebTransportStream(id)) |slot| {
                 if (slot.handle) |handle| handle.stop_code.store(code, .release);
                 if (slot.pending_open != null) slot.completePendingOpen(error.PeerStopped);
@@ -1265,6 +1598,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
             if (self.findRequest(id)) |slot| {
                 if (!slot.tunnel) return self.failRequest(slot, .request_cancelled, error.PeerStopped);
+                self.abortParentPushes(slot, error.PeerStopped);
                 slot.output_direction_failed = true;
                 slot.output_done = true;
                 slot.output_acked = true;
@@ -1328,7 +1662,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         fn flushResponses(self: *Self) !usize {
             var total: usize = 0;
             for (&self.requests) |*slot| {
-                if (!slot.occupied or slot.response == null or slot.output_done) continue;
+                if (!slot.occupied) continue;
                 if (slot.control_sent < slot.control_len) {
                     const written = try self.tryWrite(slot.id, slot.control[slot.control_sent..slot.control_len]);
                     slot.control_sent += written;
@@ -1337,6 +1671,18 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     slot.control_len = 0;
                     slot.control_sent = 0;
                 }
+                if (slot.promise) |promised| {
+                    const written = try self.tryWrite(slot.id, promised.promise[promised.promise_sent..promised.promise_len]);
+                    promised.promise_sent += written;
+                    total += written;
+                    if (promised.promise_sent != promised.promise_len) continue;
+                    slot.promise = null;
+                    if (slot.pending_push) |operation| {
+                        slot.pending_push = null;
+                        self.processPushOperation(operation);
+                    }
+                }
+                if (slot.output_done or slot.response == null) continue;
                 if (!slot.response_headers_sent) continue;
                 if (slot.tunnel and !slot.handshake_complete) {
                     slot.handshake_complete = true;
@@ -1386,7 +1732,123 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     .empty => {},
                 }
             }
+            for (&self.pushes) |*slot| {
+                if (!slot.occupied or slot.output_done) continue;
+                if (slot.parent) |parent| if (parent.promise == slot) continue;
+                total += try self.flushPush(slot);
+            }
             return total;
+        }
+
+        fn flushPush(self: *Self, slot: *PushSlot) !usize {
+            var total: usize = 0;
+            if (slot.control_sent < slot.control_len) {
+                const written = try self.tryWrite(slot.stream_id, slot.control[slot.control_sent..slot.control_len]);
+                slot.control_sent += written;
+                total += written;
+                if (slot.control_sent != slot.control_len) return total;
+                slot.control_len = 0;
+                slot.control_sent = 0;
+            }
+            if (slot.suppress_body or slot.response.?.body == .empty) {
+                if (slot.task_done) try self.finishPush(slot);
+                return total;
+            }
+            if (slot.data_header_len != 0) {
+                total += try self.flushPushDataFrame(slot);
+                if (slot.data_header_len != 0) return total;
+            }
+            switch (slot.response.?.body) {
+                .bytes => |bytes| {
+                    if (slot.bytes_offset < bytes.len) {
+                        try self.beginPushDataFrame(slot, @min(config.max_frame_size, bytes.len - slot.bytes_offset));
+                        total += try self.flushPushDataFrame(slot);
+                    } else if (slot.task_done) try self.finishPush(slot);
+                },
+                .stream => {
+                    const output = slot.output.?;
+                    if (output.failure()) |err| {
+                        self.failPush(slot, err);
+                        return total;
+                    }
+                    const bytes = output.peek(config.max_frame_size);
+                    if (bytes.len != 0) {
+                        if (slot.response_bytes_sent + bytes.len > config.max_response_body_size) {
+                            self.failPush(slot, error.ResponseBodyTooLarge);
+                            return total;
+                        }
+                        try self.beginPushDataFrame(slot, bytes.len);
+                        total += try self.flushPushDataFrame(slot);
+                    } else if (output.isFinished() and slot.task_done) {
+                        if (!slot.trailers_queued and !slot.response_trailers.isEmpty()) {
+                            try self.appendPushTrailerFrame(slot, slot.response_trailers);
+                            slot.trailers_queued = true;
+                        } else if (slot.control_len == 0) try self.finishPush(slot);
+                    }
+                },
+                .empty => unreachable,
+            }
+            return total;
+        }
+
+        fn beginPushDataFrame(_: *Self, slot: *PushSlot, length: usize) !void {
+            std.debug.assert(slot.data_header_len == 0 and length != 0);
+            var cursor: usize = 0;
+            var encoded: [8]u8 = undefined;
+            const type_bytes = try varint.encode(&encoded, @intFromEnum(frame.Type.data));
+            @memcpy(slot.data_header[cursor..][0..type_bytes.len], type_bytes);
+            cursor += type_bytes.len;
+            const length_bytes = try varint.encode(&encoded, length);
+            @memcpy(slot.data_header[cursor..][0..length_bytes.len], length_bytes);
+            cursor += length_bytes.len;
+            slot.data_header_len = cursor;
+            slot.data_payload_len = length;
+        }
+
+        fn flushPushDataFrame(self: *Self, slot: *PushSlot) !usize {
+            var total: usize = 0;
+            if (slot.data_header_sent < slot.data_header_len) {
+                const written = try self.tryWrite(slot.stream_id, slot.data_header[slot.data_header_sent..slot.data_header_len]);
+                slot.data_header_sent += written;
+                total += written;
+                if (slot.data_header_sent != slot.data_header_len) return total;
+            }
+            const remaining = slot.data_payload_len - slot.data_payload_sent;
+            if (remaining != 0) {
+                const source = switch (slot.response.?.body) {
+                    .bytes => |bytes| bytes[slot.bytes_offset..][0..remaining],
+                    .stream => slot.output.?.peek(remaining),
+                    .empty => unreachable,
+                };
+                const written = try self.tryWrite(slot.stream_id, source);
+                slot.data_payload_sent += written;
+                slot.response_bytes_sent += written;
+                switch (slot.response.?.body) {
+                    .bytes => slot.bytes_offset += written,
+                    .stream => slot.output.?.consume(written),
+                    .empty => unreachable,
+                }
+                total += written;
+            }
+            if (slot.data_payload_sent == slot.data_payload_len) {
+                slot.data_header_len = 0;
+                slot.data_header_sent = 0;
+                slot.data_payload_len = 0;
+                slot.data_payload_sent = 0;
+            }
+            return total;
+        }
+
+        fn finishPush(self: *Self, slot: *PushSlot) !void {
+            if (slot.finish_queued) return;
+            if (slot.expected_length) |expected| if (slot.response_bytes_sent != expected) {
+                self.failPush(slot, error.ResponseContentLengthMismatch);
+                return;
+            };
+            try self.connection.finishStream(slot.stream_id);
+            slot.finish_queued = true;
+            slot.output_done = true;
+            slot.notifyCompletion(.success);
         }
 
         fn flushTunnel(self: *Self, slot: *RequestSlot) !usize {
@@ -1463,7 +1925,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         fn finishResponse(self: *Self, slot: *RequestSlot) !void {
-            if (slot.finish_queued) return;
+            if (slot.finish_queued or slot.promise != null or slot.pending_push != null) return;
             if (!slot.tunnel) if (slot.expected_response_length) |expected| if (slot.response_bytes_sent != expected) {
                 self.failRequest(slot, .internal_error, error.ResponseContentLengthMismatch);
                 return;
@@ -1481,8 +1943,37 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             };
         }
 
+        fn abortParentPushes(self: *Self, parent: *RequestSlot, err: anyerror) void {
+            if (parent.pending_push) |operation| {
+                parent.pending_push = null;
+                operation.err = err;
+                operation.done.set(self.io);
+            }
+            parent.promise = null;
+            for (&self.pushes) |*slot| {
+                if (!slot.occupied or slot.parent != parent) continue;
+                if (!slot.output_done) slot.fail(err);
+                slot.detachParent();
+                slot.start.set(self.io);
+            }
+        }
+
+        fn failPush(self: *Self, slot: *PushSlot, err: anyerror) void {
+            if (!slot.occupied or slot.output_done) return;
+            if (slot.parent) |parent| {
+                if (parent.promise == slot) {
+                    self.failRequest(parent, .internal_error, err);
+                    return;
+                }
+            }
+            slot.fail(err);
+            slot.detachParent();
+            slot.start.set(self.io);
+        }
+
         fn failRequest(self: *Self, slot: *RequestSlot, code: errors.Code, err: anyerror) void {
             if (!slot.occupied) return;
+            self.abortParentPushes(slot, err);
             if (slot.webtransport_candidate) {
                 if (slot.webtransport_admitted) {
                     if (WtController.recordWebTransportClose(self, slot, 0, "")) WtController.closeWebTransportStreams(self, slot, err);
@@ -1503,11 +1994,20 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             slot.receive_finished = true;
         }
 
+        fn collectPushes(self: *Self) void {
+            for (&self.pushes) |*slot| {
+                if (!slot.occupied or !slot.task_done or !slot.output_done or !slot.output_acked) continue;
+                if (slot.parent) |parent| if (parent.promise == slot) continue;
+                slot.detachParent();
+                slot.recycle();
+            }
+        }
+
         fn collectRequests(self: *Self) void {
             for (&self.requests) |*slot| {
                 if (!slot.occupied or !slot.task_done or !slot.output_done or !slot.output_acked) continue;
                 if (slot.tunnel and !slot.receive_finished) continue;
-                if (slot.datagrams.hasPendingOutgoing()) continue;
+                if (slot.datagrams.hasPendingOutgoing() or slot.promise != null or slot.pending_push != null or slot.active_pushes != 0) continue;
                 slot.deinit();
             }
         }
@@ -1521,6 +2021,15 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 try self.owner.messages.putOne(self.owner.io, .{ .informational = &operation });
                 try operation.done.wait(self.owner.io);
                 if (operation.err) |err| return err;
+            }
+
+            pub fn push(self: *@This(), request: PushRequest, response: Response) !PushOutcome {
+                if (comptime !config.enable_server_push) return .{ .unavailable = .server_disabled };
+                var operation: PushOperation = .{ .parent = self.slot, .request = request, .response = response };
+                try self.owner.submitPushOperation(&operation);
+                operation.done.waitUncancelable(self.owner.io);
+                if (operation.err) |err| return err;
+                return operation.outcome.?;
             }
         };
 
@@ -2034,6 +2543,16 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 const previous_goaway = self.peer_control.last_goaway;
                 try self.peer_control.observe(parsed.frame);
                 if (parsed.frame.payload == .settings) try self.applySettings(parsed.frame.payload.settings);
+                if (parsed.frame.payload == .max_push_id) {
+                    const value = parsed.frame.payload.max_push_id;
+                    if (value > std.math.maxInt(u62)) return error.InvalidPushId;
+                    try self.push_registry.setPeerMax(@intCast(value));
+                }
+                if (parsed.frame.payload == .cancel_push) {
+                    // Cancellation state and producer interruption are intentionally
+                    // deferred to the next server-push commit.
+                    try self.push_registry.cancel(@intCast(parsed.frame.payload.cancel_push));
+                }
                 if (parsed.frame.payload == .goaway and self.peer_control.last_goaway != previous_goaway) {
                     for (&self.requests) |*request_slot| if (request_slot.occupied and request_slot.webtransport_established) {
                         request_slot.webtransport_draining.store(true, .release);
@@ -2139,6 +2658,19 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         fn appendTrailerFrame(self: *Self, slot: *RequestSlot, headers: Headers) !void {
             const fields_value = try response_fields.trailerFields(headers, &self.response_field_storage, &self.response_names);
             try self.encodeHeaderFrame(slot, fields_value);
+        }
+
+        fn appendPushTrailerFrame(self: *Self, slot: *PushSlot, headers: Headers) !void {
+            const fields_value = try response_fields.trailerFields(headers, &self.response_field_storage, &self.response_names);
+            try self.encodePushHeaderFrame(slot, fields_value);
+        }
+
+        fn encodePushHeaderFrame(self: *Self, slot: *PushSlot, fields_value: []const qpack.Field) !void {
+            if (slot.control_sent != 0) return error.StreamBlocked;
+            var writer: Io.Writer = .fixed(&self.qpack_block);
+            try self.encoder.?.encodeSection(&writer, @intCast(slot.stream_id.value), fields_value, &self.qpack_staging, false);
+            const written = try frame.encode(slot.control[slot.control_len..], .{ .frame_type = .headers, .payload = .{ .headers = writer.buffered() } });
+            slot.control_len += written;
         }
 
         fn encodeHeaderFrame(self: *Self, slot: *RequestSlot, fields_value: []const qpack.Field) !void {
@@ -2261,6 +2793,14 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
         fn freeRequest(self: *Self) ?*RequestSlot {
             for (&self.requests) |*slot| if (!slot.occupied) return slot;
+            return null;
+        }
+        fn freePush(self: *Self) ?*PushSlot {
+            for (&self.pushes) |*slot| if (!slot.occupied and slot.lease == null) return slot;
+            return null;
+        }
+        fn findPush(self: *Self, id: StreamId) ?*PushSlot {
+            for (&self.pushes) |*slot| if (slot.occupied and slot.stream_id.value == id.value) return slot;
             return null;
         }
         fn findUni(self: *Self, id: StreamId) ?*UniSlot {
