@@ -56,7 +56,8 @@ pub const ApplicationKeys = struct {
 
     pub fn init(secret: Secret, cipher_suite: tls.CipherSuite) !ApplicationKeys {
         const current = try derive(secret, cipher_suite);
-        const next_secret = updateSecret(secret);
+        var next_secret = updateSecret(secret);
+        defer std.crypto.secureZero(u8, &next_secret);
         var next = try derive(next_secret, cipher_suite);
         preserveHeaderKey(&next, current);
         return .{
@@ -71,9 +72,23 @@ pub const ApplicationKeys = struct {
         return self.key_phase;
     }
 
+    /// Clears the traffic secret and every retained packet-key generation.
+    /// Safe to call repeatedly.
+    pub fn deinit(self: *ApplicationKeys) void {
+        std.crypto.secureZero(u8, &self.current_secret);
+        if (self.previous) |*keys| keys.clear();
+        self.previous = null;
+        self.current.clear();
+        self.next.clear();
+        self.current_phase_start = null;
+        self.largest_current = null;
+        self.key_phase = false;
+    }
+
     /// Advances sending keys. Callers are responsible for enforcing handshake
     /// confirmation and acknowledgment timing requirements from RFC 9001 §6.1.
     pub fn update(self: *ApplicationKeys) !void {
+        if (self.previous) |*keys| keys.clear();
         self.previous = self.current;
         self.current = self.next;
         self.current_secret = updateSecret(self.current_secret);
@@ -133,6 +148,7 @@ pub const ApplicationKeys = struct {
     }
 
     fn promote(self: *ApplicationKeys, pn: u64) !void {
+        if (self.previous) |*keys| keys.clear();
         self.previous = self.current;
         self.current = self.next;
         self.current_secret = updateSecret(self.current_secret);
@@ -143,7 +159,8 @@ pub const ApplicationKeys = struct {
     }
 
     fn deriveNext(self: *ApplicationKeys) !void {
-        const next_secret = updateSecret(self.current_secret);
+        var next_secret = updateSecret(self.current_secret);
+        defer std.crypto.secureZero(u8, &next_secret);
         self.next = try derive(next_secret, self.suite_value);
         preserveHeaderKey(&self.next, self.current);
     }
@@ -184,6 +201,26 @@ test "suite shape and quic ku are deterministic and domain separated" {
     const next = updateSecret(secret);
     try std.testing.expect(!std.mem.eql(u8, &secret, &next));
     try std.testing.expectEqualSlices(u8, &next, &updateSecret(secret));
+}
+
+fn packetKeysAreZero(keys: PacketKeys) bool {
+    return switch (keys) {
+        inline else => |concrete| for (std.mem.asBytes(&concrete)) |byte| {
+            if (byte != 0) break false;
+        } else true,
+    };
+}
+
+test "application key deinit clears secret and every generation" {
+    var keys = try ApplicationKeys.init(@splat(0x6b), .CHACHA20_POLY1305_SHA256);
+    try keys.update();
+    try std.testing.expect(keys.previous != null);
+    keys.deinit();
+    try std.testing.expectEqual(@as(Secret, @splat(0)), keys.current_secret);
+    try std.testing.expect(keys.previous == null);
+    try std.testing.expect(packetKeysAreZero(keys.current));
+    try std.testing.expect(packetKeysAreZero(keys.next));
+    keys.deinit();
 }
 
 fn makePacket(storage: *[64]u8, phase: bool, pn: u8, payload: []const u8) []u8 {

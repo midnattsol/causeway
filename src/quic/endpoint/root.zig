@@ -25,8 +25,10 @@ pub const Entropy = struct {
 pub const RetryMode = enum { disabled, always };
 
 pub const Policy = struct {
-    /// Credentials and slices retained by transport parameters must outlive the endpoint.
+    /// Credentials and borrowed TLS policy values must outlive the endpoint.
     credentials: *const tls_server.ServerCredentials,
+    ticket_opener: ?tls_server.TicketOpener = null,
+    resumption_context: []const u8 = "",
     transport_parameters: transport_parameters.Values = .{},
     /// Length of server-issued connection IDs (1...20).
     connection_id_length: u8 = 16,
@@ -294,6 +296,8 @@ pub fn EndpointWithFeatures(
                         .x25519 = .{ .seed = entropy_bytes[52..84].* },
                         .transport_parameters = encoded_parameters,
                         .transcript_scratch = &slot.transcript,
+                        .ticket_opener = self.policy.ticket_opener,
+                        .resumption_context = self.policy.resumption_context,
                     },
                     .now = now,
                     .ecn_enabled = features.ecn,

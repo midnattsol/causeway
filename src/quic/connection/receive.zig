@@ -214,7 +214,7 @@ fn driveTls(self: anytype, level: types.Level, now: u64) !void {
         if (message_length > receiver.storage.len) return error.CryptoBufferExceeded;
         if (readable.len < message_length) break;
         const outputs = self.tls.receive(tls_level, readable[0..message_length], self.tls_initial_output, self.tls_handshake_output) catch |err| {
-            fail(self, types.CloseCode.crypto_error_base + 40, 0x06, "TLS handshake failure", now);
+            fail(self, tlsCryptoErrorCode(err), 0x06, "TLS handshake failure", now);
             return err;
         };
         if (outputs.initial.len != 0) try writeAll(&self.crypto.initial.sender, outputs.initial);
@@ -262,6 +262,10 @@ fn driveTls(self: anytype, level: types.Level, now: u64) !void {
     }
 }
 
+fn tlsCryptoErrorCode(err: anyerror) u64 {
+    return types.CloseCode.crypto_error_base + tls_server.alertForError(err);
+}
+
 fn writeAll(sender: anytype, bytes: []const u8) !void {
     var cursor: usize = 0;
     while (cursor < bytes.len) cursor += try sender.write(bytes[cursor..]);
@@ -304,6 +308,15 @@ fn onAck(self: anytype, level: types.Level, ack: frame.Ack, now: u64) !void {
 fn scaleAckDelay(raw: u64, exponent: u8) u64 {
     const microseconds = raw *| (@as(u64, 1) << @intCast(exponent));
     return microseconds *| 1_000;
+}
+
+test "TLS alerts map to exact QUIC CRYPTO_ERROR codes" {
+    try std.testing.expectEqual(@as(u64, 0x100 + 51), tlsCryptoErrorCode(error.BadBinder));
+    try std.testing.expectEqual(@as(u64, 0x100 + 51), tlsCryptoErrorCode(error.BadFinished));
+    try std.testing.expectEqual(@as(u64, 0x100 + 10), tlsCryptoErrorCode(error.UnexpectedHandshakeType));
+    try std.testing.expectEqual(@as(u64, 0x100 + 50), tlsCryptoErrorCode(error.TruncatedHandshake));
+    try std.testing.expectEqual(@as(u64, 0x100 + 70), tlsCryptoErrorCode(error.Tls13NotOffered));
+    try std.testing.expectEqual(@as(u64, 0x100 + 120), tlsCryptoErrorCode(error.H3NotOffered));
 }
 
 test "RESET_STREAM_AT normative failures map to QUIC transport errors" {

@@ -198,7 +198,8 @@ pub fn Connection(comptime limits: Limits) type {
                 options.client_source_id.len > 20 or options.server_connection_id.len > 20)
                 return error.InvalidConnectionIdLength;
             if (options.server_connection_id.len == 0) return error.InvalidConnectionIdLength;
-            const secrets = crypto_initial.derive(initial_destination_id);
+            var secrets = crypto_initial.derive(initial_destination_id);
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&secrets));
             var result: Self = .{
                 .original_destination_id_len = @intCast(options.original_destination_id.len),
                 .initial_destination_id_len = @intCast(initial_destination_id.len),
@@ -242,9 +243,31 @@ pub fn Connection(comptime limits: Limits) type {
             };
         }
 
-        /// Securely clears retained TLS secrets. Safe to call more than once.
+        /// Securely clears all TLS and QUIC packet-key material. Safe to call repeatedly.
         pub fn deinit(self: *Self) void {
+            self.clearKeyMaterial();
+        }
+
+        fn clearPacketKeys(slot: *?protection.Keys) void {
+            if (slot.*) |*keys| keys.clear();
+            slot.* = null;
+        }
+
+        fn clearApplicationKeys(slot: *?packet_keys.ApplicationKeys) void {
+            if (slot.*) |*keys| keys.deinit();
+            slot.* = null;
+        }
+
+        fn clearKeyMaterial(self: *Self) void {
             self.tls.deinit();
+            clearPacketKeys(&self.initial_local);
+            clearPacketKeys(&self.initial_remote);
+            clearPacketKeys(&self.handshake_local);
+            clearPacketKeys(&self.handshake_remote);
+            clearPacketKeys(&self.application_local);
+            clearPacketKeys(&self.application_remote);
+            clearApplicationKeys(&self.application_send_keys);
+            clearApplicationKeys(&self.application_receive_keys);
         }
 
         /// RFC 8446 Section 7.5 exporter with caller-owned output storage.
@@ -422,7 +445,7 @@ pub fn Connection(comptime limits: Limits) type {
         }
         pub fn onStatelessReset(self: *Self, now: u64) void {
             if (self.state == .closed or self.state == .draining) return;
-            self.tls.deinit();
+            self.clearKeyMaterial();
             self.state = .draining;
             self.close_started = now;
         }
@@ -433,14 +456,14 @@ pub fn Connection(comptime limits: Limits) type {
 
         pub fn close(self: *Self, code: u64, frame_type: ?u64, reason: []const u8, now: u64) void {
             if (self.state == .closed or self.state == .draining) return;
-            self.tls.deinit();
+            self.clearKeyMaterial();
             self.setCloseInfo(code, frame_type, reason);
             self.state = .closing;
             self.close_started = now;
         }
 
         pub fn peerClose(self: *Self, code: u64, frame_type: ?u64, reason: []const u8, now: u64) void {
-            self.tls.deinit();
+            self.clearKeyMaterial();
             self.setCloseInfo(code, frame_type, reason);
             self.state = .draining;
             self.close_started = now;
@@ -487,20 +510,34 @@ pub fn Connection(comptime limits: Limits) type {
             };
         }
         pub fn installTlsKeys(self: *Self) !void {
-            if (self.tls.handshakeKeys()) |keys| {
+            if (self.tls.takeHandshakeKeys()) |transferred| {
+                var keys = transferred;
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&keys));
+                clearPacketKeys(&self.handshake_local);
+                clearPacketKeys(&self.handshake_remote);
                 self.handshake_local = keys.local;
                 self.handshake_remote = keys.remote;
             }
             if (self.tls.takeApplicationTrafficSecrets()) |transferred| {
                 var secrets = transferred;
                 defer {
-                    @memset(&secrets.server, 0);
-                    @memset(&secrets.client, 0);
+                    std.crypto.secureZero(u8, &secrets.server);
+                    std.crypto.secureZero(u8, &secrets.client);
                 }
-                self.application_send_keys = try packet_keys.ApplicationKeys.init(secrets.server, secrets.cipher_suite);
-                self.application_receive_keys = try packet_keys.ApplicationKeys.init(secrets.client, secrets.cipher_suite);
-                self.application_local = self.application_send_keys.?.current;
-                self.application_remote = self.application_receive_keys.?.current;
+                var send = try packet_keys.ApplicationKeys.init(secrets.server, secrets.cipher_suite);
+                errdefer send.deinit();
+                var receive_keys = try packet_keys.ApplicationKeys.init(secrets.client, secrets.cipher_suite);
+                errdefer receive_keys.deinit();
+                clearApplicationKeys(&self.application_send_keys);
+                clearApplicationKeys(&self.application_receive_keys);
+                clearPacketKeys(&self.application_local);
+                clearPacketKeys(&self.application_remote);
+                self.application_send_keys = send;
+                self.application_receive_keys = receive_keys;
+                self.application_local = send.current;
+                self.application_remote = receive_keys.current;
+                send.deinit();
+                receive_keys.deinit();
             }
         }
 
@@ -518,16 +555,16 @@ pub fn Connection(comptime limits: Limits) type {
             if (self.initial_discarded) return;
             const discarded = self.detectors[0].discard();
             self.congestion.onPacketsAcknowledged(discarded.slice(), true);
-            self.initial_local = null;
-            self.initial_remote = null;
+            clearPacketKeys(&self.initial_local);
+            clearPacketKeys(&self.initial_remote);
             self.initial_discarded = true;
         }
         pub fn discardHandshake(self: *Self) void {
             if (self.handshake_discarded) return;
             const discarded = self.detectors[1].discard();
             self.congestion.onPacketsAcknowledged(discarded.slice(), true);
-            self.handshake_local = null;
-            self.handshake_remote = null;
+            clearPacketKeys(&self.handshake_local);
+            clearPacketKeys(&self.handshake_remote);
             self.handshake_discarded = true;
         }
     };
@@ -552,6 +589,99 @@ fn testInit(credentials: *const tls_server.ServerCredentials, transcript: []u8) 
         },
         .now = 0,
     };
+}
+
+fn populateAllConnectionKeys(connection: anytype) !void {
+    const aes: protection.Keys = .{ .aes_128_gcm = .{ .key = @splat(0x31), .iv = @splat(0x42), .hp = @splat(0x53) } };
+    connection.initial_local = aes;
+    connection.initial_remote = aes;
+    connection.handshake_local = aes;
+    connection.handshake_remote = aes;
+    connection.application_local = aes;
+    connection.application_remote = aes;
+    var send = try packet_keys.ApplicationKeys.init(@splat(0x61), .AES_128_GCM_SHA256);
+    try send.update();
+    connection.application_send_keys = send;
+    send.deinit();
+    var receive_keys = try packet_keys.ApplicationKeys.init(@splat(0x62), .AES_128_GCM_SHA256);
+    try receive_keys.update();
+    connection.application_receive_keys = receive_keys;
+    receive_keys.deinit();
+}
+
+fn expectAllConnectionKeysCleared(connection: anytype) !void {
+    try std.testing.expect(connection.initial_local == null);
+    try std.testing.expect(connection.initial_remote == null);
+    try std.testing.expect(connection.handshake_local == null);
+    try std.testing.expect(connection.handshake_remote == null);
+    try std.testing.expect(connection.application_local == null);
+    try std.testing.expect(connection.application_remote == null);
+    try std.testing.expect(connection.application_send_keys == null);
+    try std.testing.expect(connection.application_receive_keys == null);
+    try std.testing.expect(connection.tls.handshakeKeys() == null);
+    try std.testing.expect(connection.tls.takeApplicationTrafficSecrets() == null);
+}
+
+test "connection termination paths clear every packet-key copy" {
+    const Action = enum { deinit, close, peer_close, stateless_reset };
+    inline for (std.enums.values(Action)) |action| {
+        const limits: Limits = .{ .crypto_receive_bytes = 64, .crypto_send_bytes = 64, .tls_output_bytes = 128 };
+        var storage: Storage(limits) = .{};
+        var transcript: [512]u8 = undefined;
+        const credentials = testCredentials();
+        var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+        try populateAllConnectionKeys(&connection);
+        switch (action) {
+            .deinit => connection.deinit(),
+            .close => connection.close(CloseCode.internal_error, null, "close", 1),
+            .peer_close => connection.peerClose(CloseCode.internal_error, null, "peer", 1),
+            .stateless_reset => connection.onStatelessReset(1),
+        }
+        try expectAllConnectionKeysCleared(&connection);
+        connection.deinit();
+    }
+}
+
+test "BadFinished cleanup clears installed Handshake and Application keys" {
+    const X25519 = std.crypto.dh.X25519;
+    const limits: Limits = .{ .crypto_receive_bytes = 4096, .crypto_send_bytes = 4096, .tls_output_bytes = 4096 };
+    var storage: Storage(limits) = .{};
+    var transcript: [8192]u8 = undefined;
+    const credentials = testCredentials();
+    var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+    defer connection.deinit();
+    const client_key = try X25519.KeyPair.generateDeterministic(@splat(0x11));
+    var hello_storage: [256]u8 = undefined;
+    const hello = makeTestClientHello(&hello_storage, client_key.public_key, "\x04\x02\x40\x40\x0f\x06client");
+    _ = try connection.tls.receive(.initial, hello, connection.tls_initial_output, connection.tls_handshake_output);
+    try connection.installTlsKeys();
+    try std.testing.expect(connection.tls.handshakeKeys() == null);
+    try std.testing.expect(connection.tls.takeApplicationTrafficSecrets() == null);
+    try std.testing.expect(connection.handshake_local != null and connection.handshake_remote != null);
+    try std.testing.expect(connection.application_send_keys != null and connection.application_receive_keys != null);
+
+    var bad_finished: [36]u8 = @splat(0);
+    bad_finished[0..4].* = .{ @intFromEnum(std.crypto.tls.HandshakeType.finished), 0, 0, 32 };
+    try std.testing.expectError(error.BadFinished, connection.tls.receive(.handshake, &bad_finished, &.{}, &.{}));
+    connection.close(CloseCode.crypto_error_base + tls_server.alertForError(error.BadFinished), 0x06, "TLS handshake failure", 1);
+    try std.testing.expectEqual(CloseCode.crypto_error_base + @intFromEnum(tls_server.AlertDescription.decrypt_error), connection.close_info.?.code);
+    try expectAllConnectionKeysCleared(&connection);
+}
+
+test "discard paths zero and release Initial and Handshake keys" {
+    const limits: Limits = .{ .crypto_receive_bytes = 64, .crypto_send_bytes = 64, .tls_output_bytes = 128 };
+    var storage: Storage(limits) = .{};
+    var transcript: [512]u8 = undefined;
+    const credentials = testCredentials();
+    var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+    defer connection.deinit();
+    const aes: protection.Keys = .{ .aes_128_gcm = .{ .key = @splat(0x31), .iv = @splat(0x42), .hp = @splat(0x53) } };
+    connection.handshake_local = aes;
+    connection.handshake_remote = aes;
+    connection.discardInitial();
+    connection.discardHandshake();
+    try std.testing.expect(connection.initial_local == null and connection.initial_remote == null);
+    try std.testing.expect(connection.handshake_local == null and connection.handshake_remote == null);
 }
 
 test "connection storage and core are allocation free fixed-size values" {
@@ -909,7 +1039,7 @@ test "deterministic client Initial through server flight and Finished" {
     const application_datagram = try connection.buildDatagram(&application_datagram_storage, 5);
     const application_header = try packet_header.parse(application_datagram, "client".len);
     try std.testing.expectEqual(packet_header.Type.short, application_header.packet_type);
-    const application_clear = try connection.application_local.?.unprotect(application_datagram, application_header.packet_number_offset.?, null);
+    const application_clear = try connection.application_send_keys.?.current.unprotect(application_datagram, application_header.packet_number_offset.?, null);
     var application_frames: frame.Iterator = .{ .payload = application_clear.payload };
     var saw_handshake_done = false;
     while (try application_frames.next()) |value| switch (value) {

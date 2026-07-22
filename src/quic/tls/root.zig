@@ -12,6 +12,7 @@ pub const crypto_stream = @import("crypto_stream.zig");
 pub const negotiation = @import("negotiation.zig");
 pub const key_schedule = @import("key_schedule.zig");
 pub const session_ticket = @import("session_ticket.zig");
+pub const resumption = @import("resumption.zig");
 pub const packet_keys = @import("packet_keys.zig");
 pub const server = @import("server.zig");
 

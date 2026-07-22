@@ -28,6 +28,13 @@ pub const Keys = union(enum) {
     aes_128_gcm: Aes128Keys,
     chacha20_poly1305: ChaCha20Keys,
 
+    /// Clears AEAD, IV, and header-protection material while retaining a valid tag.
+    pub fn clear(self: *Keys) void {
+        switch (self.*) {
+            inline else => |*keys| std.crypto.secureZero(u8, std.mem.asBytes(keys)),
+        }
+    }
+
     pub fn protect(
         self: Keys,
         packet: []u8,
