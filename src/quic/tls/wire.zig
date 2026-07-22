@@ -8,16 +8,22 @@ pub const ExtensionType = tls.ExtensionType;
 pub const CipherSuite = tls.CipherSuite;
 pub const NamedGroup = tls.NamedGroup;
 pub const SignatureScheme = tls.SignatureScheme;
+pub const PskKeyExchangeMode = tls.PskKeyExchangeMode;
 
 /// One complete TLS handshake message. `body` aliases the input buffer.
 pub const Handshake = struct {
     message_type: HandshakeType,
     body: []const u8,
+    encoded: []const u8,
 
-    /// Parses the body as a TLS 1.3 ClientHello.
+    /// Parses the body as a TLS 1.3 ClientHello. When PSK is present,
+    /// `binder_transcript` is the exact framed prefix hashed for its binders.
     pub fn clientHello(self: Handshake) !ClientHello {
         if (self.message_type != .client_hello) return error.UnexpectedHandshakeType;
-        return parseClientHello(self.body);
+        var hello = try parseClientHello(self.body);
+        if (hello.binder_transcript_body) |prefix|
+            hello.binder_transcript = self.encoded[0 .. 4 + prefix.len];
+        return hello;
     }
 };
 
@@ -86,6 +92,66 @@ pub const ServerNameIterator = struct {
 
 pub const KeyShareEntry = struct { group: NamedGroup, key_exchange: []const u8 };
 
+pub const PskIdentity = struct {
+    identity: []const u8,
+    obfuscated_ticket_age: u32,
+};
+
+pub const PskIdentityIterator = struct {
+    bytes: []const u8,
+    cursor: usize = 0,
+
+    pub fn next(self: *PskIdentityIterator) ?PskIdentity {
+        if (self.cursor == self.bytes.len) return null;
+        const length = readU16(self.bytes[self.cursor..][0..2]);
+        self.cursor += 2;
+        const identity = self.bytes[self.cursor..][0..length];
+        self.cursor += length;
+        const age = std.mem.readInt(u32, self.bytes[self.cursor..][0..4], .big);
+        self.cursor += 4;
+        return .{ .identity = identity, .obfuscated_ticket_age = age };
+    }
+};
+
+pub const PskBinderIterator = struct {
+    bytes: []const u8,
+    cursor: usize = 0,
+
+    pub fn next(self: *PskBinderIterator) ?[]const u8 {
+        if (self.cursor == self.bytes.len) return null;
+        const length = self.bytes[self.cursor];
+        self.cursor += 1;
+        const binder = self.bytes[self.cursor..][0..length];
+        self.cursor += length;
+        return binder;
+    }
+};
+
+pub const OfferedPsks = struct {
+    identities: []const u8,
+    binders: []const u8,
+    count: usize,
+
+    pub fn identityIterator(self: OfferedPsks) PskIdentityIterator {
+        return .{ .bytes = self.identities };
+    }
+
+    pub fn binderIterator(self: OfferedPsks) PskBinderIterator {
+        return .{ .bytes = self.binders };
+    }
+};
+
+pub const PskModeIterator = struct {
+    bytes: []const u8,
+    cursor: usize = 0,
+
+    pub fn next(self: *PskModeIterator) ?PskKeyExchangeMode {
+        if (self.cursor == self.bytes.len) return null;
+        defer self.cursor += 1;
+        return @enumFromInt(self.bytes[self.cursor]);
+    }
+};
+
 pub const KeyShareIterator = struct {
     bytes: []const u8,
     cursor: usize = 0,
@@ -104,6 +170,7 @@ pub const KeyShareIterator = struct {
 /// Borrowed and fully validated TLS 1.3 ClientHello fields.
 pub const ClientHello = struct {
     legacy_version: u16,
+    encoded_body: []const u8 = "",
     random: *const [32]u8,
     session_id: []const u8,
     cipher_suites: []const u8,
@@ -116,6 +183,14 @@ pub const ClientHello = struct {
     server_names: ?[]const u8 = null,
     application_protocols: ?[]const u8 = null,
     quic_transport_parameters: ?[]const u8 = null,
+    psk_key_exchange_modes: ?[]const u8 = null,
+    pre_shared_key: ?OfferedPsks = null,
+    /// Presence is exposed for policy, but this layer never accepts 0-RTT.
+    early_data: bool = false,
+    /// Framed ClientHello prefix through `identities`, excluding binders.
+    binder_transcript: ?[]const u8 = null,
+    /// Body-only equivalent used by `parseClientHello` callers.
+    binder_transcript_body: ?[]const u8 = null,
 
     pub fn extensionIterator(self: ClientHello) ExtensionIterator {
         return .{ .bytes = self.extensions };
@@ -147,6 +222,25 @@ pub const ClientHello = struct {
 
     pub fn protocolIterator(self: ClientHello) ProtocolIterator {
         return .{ .bytes = self.application_protocols orelse &.{} };
+    }
+
+    pub fn pskModeIterator(self: ClientHello) PskModeIterator {
+        return .{ .bytes = self.psk_key_exchange_modes orelse &.{} };
+    }
+
+    /// True when the client permits PSK authentication combined with (EC)DHE.
+    pub fn containsPskDheKe(self: ClientHello) bool {
+        var modes = self.pskModeIterator();
+        while (modes.next()) |mode| if (mode == .psk_dhe_ke) return true;
+        return false;
+    }
+
+    pub fn pskIdentityIterator(self: ClientHello) PskIdentityIterator {
+        return .{ .bytes = if (self.pre_shared_key) |psks| psks.identities else &.{} };
+    }
+
+    pub fn pskBinderIterator(self: ClientHello) PskBinderIterator {
+        return .{ .bytes = if (self.pre_shared_key) |psks| psks.binders else &.{} };
     }
 
     /// Returns the offered `h3` ALPN token, if present.
@@ -192,7 +286,7 @@ pub fn parseHandshake(bytes: []const u8) !Handshake {
     const length = (@as(usize, bytes[1]) << 16) | (@as(usize, bytes[2]) << 8) | bytes[3];
     if (length > bytes.len - 4) return error.TruncatedHandshake;
     if (length != bytes.len - 4) return error.TrailingHandshakeBytes;
-    return .{ .message_type = @enumFromInt(bytes[0]), .body = bytes[4..] };
+    return .{ .message_type = @enumFromInt(bytes[0]), .body = bytes[4..], .encoded = bytes };
 }
 
 /// Parses a complete ClientHello body without taking ownership of its bytes.
@@ -211,6 +305,7 @@ pub fn parseClientHello(bytes: []const u8) !ClientHello {
 
     var result: ClientHello = .{
         .legacy_version = legacy_version,
+        .encoded_body = bytes,
         .random = @ptrCast(random_bytes),
         .session_id = session_id,
         .cipher_suites = cipher_suites,
@@ -244,9 +339,59 @@ fn parseExtensions(result: *ClientHello) !void {
             .server_name => result.server_names = try serverNameVector(data),
             .application_layer_protocol_negotiation => result.application_protocols = try protocolVector(data),
             .quic_transport_parameters => result.quic_transport_parameters = data,
+            .psk_key_exchange_modes => result.psk_key_exchange_modes = try pskModeVector(data),
+            .pre_shared_key => {
+                if (cursor != result.extensions.len) return error.PreSharedKeyNotLast;
+                result.pre_shared_key = try offeredPsks(data, result);
+            },
+            .early_data => {
+                if (data.len != 0) return error.MalformedExtension;
+                result.early_data = true;
+            },
             else => {},
         }
     }
+    if (result.pre_shared_key != null and result.psk_key_exchange_modes == null)
+        return error.MissingPskKeyExchangeModes;
+    if (result.early_data and result.pre_shared_key == null)
+        return error.EarlyDataWithoutPreSharedKey;
+}
+
+fn pskModeVector(data: []const u8) ![]const u8 {
+    var cursor: usize = 0;
+    const value = try takeVector8(data, &cursor);
+    if (cursor != data.len or value.len == 0) return error.MalformedExtension;
+    return value;
+}
+
+fn offeredPsks(data: []const u8, hello: *ClientHello) !OfferedPsks {
+    var cursor: usize = 0;
+    const identities = try takeVector16(data, &cursor);
+    if (identities.len < 7) return error.MalformedExtension;
+
+    var identity_cursor: usize = 0;
+    var identity_count: usize = 0;
+    while (identity_cursor < identities.len) {
+        const identity = try takeVector16(identities, &identity_cursor);
+        if (identity.len == 0) return error.MalformedExtension;
+        _ = try take(identities, &identity_cursor, 4);
+        identity_count += 1;
+    }
+
+    const binder_boundary = @intFromPtr(data.ptr) + cursor - @intFromPtr(hello.encoded_body.ptr);
+    if (binder_boundary > hello.encoded_body.len) return error.MalformedExtension;
+    const binders = try takeVector16(data, &cursor);
+    if (cursor != data.len or binders.len < 33) return error.MalformedExtension;
+    var binder_cursor: usize = 0;
+    var binder_count: usize = 0;
+    while (binder_cursor < binders.len) {
+        const binder = try takeVector8(binders, &binder_cursor);
+        if (binder.len < 32) return error.InvalidBinderLength;
+        binder_count += 1;
+    }
+    if (identity_count != binder_count) return error.PskCountMismatch;
+    hello.binder_transcript_body = hello.encoded_body[0..binder_boundary];
+    return .{ .identities = identities, .binders = binders, .count = identity_count };
 }
 
 fn vector8OfU16(data: []const u8, allow_empty: bool) ![]const u8 {
@@ -386,6 +531,68 @@ test "ClientHello rejects malformed fixed and top-level vectors" {
     try std.testing.expectError(error.TrailingClientHelloBytes, parseClientHello(body));
     const odd_suites = "\x03\x03rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr\x00\x00\x01x\x01\x00\x00\x00";
     try std.testing.expectError(error.InvalidCipherSuites, parseClientHello(odd_suites));
+}
+
+const psk_hello_body = "\x03\x03rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr" ++
+    "\x00\x00\x02\x13\x01\x01\x00\x00\x3c" ++
+    "\x00\x2d\x00\x02\x01\x01" ++
+    "\x00\x2a\x00\x00" ++
+    "\x00\x29\x00\x2e" ++
+    "\x00\x09\x00\x03one\x01\x02\x03\x04" ++
+    "\x00\x21\x20bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+const psk_hello = framed(psk_hello_body);
+
+test "PSK extensions are borrowed and preserve the exact binder transcript boundary" {
+    const hello = try (try parseHandshake(psk_hello)).clientHello();
+    try std.testing.expect(hello.early_data);
+    var modes = hello.pskModeIterator();
+    try std.testing.expectEqual(PskKeyExchangeMode.psk_dhe_ke, modes.next().?);
+    try std.testing.expect(hello.containsPskDheKe());
+    var psk_only = hello;
+    psk_only.psk_key_exchange_modes = "\x00";
+    try std.testing.expect(!psk_only.containsPskDheKe());
+    try std.testing.expect(modes.next() == null);
+    try std.testing.expectEqual(@as(usize, 1), hello.pre_shared_key.?.count);
+    var identities = hello.pskIdentityIterator();
+    const identity = identities.next().?;
+    try std.testing.expectEqualStrings("one", identity.identity);
+    try std.testing.expectEqual(@as(u32, 0x01020304), identity.obfuscated_ticket_age);
+    try std.testing.expect(identities.next() == null);
+    var binders = hello.pskBinderIterator();
+    try std.testing.expectEqualStrings("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", binders.next().?);
+    try std.testing.expect(binders.next() == null);
+    try std.testing.expectEqual(@as(usize, 72), hello.binder_transcript.?.len);
+    try std.testing.expectEqualSlices(u8, psk_hello[0..72], hello.binder_transcript.?);
+    try std.testing.expectEqualSlices(u8, psk_hello_body[0..68], hello.binder_transcript_body.?);
+}
+
+test "PSK extension ordering counts lengths and early data encoding are strict" {
+    const base = "\x03\x03rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr\x00\x00\x02\x13\x01\x01\x00";
+    const not_last_extensions = psk_hello_body[43..] ++ "\xaa\xaa\x00\x00";
+    const not_last = base ++ [2]u8{ 0, @intCast(not_last_extensions.len) } ++ not_last_extensions;
+    try std.testing.expectError(error.PreSharedKeyNotLast, parseClientHello(not_last));
+
+    const early_without_psk = "\x00\x2a\x00\x00";
+    const early_without_psk_body = base ++ [2]u8{ 0, @intCast(early_without_psk.len) } ++ early_without_psk;
+    try std.testing.expectError(error.EarlyDataWithoutPreSharedKey, parseClientHello(early_without_psk_body));
+
+    const psk_without_modes = psk_hello_body[53..];
+    const psk_without_modes_body = base ++ [2]u8{ 0, @intCast(psk_without_modes.len) } ++ psk_without_modes;
+    try std.testing.expectError(error.MissingPskKeyExchangeModes, parseClientHello(psk_without_modes_body));
+
+    const bad_early = "\x00\x2a\x00\x01x";
+    const bad_early_body = base ++ [2]u8{ 0, @intCast(bad_early.len) } ++ bad_early;
+    try std.testing.expectError(error.MalformedExtension, parseClientHello(bad_early_body));
+
+    const short_binder_extension = "\x00\x29\x00\x2d\x00\x09\x00\x03one\x00\x00\x00\x00\x00\x20\x1f" ++ "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const short_binder = base ++ [2]u8{ 0, @intCast(short_binder_extension.len) } ++ short_binder_extension;
+    try std.testing.expectError(error.MalformedExtension, parseClientHello(short_binder));
+
+    const two_binders_extension = "\x00\x29\x00\x4f\x00\x09\x00\x03one\x00\x00\x00\x00\x00\x42" ++
+        "\x20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x20bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const two_binders = base ++ [2]u8{ 0, @intCast(two_binders_extension.len) } ++ two_binders_extension;
+    try std.testing.expectError(error.PskCountMismatch, parseClientHello(two_binders));
 }
 
 test "extensions reject duplicates and malformed nested vectors" {

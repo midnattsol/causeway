@@ -7,6 +7,7 @@ const std = @import("std");
 
 const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 pub const secret_length = Hkdf.prk_length;
 pub const Secret = [secret_length]u8;
@@ -26,6 +27,12 @@ pub fn transcriptHash(bytes: []const u8) TranscriptHash {
     return digest;
 }
 
+pub const EarlySecrets = struct {
+    early_secret: Secret,
+    resumption_binder_key: Secret,
+    binder_finished_key: Secret,
+};
+
 pub const HandshakeSecrets = struct {
     early_secret: Secret,
     derived_secret: Secret,
@@ -43,11 +50,60 @@ pub const ApplicationSecrets = struct {
     exporter_master_secret: Secret,
 };
 
-/// Derives secrets through the handshake traffic-secret stage from ECDHE.
-pub fn deriveHandshake(shared_secret: []const u8, hello_transcript_hash: TranscriptHash) HandshakeSecrets {
+pub const ResumptionSecrets = struct {
+    resumption_master_secret: Secret,
+};
+
+/// Derives the resumption binder branch rooted at a ticket PSK.
+pub fn deriveEarly(psk: []const u8) EarlySecrets {
     const zeros: Secret = @splat(0);
     const empty_hash = transcriptHash("");
+    const early = Hkdf.extract(&zeros, psk);
+    const binder_key = expand(early, "res binder", &empty_hash, secret_length);
+    return .{
+        .early_secret = early,
+        .resumption_binder_key = binder_key,
+        .binder_finished_key = finishedKey(binder_key),
+    };
+}
+
+/// Computes a SHA-256 resumption binder over the exact truncated ClientHello
+/// transcript hash supplied by the wire layer.
+pub fn computeResumptionBinder(psk: []const u8, binder_transcript_hash: TranscriptHash) Secret {
+    var early = deriveEarly(psk);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&early));
+    var binder: Secret = undefined;
+    HmacSha256.create(&binder, &binder_transcript_hash, &early.binder_finished_key);
+    return binder;
+}
+
+/// Verifies an exact SHA-256 resumption binder in constant time. Non-32-byte
+/// values are rejected before comparison; the derived expected value is always
+/// securely cleared.
+pub fn verifyResumptionBinder(psk: []const u8, binder_transcript_hash: TranscriptHash, binder: []const u8) bool {
+    if (binder.len != secret_length) return false;
+    var expected = computeResumptionBinder(psk, binder_transcript_hash);
+    defer std.crypto.secureZero(u8, &expected);
+    return std.crypto.timing_safe.eql([secret_length]u8, expected, binder[0..secret_length].*);
+}
+
+/// Derives secrets through the handshake traffic-secret stage from ECDHE,
+/// preserving the original non-PSK schedule API.
+pub fn deriveHandshake(shared_secret: []const u8, hello_transcript_hash: TranscriptHash) HandshakeSecrets {
+    const zeros: Secret = @splat(0);
     const early = Hkdf.extract(&zeros, &zeros);
+    return deriveHandshakeFromEarly(early, shared_secret, hello_transcript_hash);
+}
+
+/// RFC 8446 PSK-DHE schedule for a resumption PSK and fresh ECDHE secret.
+pub fn deriveHandshakePsk(psk: []const u8, shared_secret: []const u8, hello_transcript_hash: TranscriptHash) HandshakeSecrets {
+    var early = deriveEarly(psk);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&early));
+    return deriveHandshakeFromEarly(early.early_secret, shared_secret, hello_transcript_hash);
+}
+
+fn deriveHandshakeFromEarly(early: Secret, shared_secret: []const u8, hello_transcript_hash: TranscriptHash) HandshakeSecrets {
+    const empty_hash = transcriptHash("");
     const derived = expand(early, "derived", &empty_hash, secret_length);
     const handshake = Hkdf.extract(&derived, shared_secret);
     const client = expand(handshake, "c hs traffic", &hello_transcript_hash, secret_length);
@@ -76,6 +132,19 @@ pub fn deriveApplication(handshake_secret: Secret, handshake_transcript_hash: Tr
         .server_application_traffic_secret_0 = expand(master, "s ap traffic", &handshake_transcript_hash, secret_length),
         .exporter_master_secret = expand(master, "exp master", &handshake_transcript_hash, secret_length),
     };
+}
+
+/// Derives the resumption master secret only at the transcript boundary after
+/// the authenticated ClientFinished message.
+pub fn deriveResumption(master_secret: Secret, client_finished_transcript_hash: TranscriptHash) ResumptionSecrets {
+    return .{
+        .resumption_master_secret = expand(master_secret, "res master", &client_finished_transcript_hash, secret_length),
+    };
+}
+
+/// Derives the independent PSK carried by one NewSessionTicket nonce.
+pub fn deriveTicketPsk(resumption_master_secret: Secret, ticket_nonce: []const u8) Secret {
+    return expand(resumption_master_secret, "resumption", ticket_nonce, secret_length);
 }
 
 pub fn finishedKey(base_key: Secret) Secret {
@@ -136,6 +205,54 @@ test "RFC 8448 early derived and handshake secrets" {
     try expectHex("33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a", &schedule.early_secret);
     try expectHex("6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba", &schedule.derived_secret);
     try expectHex("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac", &schedule.handshake_secret);
+}
+
+test "RFC 8448 resumed binder and PSK-DHE schedule vectors" {
+    var psk: Secret = undefined;
+    _ = try std.fmt.hexToBytes(&psk, "4ecd0eb6ec3b4d87f5d6028f922ca4c5851a277fd41311c9e62d2c9492e1c4f3");
+    var early = deriveEarly(&psk);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&early));
+    try expectHex("9b2188e9b2fc6d64d71dc329900e20bb41915000f678aa839cbb797cb7d8332c", &early.early_secret);
+    try expectHex("69fe131a3bbad5d63c64eebcc30e395b9d8107726a13d074e389dbc8a4e47256", &early.resumption_binder_key);
+    try expectHex("5588673e72cb59c87d220caffe94f2dea9a3b1609f7d50e90a48227db9ed7eaa", &early.binder_finished_key);
+    var binder_hash: TranscriptHash = undefined;
+    _ = try std.fmt.hexToBytes(&binder_hash, "63224b2e4573f2d3454ca84b9d009a04f6be9e05711a8396473aefa01e924a14");
+    var binder = computeResumptionBinder(&psk, binder_hash);
+    defer std.crypto.secureZero(u8, &binder);
+    try expectHex("3add4fb2d8fdf822a0ca3cf7678ef5e88dae990141c5924d57bb6fa31b9e5f9d", &binder);
+    try std.testing.expect(verifyResumptionBinder(&psk, binder_hash, &binder));
+    try std.testing.expect(!verifyResumptionBinder(&psk, binder_hash, binder[0..31]));
+    binder[0] ^= 1;
+    try std.testing.expect(!verifyResumptionBinder(&psk, binder_hash, &binder));
+
+    var shared: Secret = undefined;
+    _ = try std.fmt.hexToBytes(&shared, "f44194756ff9ec9d25180635d66ea6824c6ab3bf179977be37f723570e7ccb2e");
+    var hello_hash: TranscriptHash = undefined;
+    _ = try std.fmt.hexToBytes(&hello_hash, "f736cb34fe25e701551bee6fd24c1cc7102a7daf9405cb15d97aafe16f757d03");
+    const schedule = deriveHandshakePsk(&psk, &shared, hello_hash);
+    try expectHex("5f1790bbd82c5e7d376ed2e1e52f8e6038c9346db61b43be9a52f77ef3998e80", &schedule.derived_secret);
+    try expectHex("005cb112fd8eb4ccc623bb88a07c64b3ede1605363fc7d0df8c7ce4ff0fb4ae6", &schedule.handshake_secret);
+    try expectHex("2faac08f851d35fea3604fcb4de82dc62c9b164a70974d0462e27f1ab278700f", &schedule.client_handshake_traffic_secret);
+    try expectHex("fe927ae271312e8bf0275b581c54eef020450dc4ecffaa05a1a35d27518e7803", &schedule.server_handshake_traffic_secret);
+}
+
+test "RFC 8448 full application resumption and per-ticket vectors" {
+    var handshake_secret: Secret = undefined;
+    _ = try std.fmt.hexToBytes(&handshake_secret, "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac");
+    var server_finished_hash: TranscriptHash = undefined;
+    _ = try std.fmt.hexToBytes(&server_finished_hash, "9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13");
+    const application = deriveApplication(handshake_secret, server_finished_hash);
+    try expectHex("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919", &application.master_secret);
+    try expectHex("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5", &application.client_application_traffic_secret_0);
+    try expectHex("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643", &application.server_application_traffic_secret_0);
+    try expectHex("fe22f881176eda18eb8f44529e6792c50c9a3f89452f68d8ae311b4309d3cf50", &application.exporter_master_secret);
+
+    var client_finished_hash: TranscriptHash = undefined;
+    _ = try std.fmt.hexToBytes(&client_finished_hash, "209145a96ee8e2a122ff810047cc952684658d6049e86429426db87c54ad143d");
+    const resumption = deriveResumption(application.master_secret, client_finished_hash);
+    try expectHex("7df235f2031d2a051287d02b0241b0bfdaf86cc856231f2d5aba46c434ec196c", &resumption.resumption_master_secret);
+    const ticket_psk = deriveTicketPsk(resumption.resumption_master_secret, "\x00\x00");
+    try expectHex("4ecd0eb6ec3b4d87f5d6028f922ca4c5851a277fd41311c9e62d2c9492e1c4f3", &ticket_psk);
 }
 
 test "transcript boundaries deterministically separate traffic secrets" {

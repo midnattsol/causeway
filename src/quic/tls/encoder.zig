@@ -12,6 +12,8 @@ pub const ServerHello = struct {
     session_id: []const u8,
     cipher_suite: tls.CipherSuite,
     key_share: *const [32]u8,
+    /// Present only when accepting a ClientHello PSK identity.
+    selected_identity: ?u16 = null,
 };
 
 pub const EncryptedExtensions = struct {
@@ -27,7 +29,7 @@ pub const CertificateVerify = struct {
 pub fn encodeServerHello(buffer: []u8, hello: ServerHello) ![]u8 {
     if (hello.session_id.len > 32) return error.InvalidSessionId;
 
-    const extensions_length: usize = 6 + 40;
+    const extensions_length: usize = 6 + 40 + if (hello.selected_identity != null) @as(usize, 6) else 0;
     const body_length = try sum(&.{ 2, 32, 1, hello.session_id.len, 2, 1, 2, extensions_length });
     var writer = try Writer.initHandshake(buffer, .server_hello, body_length);
     writer.u16(0x0303);
@@ -46,6 +48,11 @@ pub fn encodeServerHello(buffer: []u8, hello: ServerHello) ![]u8 {
     writer.u16(@intFromEnum(tls.NamedGroup.x25519));
     writer.u16(32);
     writer.bytes(hello.key_share);
+    if (hello.selected_identity) |identity| {
+        writer.u16(@intFromEnum(tls.ExtensionType.pre_shared_key));
+        writer.u16(2);
+        writer.u16(identity);
+    }
     return writer.finish();
 }
 
@@ -102,6 +109,35 @@ pub fn encodeCertificateVerify(buffer: []u8, verify: CertificateVerify) ![]u8 {
     return writer.finish();
 }
 
+pub const NewSessionTicket = struct {
+    ticket_lifetime: u32,
+    ticket_age_add: u32,
+    ticket_nonce: []const u8,
+    ticket: []const u8,
+};
+
+pub const maximum_ticket_lifetime: u32 = 7 * 24 * 60 * 60;
+
+/// Performs strict RFC 8446 wire framing for NewSessionTicket with no
+/// extensions. A zero lifetime is valid on the wire; issuance policy belongs
+/// to the session-ticket controller. This API cannot advertise early data.
+pub fn encodeNewSessionTicket(buffer: []u8, ticket: NewSessionTicket) ![]u8 {
+    if (ticket.ticket_lifetime > maximum_ticket_lifetime) return error.InvalidTicketLifetime;
+    if (ticket.ticket_nonce.len > max_u8) return error.LengthOverflow;
+    if (ticket.ticket.len == 0) return error.EmptyTicket;
+    if (ticket.ticket.len > max_u16) return error.LengthOverflow;
+    const body_length = try sum(&.{ 4, 4, 1, ticket.ticket_nonce.len, 2, ticket.ticket.len, 2 });
+    var writer = try Writer.initHandshake(buffer, .new_session_ticket, body_length);
+    writer.u32(ticket.ticket_lifetime);
+    writer.u32(ticket.ticket_age_add);
+    writer.u8(@intCast(ticket.ticket_nonce.len));
+    writer.bytes(ticket.ticket_nonce);
+    writer.u16(ticket.ticket.len);
+    writer.bytes(ticket.ticket);
+    writer.u16(0);
+    return writer.finish();
+}
+
 /// Encodes Finished with caller-computed verify_data.
 pub fn encodeFinished(buffer: []u8, verify_data: []const u8) ![]u8 {
     var writer = try Writer.initHandshake(buffer, .finished, verify_data.len);
@@ -145,6 +181,11 @@ const Writer = struct {
         self.cursor += 2;
     }
 
+    fn @"u32"(self: *Writer, value: u32) void {
+        std.mem.writeInt(u32, self.output[self.cursor..][0..4], value, .big);
+        self.cursor += 4;
+    }
+
     fn @"u24"(self: *Writer, value: usize) void {
         self.output[self.cursor] = @truncate(value >> 16);
         self.output[self.cursor + 1] = @truncate(value >> 8);
@@ -184,6 +225,41 @@ test "ServerHello exact TLS 1.3 framing" {
         "\x00\x33\x00\x24\x00\x1d\x00\x20" ++
         "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk";
     try std.testing.expectEqualSlices(u8, expected, encoded);
+}
+
+test "ServerHello selected identity is optional and exactly encoded" {
+    const random: *const [32]u8 = @ptrCast("rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr");
+    const share: *const [32]u8 = @ptrCast("kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk");
+    var buffer: [128]u8 = undefined;
+    const encoded = try encodeServerHello(&buffer, .{
+        .random = random,
+        .session_id = "",
+        .cipher_suite = .AES_128_GCM_SHA256,
+        .key_share = share,
+        .selected_identity = 3,
+    });
+    try std.testing.expectEqual(@as(usize, 96), encoded.len);
+    try std.testing.expectEqualSlices(u8, "\x00\x29\x00\x02\x00\x03", encoded[encoded.len - 6 ..]);
+    try std.testing.expectEqual(@as(u16, 52), std.mem.readInt(u16, encoded[42..44], .big));
+}
+
+test "NewSessionTicket strict exact framing" {
+    var buffer: [64]u8 = undefined;
+    const encoded = try encodeNewSessionTicket(&buffer, .{
+        .ticket_lifetime = 600,
+        .ticket_age_add = 0x01020304,
+        .ticket_nonce = "ab",
+        .ticket = "ticket",
+    });
+    try std.testing.expectEqualSlices(
+        u8,
+        "\x04\x00\x00\x15\x00\x00\x02\x58\x01\x02\x03\x04\x02ab\x00\x06ticket\x00\x00",
+        encoded,
+    );
+    const zero_lifetime = try encodeNewSessionTicket(&buffer, .{ .ticket_lifetime = 0, .ticket_age_add = 0, .ticket_nonce = "", .ticket = "x" });
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, zero_lifetime[4..8], .big));
+    try std.testing.expectError(error.InvalidTicketLifetime, encodeNewSessionTicket(&buffer, .{ .ticket_lifetime = maximum_ticket_lifetime + 1, .ticket_age_add = 0, .ticket_nonce = "", .ticket = "x" }));
+    try std.testing.expectError(error.EmptyTicket, encodeNewSessionTicket(&buffer, .{ .ticket_lifetime = 1, .ticket_age_add = 0, .ticket_nonce = "", .ticket = "" }));
 }
 
 test "EncryptedExtensions exact ALPN and QUIC transport parameters" {
