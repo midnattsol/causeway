@@ -21,6 +21,7 @@ pub const CloseCode = struct {
     pub const transport_parameter_error: u64 = 0x08;
     pub const connection_id_limit_error: u64 = 0x09;
     pub const protocol_violation: u64 = 0x0a;
+    pub const invalid_token: u64 = 0x0b;
     pub const crypto_buffer_exceeded: u64 = 0x0d;
     pub const crypto_error_base: u64 = 0x100;
 };
@@ -44,6 +45,11 @@ pub const PathControlMeta = struct {
     lost: bool = false,
     packet_number: u64 = 0,
     control_key: u64 = 0,
+};
+
+pub const NewTokenMeta = struct {
+    valid: bool = false,
+    packet_number: u64 = 0,
 };
 
 pub fn levelId(level: Level) packet_space.Id {

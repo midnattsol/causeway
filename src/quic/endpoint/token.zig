@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const header = @import("../packet/header.zig");
+const token_kind = @import("token_kind.zig");
 
 const net = std.Io.net;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
@@ -10,10 +11,11 @@ pub const secret_length = Aes256Gcm.key_length;
 pub const nonce_length = Aes256Gcm.nonce_length;
 pub const tag_length = Aes256Gcm.tag_length;
 pub const maximum_plaintext_length = 1 + 4 + 8 + 1 + 16 + 2 + 1 + 20 + 1 + 20;
-pub const maximum_token_length = nonce_length + maximum_plaintext_length + tag_length;
+pub const maximum_token_length = token_kind.header_length + nonce_length + maximum_plaintext_length + tag_length;
 
 const format: u8 = 1;
-const context = "causeway quic retry token v1";
+const context = "causeway quic retry token envelope v1";
+const aad = context ++ token_kind.retry_header;
 
 pub const Contents = struct {
     issued_at: u64,
@@ -63,12 +65,15 @@ pub fn seal(
     @memcpy(plaintext[cursor..][0..retry_source_id.len], retry_source_id);
     cursor += retry_source_id.len;
 
-    const total = nonce_length + cursor + tag_length;
+    const envelope_start = token_kind.header_length;
+    const ciphertext_start = envelope_start + nonce_length;
+    const total = ciphertext_start + cursor + tag_length;
     if (output.len < total) return error.InsufficientCapacity;
-    output[0..nonce_length].* = nonce;
-    const ciphertext = output[nonce_length..][0..cursor];
-    const tag: *[tag_length]u8 = @ptrCast(output[nonce_length + cursor ..][0..tag_length]);
-    Aes256Gcm.encrypt(ciphertext, tag, plaintext[0..cursor], context, nonce, secret);
+    output[0..token_kind.header_length].* = token_kind.retry_header;
+    output[envelope_start..ciphertext_start].* = nonce;
+    const ciphertext = output[ciphertext_start..][0..cursor];
+    const tag: *[tag_length]u8 = @ptrCast(output[ciphertext_start + cursor ..][0..tag_length]);
+    Aes256Gcm.encrypt(ciphertext, tag, plaintext[0..cursor], aad, nonce, secret);
     return output[0..total];
 }
 
@@ -80,12 +85,16 @@ pub fn open(
     lifetime: u64,
     version: u32,
 ) !Contents {
-    if (token.len < nonce_length + tag_length or token.len > maximum_token_length) return error.InvalidToken;
-    const ciphertext_length = token.len - nonce_length - tag_length;
+    if (token_kind.classify(token) != .retry or
+        token.len < token_kind.header_length + nonce_length + tag_length or token.len > maximum_token_length)
+        return error.InvalidToken;
+    const envelope_start = token_kind.header_length;
+    const ciphertext_start = envelope_start + nonce_length;
+    const ciphertext_length = token.len - ciphertext_start - tag_length;
     var plaintext: [maximum_plaintext_length]u8 = undefined;
-    const nonce: [nonce_length]u8 = token[0..nonce_length].*;
+    const nonce: [nonce_length]u8 = token[envelope_start..ciphertext_start].*;
     const tag: [tag_length]u8 = token[token.len - tag_length ..][0..tag_length].*;
-    Aes256Gcm.decrypt(plaintext[0..ciphertext_length], token[nonce_length .. token.len - tag_length], tag, context, nonce, secret) catch
+    Aes256Gcm.decrypt(plaintext[0..ciphertext_length], token[ciphertext_start .. token.len - tag_length], tag, aad, nonce, secret) catch
         return error.InvalidToken;
 
     var cursor: usize = 0;
@@ -170,6 +179,7 @@ test "Retry token round trip binds address version and lifetime" {
     const address: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 4433 } };
     var storage: [maximum_token_length]u8 = undefined;
     const encoded = try seal(&storage, secret, @splat(0x42), address, 100, header.version_1, "original", "retrycid");
+    try std.testing.expectEqual(token_kind.Kind.retry, token_kind.classify(encoded).?);
     const decoded = try open(encoded, secret, address, 150, 100, header.version_1);
     try std.testing.expectEqualStrings("original", decoded.originalDestinationId());
     try std.testing.expectEqualStrings("retrycid", decoded.retrySourceId());

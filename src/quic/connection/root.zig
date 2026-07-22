@@ -83,6 +83,8 @@ pub const Limits = struct {
     max_ticket_bytes: usize = session_ticket.maximum_ticket_length,
     max_ticket_state_bytes: usize = session_ticket.maximum_application_length,
     max_ticket_identities: usize = 4,
+    /// Fixed storage for one server-issued NEW_TOKEN. Zero disables queueing.
+    new_token_bytes: usize = 128,
 };
 
 pub fn Storage(comptime limits: Limits) type {
@@ -188,6 +190,11 @@ pub fn Connection(comptime limits: Limits) type {
         sent_application: [limits.sent_packets]application_streams.SentMeta = @splat(.{}),
         sent_connection_ids: [limits.sent_packets]types.ConnectionIdMeta = @splat(.{}),
         sent_path_controls: [limits.sent_packets]types.PathControlMeta = @splat(.{}),
+        sent_new_tokens: [limits.sent_packets]types.NewTokenMeta = @splat(.{}),
+        new_token_storage: [limits.new_token_bytes]u8 = undefined,
+        new_token_length: usize = 0,
+        new_token_pending: bool = false,
+        new_token_acknowledged: bool = false,
         application: ApplicationStreams,
         rtt: rtt.Estimator = .{},
         congestion: congestion.NewRenoWithCapacity(limits.sent_packets * 3),
@@ -429,6 +436,23 @@ pub fn Connection(comptime limits: Limits) type {
             self.address_validated = true;
         }
 
+        /// Copies and queues the connection's sole NEW_TOKEN after handshake and
+        /// address validation. Loss recovery owns retransmission until any copy is ACKed.
+        pub fn queueNewToken(self: *Self, token: []const u8) !void {
+            if (self.state != .active or self.tls.state != .connected) return error.HandshakeNotComplete;
+            if (!self.address_validated) return error.AddressNotValidated;
+            if (token.len == 0) return error.EmptyToken;
+            if (token.len > self.new_token_storage.len) return error.TokenTooLarge;
+            if (self.new_token_length != 0) return error.NewTokenAlreadyQueued;
+            @memcpy(self.new_token_storage[0..token.len], token);
+            self.new_token_length = token.len;
+            self.new_token_pending = true;
+        }
+
+        pub fn newToken(self: *const Self) []const u8 {
+            return self.new_token_storage[0..self.new_token_length];
+        }
+
         pub fn openBidirectionalStream(self: *Self) !Self.StreamId {
             return self.application.open(.bidirectional);
         }
@@ -660,6 +684,130 @@ pub fn Connection(comptime limits: Limits) type {
             self.handshake_discarded = true;
         }
     };
+}
+
+test "packet-sized peer NEW_TOKEN reaches server role validation" {
+    const packet_writer = @import("../packet/writer.zig");
+    const frame = @import("../frame/root.zig");
+    const limits: Limits = .{ .crypto_receive_bytes = 64, .crypto_send_bytes = 64, .tls_output_bytes = 128 };
+    var storage: Storage(limits) = .{};
+    var transcript: [512]u8 = undefined;
+    const credentials = testCredentials();
+    var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+    const token: [1050]u8 = @splat(0xa5);
+    var frame_storage: [1100]u8 = undefined;
+    const payload = try frame.writer.encode(&frame_storage, .{ .new_token = &token });
+    var packet_storage: [1200]u8 = undefined;
+    const keys: protection.Keys = .{ .aes_128_gcm = crypto_initial.derive("original").client.keys };
+    const packet = try packet_writer.writeInitial(&packet_storage, keys, .{
+        .destination_id = "original",
+        .source_id = "client",
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = payload,
+        .minimum_datagram_size = 1200,
+    });
+    try std.testing.expectError(error.IllegalFrame, connection.receiveDatagram(packet.packet, 1));
+    try std.testing.expectEqual(CloseCode.protocol_violation, connection.close_info.?.code);
+}
+
+test "NEW_TOKEN is emitted in 1-RTT and retransmitted until acknowledged" {
+    const packet_writer = @import("../packet/writer.zig");
+    const packet_header = @import("../packet/header.zig");
+    const frame = @import("../frame/root.zig");
+    const limits: Limits = .{ .crypto_receive_bytes = 64, .crypto_send_bytes = 64, .tls_output_bytes = 128 };
+    var storage: Storage(limits) = .{};
+    var transcript: [512]u8 = undefined;
+    const credentials = testCredentials();
+    var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+    const keys: protection.Keys = .{ .aes_128_gcm = .{ .key = @splat(0x11), .iv = @splat(0x22), .hp = @splat(0x33) } };
+    connection.application_local = keys;
+    connection.application_remote = keys;
+    connection.tls.state = .connected;
+    connection.state = .active;
+    connection.validateAddress();
+    try connection.queueNewToken("address-token");
+
+    var first_storage: [256]u8 = undefined;
+    const first = try connection.buildDatagram(&first_storage, 1);
+    const first_header = try packet_header.parse(first, "client".len);
+    try std.testing.expectEqual(packet_header.Type.short, first_header.packet_type);
+    const first_clear = try keys.unprotect(first, first_header.packet_number_offset.?, null);
+    var frames: frame.Iterator = .{ .payload = first_clear.payload };
+    var saw_token = false;
+    while (try frames.next()) |value| switch (value) {
+        .new_token => |token| {
+            saw_token = true;
+            try std.testing.expectEqualStrings("address-token", token);
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_token);
+    try std.testing.expect(!connection.new_token_pending);
+
+    // Force the normal timeout loss path for packet 0; loss requeues the same token.
+    connection.detector(.application).largest_acknowledged = first_clear.packet_number;
+    connection.detector(.application).loss_time = 1;
+    connection.onTimeout(10_000_000_000);
+    try std.testing.expect(connection.new_token_pending);
+
+    var retransmit_storage: [256]u8 = undefined;
+    const retransmit = try connection.buildDatagram(&retransmit_storage, 10_000_000_001);
+    const retransmit_header = try packet_header.parse(retransmit, "client".len);
+    const retransmit_clear = try keys.unprotect(retransmit, retransmit_header.packet_number_offset.?, first_clear.packet_number);
+    var retransmit_frames: frame.Iterator = .{ .payload = retransmit_clear.payload };
+    try std.testing.expectEqualStrings("address-token", (try retransmit_frames.next()).?.new_token);
+
+    connection.detector(.application).largest_acknowledged = retransmit_clear.packet_number;
+    connection.detector(.application).loss_time = 10_000_000_002;
+    connection.onTimeout(20_000_000_000);
+    try std.testing.expect(connection.new_token_pending);
+    var third_storage: [256]u8 = undefined;
+    const third = try connection.buildDatagram(&third_storage, 20_000_000_001);
+    const third_header = try packet_header.parse(third, "client".len);
+    const third_clear = try keys.unprotect(third, third_header.packet_number_offset.?, retransmit_clear.packet_number);
+
+    // A late ACK for an already-declared-lost copy does not complete the current retransmission.
+    var ack_frame_storage: [32]u8 = undefined;
+    const late_ack_frame = try frame.writer.encode(&ack_frame_storage, .{ .ack = .{
+        .largest = retransmit_clear.packet_number,
+        .delay = 0,
+        .range_count = 0,
+        .first_range = 0,
+        .ranges = &.{},
+        .ecn = null,
+    } });
+    var ack_packet_storage: [64]u8 = undefined;
+    const late_ack_packet = try packet_writer.writeOneRtt(&ack_packet_storage, keys, .{
+        .destination_id = "server",
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = late_ack_frame,
+        .key_phase = false,
+    });
+    try connection.receiveDatagram(late_ack_packet.packet, 20_000_000_002);
+    try std.testing.expect(!connection.new_token_acknowledged);
+
+    const final_ack_frame = try frame.writer.encode(&ack_frame_storage, .{ .ack = .{
+        .largest = third_clear.packet_number,
+        .delay = 0,
+        .range_count = 0,
+        .first_range = 0,
+        .ranges = &.{},
+        .ecn = null,
+    } });
+    const final_ack_packet = try packet_writer.writeOneRtt(&ack_packet_storage, keys, .{
+        .destination_id = "server",
+        .packet_number = 1,
+        .packet_number_length = 2,
+        .payload = final_ack_frame,
+        .key_phase = false,
+    });
+    try connection.receiveDatagram(final_ack_packet.packet, 20_000_000_003);
+    try std.testing.expect(connection.new_token_acknowledged);
+    try std.testing.expect(!connection.new_token_pending);
+    var empty: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), (try connection.buildDatagram(&empty, 20_000_000_004)).len);
 }
 
 fn testCredentials() tls_server.ServerCredentials {

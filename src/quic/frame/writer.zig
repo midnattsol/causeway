@@ -46,7 +46,7 @@ const Writer = struct {
             },
             .new_token => |token| {
                 if (token.len == 0) return error.EmptyToken;
-                try self.integer(0x07);
+                try self.integer(types.new_token_type);
                 try self.lengthPrefixed(token);
             },
             .stream => |value_stream| try self.stream(value_stream),
@@ -212,6 +212,12 @@ test "frame writer canonicalizes stream and ACK encodings" {
         .ecn = null,
     } });
     try std.testing.expectEqualStrings("\x02\x0a\x00\x01\x02\x01\x01", encoded_ack);
+}
+
+test "frame writer requires a nonempty NEW_TOKEN" {
+    var output: [32]u8 = undefined;
+    try std.testing.expectError(error.EmptyToken, encode(&output, .{ .new_token = "" }));
+    try std.testing.expectEqualStrings("\x07\x03abc", try encode(&output, .{ .new_token = "abc" }));
 }
 
 test "frame writer emits RESET_STREAM_AT and validates sizes" {

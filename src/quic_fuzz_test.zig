@@ -7,6 +7,7 @@ const packet_header = @import("quic/packet/header.zig");
 const packet_number = @import("quic/packet/number.zig");
 const packet_protection = @import("quic/packet/protection.zig");
 const retry = @import("quic/packet/retry.zig");
+const new_token = @import("quic/endpoint/new_token.zig");
 const version_negotiation = @import("quic/packet/version_negotiation.zig");
 const connection_module = @import("quic/connection/root.zig");
 const congestion = @import("quic/recovery/congestion.zig");
@@ -25,6 +26,9 @@ const corpus = &.{
     "\x1d\x00", // reset_stream_at transport parameter
     "\x24\x04\x2a\x08\x03", // valid RESET_STREAM_AT
     "\x24\x04\x2a\x03\x04", // Reliable Size exceeds Final Size
+    "\x07\x00", // forbidden empty NEW_TOKEN
+    "\x07\x03tok", // valid NEW_TOKEN frame
+    "\x07\x44\x01", // truncated 1025-byte NEW_TOKEN
 };
 
 test "fuzz QUIC wire primitives and bounded server connections" {
@@ -58,6 +62,7 @@ fn fuzzQuic(_: std.Io, smith: *std.testing.Smith) !void {
     _ = packet_header.parse(input, if (input.len == 0) 0 else input[0] % 21) catch {};
     var retry_scratch: [2069]u8 = undefined;
     _ = retry.validate(input, &.{}, &.{}, &retry_scratch) catch {};
+    fuzzNewToken(input);
     _ = version_negotiation.validate(input, &.{}, &.{}, 1, false) catch {};
     fuzzInitialProtection(input);
     fuzzConnection(input);
@@ -76,6 +81,28 @@ fn fuzzQuic(_: std.Io, smith: *std.testing.Smith) !void {
         var encoded: [4]u8 = undefined;
         _ = try packet_number.encode(&encoded, full, encoded_length);
     }
+}
+
+fn fuzzNewToken(input: []const u8) void {
+    const Source = struct {
+        fn now(_: ?*anyopaque) u64 {
+            return 100;
+        }
+        fn fill(_: ?*anyopaque, output: []u8) anyerror!void {
+            for (output, 0..) |*byte, index| byte.* = @truncate(index + 1);
+        }
+    };
+    var controller = new_token.Controller(1).init(
+        .{ .context = null, .now_seconds_fn = Source.now },
+        .{ .context = null, .fill_fn = Source.fill },
+        "fuzz",
+        @splat(0x01),
+    ) catch return;
+    defer controller.deinit();
+    const key: new_token.Key = .{ .id = 1, .secret = @splat(0x42), .seal_from = 0, .seal_until = 200, .accept_until = 300 };
+    controller.addKey(&key) catch return;
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(4433) };
+    _ = controller.open(input, address, 1, .ip) catch {};
 }
 
 fn fuzzConnection(input: []const u8) void {

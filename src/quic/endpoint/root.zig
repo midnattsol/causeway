@@ -7,7 +7,13 @@ const tls_server = @import("../tls/server.zig");
 const session_ticket = @import("../tls/session_ticket.zig");
 const transport_parameters = @import("../crypto/transport_parameters.zig");
 const retry = @import("../packet/retry.zig");
+const wire_packet_writer = @import("../packet/writer.zig");
+const packet_protection = @import("../packet/protection.zig");
+const initial_crypto = @import("../crypto/initial.zig");
+const quic_frame = @import("../frame/root.zig");
 const retry_token = @import("token.zig");
+const token_kind = @import("token_kind.zig");
+pub const new_token = @import("new_token.zig");
 const stateless_reset = @import("stateless_reset.zig");
 pub const ecn = @import("ecn.zig");
 
@@ -24,6 +30,14 @@ pub const Entropy = struct {
 };
 
 pub const RetryMode = enum { disabled, always };
+pub const NewTokenUsage = enum { reusable, bounded_replay_filter };
+
+pub const ReplayFilterStats = struct {
+    consumed: u64 = 0,
+    replays: u64 = 0,
+    expired_recycled: u64 = 0,
+    capacity_evictions: u64 = 0,
+};
 
 pub const Policy = struct {
     /// Credentials and borrowed TLS policy values must outlive the endpoint.
@@ -43,6 +57,15 @@ pub const Policy = struct {
     retry_token_secret: ?[retry_token.secret_length]u8 = null,
     /// Retry-token validity in the same monotonic units supplied as `now`.
     retry_token_lifetime: u64 = 10 * 60 * 1_000_000_000,
+    /// Opt-in NEW_TOKEN service. The mutable backing controller is claimed by
+    /// this endpoint and supplies its own wall clock, entropy, context, and key ring.
+    new_token_service: ?new_token.Service = null,
+    new_token_lifetime: u32 = 24 * 60 * 60,
+    new_token_address_binding: new_token.AddressBinding = .ip,
+    /// Stateless tokens are reusable by default. `bounded_replay_filter` is a
+    /// best-effort fixed-capacity replay detector, not a single-use guarantee;
+    /// capacity eviction can permit an older token to be reused.
+    new_token_usage: NewTokenUsage = .reusable,
     /// Enables outgoing stateless reset and deterministic per-CID reset tokens.
     stateless_reset_secret: ?[32]u8 = null,
     /// Global reset-response cap per interval, in addition to `batch_size`.
@@ -83,6 +106,7 @@ pub fn EndpointWithFeatures(
         pub const capacity_value = capacity;
         pub const configured_features = features;
         pub const transcript_bytes = connection_limits.tls_transcript_bytes;
+        pub const new_token_replay_capacity = capacity * 2;
 
         const PendingStateless = struct {
             address: net.IpAddress = undefined,
@@ -92,6 +116,12 @@ pub fn EndpointWithFeatures(
         const ReplayEntry = struct {
             occupied: bool = false,
             nonce: [retry_token.nonce_length]u8 = undefined,
+            expires_at: u64 = 0,
+        };
+
+        const NewTokenReplayEntry = struct {
+            occupied: bool = false,
+            fingerprint: [16]u8 = undefined,
             expires_at: u64 = 0,
         };
 
@@ -105,6 +135,7 @@ pub fn EndpointWithFeatures(
             /// Changes on every admission so external per-connection state cannot
             /// be confused with a later connection reusing this fixed slot.
             generation: u64 = 0,
+            new_token_issued: bool = false,
         };
 
         socket: net.Socket = undefined,
@@ -118,6 +149,9 @@ pub fn EndpointWithFeatures(
         pending_stateless_count: usize = 0,
         replay_cache: [capacity * 2]ReplayEntry = @splat(.{}),
         replay_cursor: usize = 0,
+        new_token_replay_cache: [new_token_replay_capacity]NewTokenReplayEntry = @splat(.{}),
+        new_token_replay_cursor: usize = 0,
+        new_token_replay_stats: ReplayFilterStats = .{},
         reset_window_started_at: u64 = 0,
         reset_window_count: u16 = 0,
         shutting_down: bool = false,
@@ -135,6 +169,10 @@ pub fn EndpointWithFeatures(
                 return error.InvalidPathValidationPolicy;
             if (policy.retry_mode != .disabled and (policy.retry_token_secret == null or policy.retry_token_lifetime == 0))
                 return error.InvalidRetryPolicy;
+            if (policy.new_token_service != null and
+                (policy.new_token_lifetime == 0 or policy.new_token_lifetime > new_token.maximum_lifetime or
+                    connection_limits.new_token_bytes < new_token.maximum_token_length))
+                return error.InvalidNewTokenPolicy;
             if (policy.stateless_reset_secret != null and (policy.stateless_reset_burst == 0 or policy.stateless_reset_interval == 0))
                 return error.InvalidStatelessResetPolicy;
             if (features.ecn) switch (ecn.enableReceive(socket.handle, std.meta.activeTag(socket.address))) {
@@ -145,6 +183,8 @@ pub fn EndpointWithFeatures(
             };
             self.* = .{ .socket = socket, .policy = policy };
             if (policy.ticket_service) |service| try service.claimExclusiveOwner(self);
+            errdefer if (policy.ticket_service) |service| service.releaseExclusiveOwner(self);
+            if (policy.new_token_service) |service| try service.claimExclusiveOwner(self);
         }
 
         /// Binds and initializes this endpoint. On initialization failure the socket is closed.
@@ -155,6 +195,7 @@ pub fn EndpointWithFeatures(
         }
 
         pub fn deinit(self: *Self, io: Io) void {
+            if (self.policy.new_token_service) |service| service.releaseExclusiveOwner(self);
             if (self.policy.ticket_service) |service| service.releaseExclusiveOwner(self);
             self.socket.close(io);
             for (&self.slots) |*slot| {
@@ -237,25 +278,47 @@ pub fn EndpointWithFeatures(
                 if (self.shutting_down or message.data.len < 1200 or invariant.packet_type != .initial or
                     invariant.version != header.version_1 or invariant.destination_id.len < 8) continue;
 
-                var token_contents: ?retry_token.Contents = null;
-                if (self.policy.retry_mode == .always) {
-                    token_contents = retry_token.open(
-                        invariant.token,
-                        self.policy.retry_token_secret.?,
-                        message.from,
-                        now,
-                        self.policy.retry_token_lifetime,
-                        invariant.version.?,
-                    ) catch {
-                        self.queueRetry(io, message, invariant, now);
-                        continue;
-                    };
-                    if (!std.mem.eql(u8, invariant.destination_id, token_contents.?.retrySourceId()) or
-                        self.tokenWasReplayed(invariant.token, now))
-                    {
-                        self.queueRetry(io, message, invariant, now);
-                        continue;
-                    }
+                var retry_contents: ?retry_token.Contents = null;
+                var new_token_valid = false;
+                if (invariant.token.len != 0) if (token_kind.classify(invariant.token)) |kind| switch (kind) {
+                    .retry => {
+                        const secret = self.policy.retry_token_secret orelse {
+                            self.queueInvalidToken(io, message, invariant);
+                            continue;
+                        };
+                        retry_contents = retry_token.open(
+                            invariant.token,
+                            secret,
+                            message.from,
+                            now,
+                            self.policy.retry_token_lifetime,
+                            invariant.version.?,
+                        ) catch {
+                            self.queueInvalidToken(io, message, invariant);
+                            continue;
+                        };
+                        if (!std.mem.eql(u8, invariant.destination_id, retry_contents.?.retrySourceId()) or
+                            self.tokenWasReplayed(invariant.token, now))
+                        {
+                            self.queueInvalidToken(io, message, invariant);
+                            continue;
+                        }
+                    },
+                    .new_token => if (self.policy.new_token_service) |service| {
+                        if (service.open(
+                            invariant.token,
+                            message.from,
+                            invariant.version.?,
+                            self.policy.new_token_address_binding,
+                        )) |contents| {
+                            new_token_valid = self.policy.new_token_usage == .reusable or
+                                !self.checkAndConsumeNewToken(invariant.token, contents.validated_at, contents.expires_at);
+                        } else |_| {}
+                    },
+                };
+                if (self.policy.retry_mode == .always and retry_contents == null and !new_token_valid) {
+                    self.queueRetry(io, message, invariant, now);
+                    continue;
                 }
 
                 const slot = self.freeSlot() orelse continue;
@@ -271,6 +334,7 @@ pub fn EndpointWithFeatures(
                 }
                 if (!unique_cid) continue;
                 slot.storage = .{};
+                slot.new_token_issued = false;
                 slot.paths = PathManager.init(message.from, .{
                     .disable_active_migration = self.policy.transport_parameters.disable_active_migration,
                     .allow_nat_rebinding = self.policy.allow_nat_rebinding,
@@ -279,10 +343,10 @@ pub fn EndpointWithFeatures(
                 });
                 _ = slot.paths.observe(message.from, message.data.len, @splat(0)) catch unreachable;
                 var parameter_values = self.policy.transport_parameters;
-                const original_destination_id = if (token_contents) |*contents| contents.originalDestinationId() else invariant.destination_id;
+                const original_destination_id = if (retry_contents) |*contents| contents.originalDestinationId() else invariant.destination_id;
                 parameter_values.original_destination_connection_id = original_destination_id;
                 parameter_values.initial_source_connection_id = entropy_bytes[0..cid_len];
-                parameter_values.retry_source_connection_id = if (token_contents) |*contents| contents.retrySourceId() else null;
+                parameter_values.retry_source_connection_id = if (retry_contents) |*contents| contents.retrySourceId() else null;
                 const reset_token_value: [16]u8 = if (self.policy.stateless_reset_secret) |secret|
                     stateless_reset.deriveToken(secret, entropy_bytes[0..cid_len])
                 else
@@ -330,10 +394,10 @@ pub fn EndpointWithFeatures(
                     slot.connection.receiveDatagram(message.data, now) catch {};
                 if (slot.connection.space(.initial).received.largest() == null) {
                     slot.occupied = false;
-                } else if (token_contents != null) {
+                } else if (retry_contents != null or new_token_valid) {
                     slot.connection.validateAddress();
                     slot.paths.validateInitial();
-                    self.rememberToken(invariant.token, now);
+                    if (retry_contents != null) self.rememberToken(invariant.token, now);
                 }
             }
         }
@@ -416,6 +480,34 @@ pub fn EndpointWithFeatures(
             return self.policy.path_validation_interval orelse slot.connection.pathValidationInterval();
         }
 
+        fn queueInvalidToken(self: *Self, io: Io, message: net.IncomingMessage, invariant: header.Header) void {
+            if (self.pending_stateless_count == batch_size) return;
+            const index = self.pending_stateless_count;
+            var source_id_storage: [header.maximum_connection_id_length]u8 = undefined;
+            const source_id = source_id_storage[0..self.policy.connection_id_length];
+            self.fillEntropy(io, source_id);
+            var payload_storage: [32]u8 = undefined;
+            const payload = quic_frame.writer.encode(&payload_storage, .{ .connection_close = .{
+                .error_code = connection.CloseCode.invalid_token,
+                .frame_type = 0,
+                .reason = &.{},
+            } }) catch return;
+            var secrets = initial_crypto.derive(invariant.destination_id);
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&secrets));
+            const keys: packet_protection.Keys = .{ .aes_128_gcm = secrets.server.keys };
+            const packet = wire_packet_writer.writeInitial(&self.send_storage[index], keys, .{
+                .destination_id = invariant.source_id,
+                .source_id = source_id,
+                .packet_number = 0,
+                .packet_number_length = 2,
+                .payload = payload,
+                .minimum_datagram_size = 1200,
+            }) catch return;
+            if (packet.packet.len > message.data.len *| 3) return;
+            self.pending_stateless[index] = .{ .address = message.from, .length = packet.packet.len };
+            self.pending_stateless_count += 1;
+        }
+
         fn queueRetry(self: *Self, io: Io, message: net.IncomingMessage, invariant: header.Header, now: u64) void {
             if (self.pending_stateless_count == batch_size) return;
             var entropy: [retry_token.nonce_length + header.maximum_connection_id_length + 1]u8 = undefined;
@@ -476,8 +568,8 @@ pub fn EndpointWithFeatures(
         }
 
         fn tokenWasReplayed(self: *const Self, token: []const u8, now: u64) bool {
-            if (token.len < retry_token.nonce_length) return true;
-            const nonce: [retry_token.nonce_length]u8 = token[0..retry_token.nonce_length].*;
+            if (token.len < token_kind.header_length + retry_token.nonce_length) return true;
+            const nonce: [retry_token.nonce_length]u8 = token[token_kind.header_length..][0..retry_token.nonce_length].*;
             for (self.replay_cache) |entry| {
                 if (entry.occupied and entry.expires_at >= now and
                     std.crypto.timing_safe.eql([retry_token.nonce_length]u8, entry.nonce, nonce)) return true;
@@ -486,7 +578,7 @@ pub fn EndpointWithFeatures(
         }
 
         fn rememberToken(self: *Self, token: []const u8, now: u64) void {
-            if (token.len < retry_token.nonce_length) return;
+            if (token.len < token_kind.header_length + retry_token.nonce_length) return;
             var selected = self.replay_cursor;
             for (self.replay_cache, 0..) |entry, index| {
                 if (!entry.occupied or entry.expires_at < now) {
@@ -496,10 +588,65 @@ pub fn EndpointWithFeatures(
             }
             self.replay_cache[selected] = .{
                 .occupied = true,
-                .nonce = token[0..retry_token.nonce_length].*,
+                .nonce = token[token_kind.header_length..][0..retry_token.nonce_length].*,
                 .expires_at = now +| self.policy.retry_token_lifetime,
             };
             self.replay_cursor = (selected + 1) % self.replay_cache.len;
+        }
+
+        fn newTokenFingerprint(token: []const u8) [16]u8 {
+            var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
+            defer std.crypto.secureZero(u8, &digest);
+            return digest[0..16].*;
+        }
+
+        /// Sequential-owner, best-effort check-and-consume. Expired entries are
+        /// recycled first; full-capacity eviction deliberately provides no single-use guarantee.
+        fn checkAndConsumeNewToken(self: *Self, token: []const u8, validated_at: u64, expires_at: u64) bool {
+            const fingerprint = newTokenFingerprint(token);
+            var available: ?usize = null;
+            for (&self.new_token_replay_cache, 0..) |*entry, index| {
+                if (entry.occupied and entry.expires_at < validated_at) {
+                    entry.occupied = false;
+                    self.new_token_replay_stats.expired_recycled +|= 1;
+                }
+                if (!entry.occupied) {
+                    if (available == null) available = index;
+                    continue;
+                }
+                if (std.crypto.timing_safe.eql([16]u8, entry.fingerprint, fingerprint)) {
+                    self.new_token_replay_stats.replays +|= 1;
+                    return true;
+                }
+            }
+            const selected = available orelse blk: {
+                self.new_token_replay_stats.capacity_evictions +|= 1;
+                break :blk self.new_token_replay_cursor;
+            };
+            self.new_token_replay_cache[selected] = .{
+                .occupied = true,
+                .fingerprint = fingerprint,
+                .expires_at = expires_at,
+            };
+            self.new_token_replay_cursor = (selected + 1) % self.new_token_replay_cache.len;
+            self.new_token_replay_stats.consumed +|= 1;
+            return false;
+        }
+
+        fn prepareNewToken(self: *Self, slot: *Slot) void {
+            const service = self.policy.new_token_service orelse return;
+            if (slot.new_token_issued or slot.connection.state != .active or !slot.connection.address_validated) return;
+            var storage: [new_token.maximum_token_length]u8 = undefined;
+            const token = service.seal(
+                &storage,
+                slot.paths.activeAddress().*,
+                header.version_1,
+                self.policy.new_token_lifetime,
+                self.policy.new_token_address_binding,
+            ) catch return;
+            slot.connection.queueNewToken(token) catch return;
+            slot.new_token_issued = true;
         }
 
         fn replenishConnectionIds(self: *Self, io: Io, slot: *Slot) void {
@@ -541,6 +688,7 @@ pub fn EndpointWithFeatures(
             for (&self.slots) |*slot| {
                 if (!slot.occupied or count == batch_size) continue;
                 self.replenishConnectionIds(io, slot);
+                self.prepareNewToken(slot);
 
                 self.routeLostPathControls(slot);
                 if (slot.paths.prepareControl()) |control| {
@@ -618,6 +766,35 @@ fn testCredentials() tls_server.ServerCredentials {
 fn deterministicEntropy(_: ?*anyopaque, bytes: []u8) void {
     for (bytes, 0..) |*byte, index| byte.* = @truncate(index + 1);
 }
+
+const NewTokenTestClock = struct {
+    now: u64,
+
+    fn read(context: ?*anyopaque) u64 {
+        const self: *NewTokenTestClock = @ptrCast(@alignCast(context.?));
+        return self.now;
+    }
+
+    fn clock(self: *NewTokenTestClock) new_token.Clock {
+        return .{ .context = self, .now_seconds_fn = read };
+    }
+};
+
+const NewTokenTestEntropy = struct {
+    next: u8 = 1,
+
+    fn fill(context: ?*anyopaque, bytes: []u8) anyerror!void {
+        const self: *NewTokenTestEntropy = @ptrCast(@alignCast(context.?));
+        for (bytes) |*byte| {
+            byte.* = self.next;
+            self.next +%= 1;
+        }
+    }
+
+    fn entropy(self: *NewTokenTestEntropy) new_token.Entropy {
+        return .{ .context = self, .fill_fn = fill };
+    }
+};
 
 const CountingEntropy = struct {
     next: u8 = 1,
@@ -812,6 +989,172 @@ test "invalid Retry token and wrong address never allocate a slot" {
     endpoint.processBatch(std.testing.io, &messages, 20);
     try std.testing.expectEqual(@as(usize, 0), endpoint.activeCount());
     try std.testing.expectEqual(@as(usize, 1), endpoint.pending_stateless_count);
+    const response = endpoint.send_storage[0][0..endpoint.pending_stateless[0].length];
+    const invariant = try header.parse(response, 0);
+    try std.testing.expectEqual(header.Type.initial, invariant.packet_type);
+    const server_keys: protection.Keys = .{ .aes_128_gcm = crypto_initial.derive("retry-id").server.keys };
+    const clear = try server_keys.unprotect(response, invariant.packet_number_offset.?, null);
+    var frames: quic_frame.Iterator = .{ .payload = clear.payload };
+    const close = (try frames.next()).?.connection_close;
+    try std.testing.expectEqual(connection.CloseCode.invalid_token, close.error_code);
+    try std.testing.expectEqual(@as(?u64, 0), close.frame_type);
+}
+
+test "NEW_TOKEN Initial admission validates before allocation and formats cannot cross protocols" {
+    const crypto_initial = @import("../crypto/initial.zig");
+    const protection = @import("../packet/protection.zig");
+    const packet_writer = @import("../packet/writer.zig");
+    const limits: connection.Limits = .{ .crypto_receive_bytes = 64, .crypto_send_bytes = 64, .tls_output_bytes = 128 };
+    const E = Endpoint(limits, 2, 1);
+    const credentials = testCredentials();
+    var clock_value: NewTokenTestClock = .{ .now = 100 };
+    var random: NewTokenTestEntropy = .{};
+    var controller = try new_token.Controller(2).init(clock_value.clock(), random.entropy(), "admission", @splat(0x11));
+    defer controller.deinit();
+    const token_key: new_token.Key = .{ .id = 7, .secret = @splat(0x41), .seal_from = 0, .seal_until = 200, .accept_until = 300 };
+    try controller.addKey(&token_key);
+    const issued_address: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 4433 } };
+    var token_storage: [new_token.maximum_token_length]u8 = undefined;
+    const token = try controller.seal(&token_storage, issued_address, header.version_1, 60, .ip);
+
+    var endpoint_entropy: CountingEntropy = .{};
+    var endpoint: E = undefined;
+    try endpoint.init(undefined, .{
+        .credentials = &credentials,
+        .connection_id_length = 8,
+        .entropy = .{ .context = &endpoint_entropy, .fillFn = CountingEntropy.fill },
+        .new_token_service = new_token.Service.fromController(&controller),
+        .new_token_lifetime = 60,
+        .new_token_usage = .bounded_replay_filter,
+    });
+    defer endpoint.policy.new_token_service.?.releaseExclusiveOwner(&endpoint);
+
+    // Default IP-only binding accepts a changed source port and bypasses address validation.
+    const presented_address: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 5555 } };
+    var valid_storage: [1200]u8 = undefined;
+    const valid_keys: protection.Keys = .{ .aes_128_gcm = crypto_initial.derive("validcid").client.keys };
+    const valid = try packet_writer.writeInitial(&valid_storage, valid_keys, .{
+        .destination_id = "validcid",
+        .source_id = "client",
+        .token = token,
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = "\x01",
+        .minimum_datagram_size = 1200,
+    });
+    var valid_messages = [_]net.IncomingMessage{incoming(presented_address, valid.packet)};
+    endpoint.processBatch(std.testing.io, &valid_messages, 100);
+    try std.testing.expectEqual(@as(usize, 1), endpoint.activeCount());
+    try std.testing.expect(endpoint.slots[0].connection.address_validated);
+    try std.testing.expect(endpoint.slots[0].paths.entries[0].validated);
+    try std.testing.expectEqual(@as(u64, 1), endpoint.new_token_replay_stats.consumed);
+
+    // Authentication failure is treated as no token: admission continues, but validation is not bypassed.
+    var tampered_token = token_storage;
+    tampered_token[tampered_token.len - 1] ^= 1;
+    var invalid_storage: [1200]u8 = undefined;
+    const invalid_keys: protection.Keys = .{ .aes_128_gcm = crypto_initial.derive("othercid").client.keys };
+    const invalid = try packet_writer.writeInitial(&invalid_storage, invalid_keys, .{
+        .destination_id = "othercid",
+        .source_id = "other",
+        .token = &tampered_token,
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = "\x01",
+        .minimum_datagram_size = 1200,
+    });
+    var invalid_messages = [_]net.IncomingMessage{incoming(presented_address, invalid.packet)};
+    endpoint.processBatch(std.testing.io, &invalid_messages, 101);
+    try std.testing.expectEqual(@as(usize, 2), endpoint.activeCount());
+    try std.testing.expect(!endpoint.slots[1].connection.address_validated);
+
+    var retry_storage: [retry_token.maximum_token_length]u8 = undefined;
+    const retry_value = try retry_token.seal(&retry_storage, @splat(0x41), @splat(9), issued_address, 100, header.version_1, "original", "retry-id");
+    try std.testing.expectError(error.InvalidToken, controller.open(retry_value, issued_address, header.version_1, .ip));
+    try std.testing.expectError(error.InvalidToken, retry_token.open(token, @splat(0x41), issued_address, 100, 100, header.version_1));
+}
+
+test "bounded NEW_TOKEN replay filter reports replay expiry recycling and capacity eviction" {
+    const limits: connection.Limits = .{ .tls_output_bytes = 128 };
+    const E = Endpoint(limits, 1, 1);
+    var endpoint: E = undefined;
+    endpoint.new_token_replay_cache = @splat(.{});
+    endpoint.new_token_replay_cursor = 0;
+    endpoint.new_token_replay_stats = .{};
+    try std.testing.expect(!endpoint.checkAndConsumeNewToken("a", 1, 10));
+    try std.testing.expect(endpoint.checkAndConsumeNewToken("a", 2, 10));
+    try std.testing.expect(!endpoint.checkAndConsumeNewToken("b", 2, 20));
+    try std.testing.expect(!endpoint.checkAndConsumeNewToken("c", 2, 30));
+    try std.testing.expectEqual(@as(u64, 1), endpoint.new_token_replay_stats.capacity_evictions);
+    try std.testing.expect(!endpoint.checkAndConsumeNewToken("d", 21, 40));
+    try std.testing.expect(endpoint.new_token_replay_stats.expired_recycled >= 1);
+    try std.testing.expectEqual(@as(u64, 4), endpoint.new_token_replay_stats.consumed);
+    try std.testing.expectEqual(@as(u64, 1), endpoint.new_token_replay_stats.replays);
+}
+
+test "endpoint prepares one NEW_TOKEN only after handshake and address validation" {
+    const protection = @import("../packet/protection.zig");
+    const packet_header = @import("../packet/header.zig");
+    const frame = @import("../frame/root.zig");
+    const limits: connection.Limits = .{ .crypto_receive_bytes = 64, .crypto_send_bytes = 64, .tls_output_bytes = 128 };
+    const E = Endpoint(limits, 1, 1);
+    const credentials = testCredentials();
+    var clock_value: NewTokenTestClock = .{ .now = 100 };
+    var random: NewTokenTestEntropy = .{};
+    var controller = try new_token.Controller(1).init(clock_value.clock(), random.entropy(), "emission", @splat(0x12));
+    defer controller.deinit();
+    const key: new_token.Key = .{ .id = 1, .secret = @splat(0x51), .seal_from = 0, .seal_until = 200, .accept_until = 300 };
+    try controller.addKey(&key);
+    var endpoint: E = undefined;
+    try endpoint.init(undefined, .{
+        .credentials = &credentials,
+        .new_token_service = new_token.Service.fromController(&controller),
+        .new_token_lifetime = 60,
+    });
+    defer endpoint.policy.new_token_service.?.releaseExclusiveOwner(&endpoint);
+    const slot = &endpoint.slots[0];
+    slot.storage = .{};
+    const peer: net.IpAddress = .{ .ip4 = .loopback(4433) };
+    slot.paths = @TypeOf(slot.paths).init(peer, .{});
+    slot.paths.validateInitial();
+    slot.connection = try E.Connection.init(&slot.storage, .{
+        .original_destination_id = "original",
+        .client_source_id = "client",
+        .server_connection_id = "server",
+        .tls = .{
+            .credentials = &credentials,
+            .server_random = @splat(0x53),
+            .x25519 = .{ .seed = @splat(0x22) },
+            .transport_parameters = "",
+            .transcript_scratch = &slot.transcript,
+        },
+        .now = 0,
+    });
+    slot.occupied = true;
+    endpoint.prepareNewToken(slot);
+    try std.testing.expect(!slot.new_token_issued);
+
+    const keys: protection.Keys = .{ .aes_128_gcm = .{ .key = @splat(0x11), .iv = @splat(0x22), .hp = @splat(0x33) } };
+    slot.connection.application_local = keys;
+    slot.connection.tls.state = .connected;
+    slot.connection.state = .active;
+    endpoint.prepareNewToken(slot);
+    try std.testing.expect(!slot.new_token_issued);
+    slot.connection.validateAddress();
+    endpoint.prepareNewToken(slot);
+    try std.testing.expect(slot.new_token_issued);
+    const issued = slot.connection.newToken();
+    _ = try controller.open(issued, .{ .ip4 = .loopback(5555) }, header.version_1, .ip);
+    const emissions = controller.slots[0].emissions;
+    endpoint.prepareNewToken(slot);
+    try std.testing.expectEqual(emissions, controller.slots[0].emissions);
+
+    var datagram: [256]u8 = undefined;
+    const packet = try slot.connection.buildDatagram(&datagram, 1);
+    const invariant = try packet_header.parse(packet, "client".len);
+    const clear = try keys.unprotect(packet, invariant.packet_number_offset.?, null);
+    var frames: frame.Iterator = .{ .payload = clear.payload };
+    try std.testing.expectEqualSlices(u8, issued, (try frames.next()).?.new_token);
 }
 
 test "unknown plausible short packet queues bounded stateless reset" {

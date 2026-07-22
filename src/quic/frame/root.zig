@@ -26,6 +26,11 @@ pub const ConnectionId = types.ConnectionId;
 pub const ConnectionClose = types.ConnectionClose;
 pub const PacketKind = types.PacketKind;
 pub const Frame = types.Frame;
+pub const new_token_type = types.new_token_type;
+pub const new_token_is_ack_eliciting = types.new_token_is_ack_eliciting;
+pub const new_token_is_congestion_controlled = types.new_token_is_congestion_controlled;
+pub const new_token_is_retransmittable = types.new_token_is_retransmittable;
+pub const newTokenAllowedIn = types.newTokenAllowedIn;
 pub const datagram_type = types.datagram_type;
 pub const datagram_len_type = types.datagram_len_type;
 pub const datagram_is_ack_eliciting = types.datagram_is_ack_eliciting;
@@ -61,7 +66,7 @@ pub fn parseOne(payload: []const u8, cursor: *usize) !Frame {
             .application_error = try varint.decodeAt(payload, cursor),
         } },
         0x06 => .{ .crypto = try parseCrypto(payload, cursor) },
-        0x07 => .{ .new_token = try readLengthPrefixed(payload, cursor) },
+        new_token_type => .{ .new_token = try readNewToken(payload, cursor) },
         0x08...0x0f => .{ .stream = try parseStream(payload, cursor, @intCast(frame_type)) },
         0x10 => .{ .max_data = try varint.decodeAt(payload, cursor) },
         0x11 => .{ .max_stream_data = .{
@@ -194,6 +199,12 @@ fn parseConnectionClose(payload: []const u8, cursor: *usize, transport: bool) !C
     return .{ .error_code = error_code, .frame_type = frame_type, .reason = try readLengthPrefixed(payload, cursor) };
 }
 
+fn readNewToken(payload: []const u8, cursor: *usize) ![]const u8 {
+    const token = try readLengthPrefixed(payload, cursor);
+    if (token.len == 0) return error.FrameEncodingError;
+    return token;
+}
+
 fn readLengthPrefixed(payload: []const u8, cursor: *usize) ![]const u8 {
     const length = try varint.decodeAt(payload, cursor);
     const size = std.math.cast(usize, length) orelse return error.FrameTooLarge;
@@ -237,6 +248,19 @@ test "RESET_STREAM_AT parses codepoint and rejects reliable size above final siz
 
     cursor = 0;
     try std.testing.expectError(error.FrameEncodingError, parseOne("\x24\x04\x2a\x03\x04", &cursor));
+}
+
+test "NEW_TOKEN wire format is nonempty and packet-bounded" {
+    var cursor: usize = 0;
+    try std.testing.expectError(error.FrameEncodingError, parseOne("\x07\x00", &cursor));
+
+    cursor = 0;
+    try std.testing.expectError(error.Truncated, parseOne("\x07\x44\x01", &cursor));
+
+    cursor = 0;
+    const token = (try parseOne("\x07\x03abc", &cursor)).new_token;
+    try std.testing.expectEqualStrings("abc", token);
+    try std.testing.expectEqual(@as(usize, 5), cursor);
 }
 
 test "QUIC ACK ranges validate and iterate" {
@@ -305,6 +329,16 @@ test "RESET_STREAM_AT frame metadata follows reliable stream reset draft 09" {
     try std.testing.expect(reset_stream_at_is_ack_eliciting);
     try std.testing.expect(reset_stream_at_is_congestion_controlled);
     try std.testing.expect(reset_stream_at_is_retransmittable);
+}
+
+test "NEW_TOKEN frame metadata follows RFC 9000" {
+    try std.testing.expect(!newTokenAllowedIn(.initial));
+    try std.testing.expect(!newTokenAllowedIn(.zero_rtt));
+    try std.testing.expect(!newTokenAllowedIn(.handshake));
+    try std.testing.expect(newTokenAllowedIn(.one_rtt));
+    try std.testing.expect(new_token_is_ack_eliciting);
+    try std.testing.expect(new_token_is_congestion_controlled);
+    try std.testing.expect(new_token_is_retransmittable);
 }
 
 test "QUIC DATAGRAM frame metadata follows RFC 9221" {

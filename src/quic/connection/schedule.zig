@@ -89,6 +89,7 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
     var transmission: ?@import("../tls/crypto_stream.zig").Transmission = null;
     var application_item: @import("application_streams.zig").SentMeta.Item = .none;
     var datagram_included = false;
+    var new_token_included = false;
     var connection_id_frame: ?frame.Frame = null;
 
     if (self.ack_pending[index]) {
@@ -109,6 +110,11 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
     if (level == .application and self.handshake_done_pending) {
         const encoded = try frame.writer.encode(payload_storage[payload_length..], .handshake_done);
         payload_length += encoded.len;
+    }
+    if (level == .application and self.new_token_pending and !self.new_token_acknowledged) {
+        const encoded = try frame.writer.encode(payload_storage[payload_length..], .{ .new_token = self.newToken() });
+        payload_length += encoded.len;
+        new_token_included = true;
     }
     const sender = &self.cryptoSpace(level).sender;
     const maximum_crypto = payload_storage.len - payload_length -| 24;
@@ -160,7 +166,8 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
 
     const estimated_size = if (level == .initial) @max(@as(usize, 1200), payload_length + 64) else payload_length + 64;
     const has_application_item = std.meta.activeTag(application_item) != .none;
-    const ack_eliciting = transmission != null or has_application_item or datagram_included or sending_probe or (level == .application and (connection_id_frame != null or self.handshake_done_pending));
+    const ack_eliciting = transmission != null or has_application_item or datagram_included or sending_probe or
+        (level == .application and (connection_id_frame != null or self.handshake_done_pending or new_token_included));
     const congestion_controlled = ack_eliciting;
     if (!self.congestion.canSend(estimated_size, sending_probe) or !self.pacer.canSend(estimated_size, congestion_controlled)) {
         if (transmission) |tx| try sender.onLost(tx.offset, tx.data.len);
@@ -221,6 +228,7 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
     if (level == .application) {
         try rememberApplication(self, packet_number, self.application_send_generation, application_item);
         if (connection_id_frame) |sent_frame| try rememberConnectionId(self, packet_number, sent_frame);
+        if (new_token_included) try rememberNewToken(self, packet_number);
     }
     if (datagram_included) try self.datagrams.send.commit();
     if (has_application_item) self.application.onPacketSent(application_item);
@@ -230,6 +238,7 @@ fn appendLevel(self: anytype, cursor: *packet_writer.Cursor, level: types.Level,
     if (level == .application) {
         if (connection_id_frame) |sent_frame| self.cids.markPendingFrameSent(sent_frame);
         if (self.handshake_done_pending) self.handshake_done_pending = false;
+        if (new_token_included) self.new_token_pending = false;
     }
     if (sending_probe and ack_eliciting) self.probe_space = null;
     return true;
@@ -270,6 +279,18 @@ fn rememberConnectionId(self: anytype, packet_number: u64, sent: frame.Frame) !v
     for (&self.sent_connection_ids) |*entry| {
         if (entry.valid) continue;
         entry.* = .{ .valid = true, .packet_number = packet_number, .kind = kind, .sequence = sequence };
+        return;
+    }
+    return error.SentPacketCapacityExceeded;
+}
+
+fn rememberNewToken(self: anytype, packet_number: u64) !void {
+    for (&self.sent_new_tokens) |*entry| {
+        if (entry.valid and !applicationPacketTracked(self, entry.packet_number)) entry.* = .{};
+    }
+    for (&self.sent_new_tokens) |*entry| {
+        if (entry.valid) continue;
+        entry.* = .{ .valid = true, .packet_number = packet_number };
         return;
     }
     return error.SentPacketCapacityExceeded;
@@ -396,11 +417,17 @@ fn markLost(self: anytype, level: types.Level, packet_number: u64) void {
             entry.lost = true;
             break;
         }
+        for (&self.sent_new_tokens) |*entry| {
+            if (!entry.valid or entry.packet_number != packet_number) continue;
+            entry.valid = false;
+            if (!self.new_token_acknowledged) self.new_token_pending = true;
+            break;
+        }
     }
 }
 
 fn hasPending(self: anytype) bool {
-    if (self.probe_space != null or self.cids.pendingFrame() != null or self.handshake_done_pending) return true;
+    if (self.probe_space != null or self.cids.pendingFrame() != null or self.handshake_done_pending or self.new_token_pending) return true;
     for (self.ack_pending) |pending| if (pending) return true;
     return self.application.hasPending() or self.datagrams.pendingSend() != 0 or
         self.crypto.initial.sender.sent_offset != self.crypto.initial.sender.write_offset or

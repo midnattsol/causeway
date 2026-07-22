@@ -62,6 +62,11 @@ pub const ConnectionClose = struct {
     reason: []const u8,
 };
 
+pub const new_token_type: u64 = 0x07;
+pub const new_token_is_ack_eliciting = true;
+pub const new_token_is_congestion_controlled = true;
+pub const new_token_is_retransmittable = true;
+
 pub const datagram_type: u64 = 0x30;
 pub const datagram_len_type: u64 = 0x31;
 pub const datagram_is_ack_eliciting = true;
@@ -73,6 +78,11 @@ pub const PacketKind = enum { initial, zero_rtt, handshake, one_rtt };
 /// RESET_STREAM_AT uses the application data packet number space, including 0-RTT.
 pub fn resetStreamAtAllowedIn(kind: PacketKind) bool {
     return kind == .zero_rtt or kind == .one_rtt;
+}
+
+/// RFC 9000 permits NEW_TOKEN only in server-sent 1-RTT packets.
+pub fn newTokenAllowedIn(kind: PacketKind) bool {
+    return kind == .one_rtt;
 }
 
 pub fn isDatagramType(frame_type: u64) bool {

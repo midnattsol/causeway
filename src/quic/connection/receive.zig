@@ -292,6 +292,7 @@ fn onAck(self: anytype, level: types.Level, ack: frame.Ack, now: u64) !void {
             try markApplication(self, packet.packet_number, true);
             markConnectionId(self, packet.packet_number, true);
             markPathControl(self, packet.packet_number, true);
+            markNewToken(self, packet.packet_number, true);
         }
     }
     for (outcome.lost.slice()) |packet| {
@@ -300,6 +301,7 @@ fn onAck(self: anytype, level: types.Level, ack: frame.Ack, now: u64) !void {
             try markApplication(self, packet.packet_number, false);
             markConnectionId(self, packet.packet_number, false);
             markPathControl(self, packet.packet_number, false);
+            markNewToken(self, packet.packet_number, false);
         }
     }
     if (outcome.acknowledged.count != 0) self.pto_count = 0;
@@ -371,6 +373,23 @@ fn markPathControl(self: anytype, packet_number: u64, acknowledged: bool) void {
         if (!entry.valid or entry.packet_number != packet_number) continue;
         if (acknowledged) entry.* = .{} else entry.lost = true;
         return;
+    }
+}
+
+fn markNewToken(self: anytype, packet_number: u64, acknowledged: bool) void {
+    var matched = false;
+    for (&self.sent_new_tokens) |*entry| {
+        if (!entry.valid or entry.packet_number != packet_number) continue;
+        entry.valid = false;
+        matched = true;
+    }
+    if (!matched) return;
+    if (acknowledged) {
+        self.new_token_acknowledged = true;
+        self.new_token_pending = false;
+        for (&self.sent_new_tokens) |*entry| entry.valid = false;
+    } else if (!self.new_token_acknowledged) {
+        self.new_token_pending = true;
     }
 }
 
