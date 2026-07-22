@@ -29,7 +29,7 @@ pub const ControlState = struct {
                 if (self.sender != .client) return error.FrameUnexpected;
                 const id = value.payload.max_push_id;
                 if (self.max_push_id) |previous| {
-                    if (id < previous) return error.PushIdDecreased;
+                    if (id <= previous) return error.PushIdDecreased;
                 }
                 self.max_push_id = id;
             },
@@ -127,7 +127,7 @@ pub fn errorCode(cause: anyerror) errors.Code {
         error.DuplicateSetting, error.ReservedHttp2Setting, error.DuplicateSettingsFrame, error.InvalidH3DatagramSetting, error.InvalidWebTransportSetting, error.InvalidWebTransportFlowControlSetting => .settings_error,
         error.DuplicateCriticalStream, error.ClientOpenedPushStream => .stream_creation_error,
         error.ClosedCriticalStream => .closed_critical_stream,
-        error.InvalidGoawayId, error.GoawayIdIncreased, error.PushIdDecreased, error.PushDisabled, error.InvalidSessionId => .id_error,
+        error.InvalidGoawayId, error.GoawayIdIncreased, error.PushIdDecreased, error.InvalidPushId, error.PushDisabled, error.InvalidSessionId => .id_error,
         error.RequestIncomplete => .request_incomplete,
         error.ResponseIncomplete => .message_error,
         error.FrameUnexpected, error.FrameAfterTrailers, error.DataBeforeHeaders, error.HeaderClassificationRequired, error.ForbiddenHttp2Frame => .frame_unexpected,
@@ -151,6 +151,7 @@ test "control stream requires one first SETTINGS and enforces sender roles" {
     try client.observe(make(.settings, .{ .settings = "" }));
     try std.testing.expectError(error.DuplicateSettingsFrame, client.observe(make(.settings, .{ .settings = "" })));
     try client.observe(make(.max_push_id, .{ .max_push_id = 7 }));
+    try std.testing.expectError(error.PushIdDecreased, client.observe(make(.max_push_id, .{ .max_push_id = 7 })));
     try std.testing.expectError(error.PushIdDecreased, client.observe(make(.max_push_id, .{ .max_push_id = 6 })));
     try client.observe(make(.goaway, .{ .goaway = 5 }));
     try client.observe(make(.goaway, .{ .goaway = 4 }));

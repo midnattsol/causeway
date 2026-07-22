@@ -124,12 +124,25 @@ test "compliance: valid non-minimal QUIC varints are accepted throughout HTTP/3"
     }
 }
 
-test "compliance: client GOAWAY uses a decreasing Push ID and MAX_PUSH_ID increases" {
-    const accepted = try run(&.{.{ .id = 2, .bytes = "\x00\x04\x00\x07\x01\x05\x07\x01\x04" }});
+test "compliance: client GOAWAY decreases and MAX_PUSH_ID strictly increases from zero" {
+    const accepted = try run(&.{.{ .id = 2, .bytes = "\x00\x04\x00\x0d\x01\x00\x0d\x01\x01\x07\x01\x05\x07\x01\x04" }});
     try std.testing.expect(accepted.err == null);
     try std.testing.expect(accepted.transport.close_code == null);
     try expectConnectionError(code(.id_error), &.{.{ .id = 2, .bytes = "\x00\x04\x00\x07\x01\x05\x07\x01\x09" }});
+    try expectConnectionError(code(.id_error), &.{.{ .id = 2, .bytes = "\x00\x04\x00\x0d\x01\x09\x0d\x01\x09" }});
     try expectConnectionError(code(.id_error), &.{.{ .id = 2, .bytes = "\x00\x04\x00\x0d\x01\x09\x0d\x01\x05" }});
+}
+
+test "compliance: server Push ID registry protocol failures map to H3_ID_ERROR" {
+    const Registry = http3.connection.push.Registry;
+    var registry: Registry = .{};
+    try registry.setPeerMax(0);
+    _ = try registry.promise();
+    try std.testing.expectEqual(Code.id_error, http3.validation.errorCode(error.PushIdDecreased));
+    try std.testing.expectEqual(Code.id_error, http3.validation.errorCode(error.InvalidPushId));
+    try std.testing.expectError(error.InvalidPushId, registry.cancel(1));
+    try registry.cancel(0);
+    try registry.cancel(0);
 }
 
 test "compliance: incomplete requests carry H3_REQUEST_INCOMPLETE and semantic errors stay stream scoped" {
