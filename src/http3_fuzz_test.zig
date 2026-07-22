@@ -56,7 +56,113 @@ fn fuzzProtocol(io: std.Io, smith: *std.testing.Smith) !void {
     fuzzInstructions(input);
     fuzzFields(input);
     fuzzWebTransport(input);
+    try fuzzPushRegistry(input);
     fuzzConnection(io, input);
+}
+
+const PushRegistryModel = struct {
+    peer_max: ?u62 = null,
+    next_id: u62 = 0,
+    largest_promised: ?u62 = null,
+    goaway_cutoff: ?u62 = null,
+    exhausted: bool = false,
+
+    fn setPeerMax(self: *@This(), id: u62) !void {
+        if (self.peer_max) |previous| if (id <= previous) return error.PushIdDecreased;
+        self.peer_max = id;
+    }
+
+    fn promise(self: *@This()) !u62 {
+        if (self.exhausted) return error.PushIdExhausted;
+        const maximum = self.peer_max orelse return error.PushNotAllowed;
+        const id = self.next_id;
+        if (id > maximum) return error.PushNotAllowed;
+        if (self.goaway_cutoff) |cutoff| if (id >= cutoff) return error.PushNotAllowed;
+        self.largest_promised = id;
+        if (id == std.math.maxInt(u62)) {
+            self.exhausted = true;
+        } else {
+            self.next_id = id + 1;
+        }
+        return id;
+    }
+
+    fn cancel(self: @This(), id: u62) !void {
+        const largest = self.largest_promised orelse return error.InvalidPushId;
+        if (id > largest) return error.InvalidPushId;
+    }
+
+    fn setGoawayCutoff(self: *@This(), id: u62) !void {
+        if (self.goaway_cutoff) |previous| if (id > previous) return error.GoawayIdIncreased;
+        self.goaway_cutoff = id;
+    }
+};
+
+fn expectSameError(actual: ?anyerror, expected: ?anyerror) !void {
+    if (actual == null or expected == null) return std.testing.expect(actual == null and expected == null);
+    try std.testing.expectEqualStrings(@errorName(expected.?), @errorName(actual.?));
+}
+
+/// Differentially fuzzes the allocation-free protocol registry. Besides matching
+/// a deliberately small model, every operation checks monotonicity and that
+/// failed admission never consumes or recycles a Push ID.
+fn fuzzPushRegistry(input: []const u8) !void {
+    var registry: http3.connection.push.Registry = .{};
+    var model: PushRegistryModel = .{};
+    var cursor: usize = 0;
+    while (cursor + 1 < input.len) : (cursor += 2) {
+        const operation = input[cursor] % 4;
+        const id: u62 = input[cursor + 1] % 16;
+        const previous_next = registry.next_id;
+        var actual_error: ?anyerror = null;
+        var model_error: ?anyerror = null;
+        switch (operation) {
+            0 => {
+                registry.setPeerMax(id) catch |err| {
+                    actual_error = err;
+                };
+                model.setPeerMax(id) catch |err| {
+                    model_error = err;
+                };
+            },
+            1 => {
+                const actual = registry.promise() catch |err| blk: {
+                    actual_error = err;
+                    break :blk null;
+                };
+                const expected = model.promise() catch |err| blk: {
+                    model_error = err;
+                    break :blk null;
+                };
+                try std.testing.expectEqual(expected, actual);
+            },
+            2 => {
+                registry.cancel(id) catch |err| {
+                    actual_error = err;
+                };
+                model.cancel(id) catch |err| {
+                    model_error = err;
+                };
+            },
+            3 => {
+                registry.setGoawayCutoff(id) catch |err| {
+                    actual_error = err;
+                };
+                model.setGoawayCutoff(id) catch |err| {
+                    model_error = err;
+                };
+            },
+            else => unreachable,
+        }
+        try expectSameError(actual_error, model_error);
+        try std.testing.expectEqual(model.peer_max, registry.peer_max);
+        try std.testing.expectEqual(model.next_id, registry.next_id);
+        try std.testing.expectEqual(model.largest_promised, registry.largest_promised);
+        try std.testing.expectEqual(model.goaway_cutoff, registry.goaway_cutoff);
+        try std.testing.expectEqual(model.exhausted, registry.exhausted);
+        if (operation != 1 or actual_error != null) try std.testing.expectEqual(previous_next, registry.next_id);
+        if (registry.largest_promised) |largest| try std.testing.expect(registry.next_id > largest or registry.exhausted);
+    }
 }
 
 fn fuzzWebTransport(input: []const u8) void {

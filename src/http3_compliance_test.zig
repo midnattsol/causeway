@@ -25,6 +25,31 @@ const Dispatcher = struct {
 };
 const TestSession = Session(State, Dispatcher, FakeConnection, support.small_config);
 
+const push_config = blk: {
+    var value = support.small_config;
+    value.enable_server_push = true;
+    value.max_pushes = 1;
+    value.qpack_capacity = 256;
+    value.qpack_entries = 8;
+    break :blk value;
+};
+const PushState = struct { promised: std.atomic.Value(bool) = .init(false) };
+const PushDispatcher = struct {
+    pub fn dispatch(context: anytype) !Response {
+        const outcome = try context.push(.{
+            .path = "/compliance.css",
+            .headers = .{ .items = &.{.{ .name = "x-promise", .value = "v" }} },
+        }, .{
+            .status = .ok,
+            .headers = .{ .items = &.{.{ .name = "x-response", .value = "v" }} },
+            .body = .{ .bytes = "body" },
+        });
+        context.execution.state.promised.store(outcome == .promised, .release);
+        return .{ .status = .ok };
+    }
+};
+const PushSession = Session(PushState, PushDispatcher, FakeConnection, push_config);
+
 const Input = struct {
     id: u64,
     bytes: []const u8,
@@ -67,6 +92,29 @@ fn expectConnectionError(expected: u64, inputs: []const Input) !void {
 
 fn code(value: Code) u64 {
     return @intFromEnum(value);
+}
+
+fn feedMaxPushId(transport: *FakeConnection, maximum: u62) !void {
+    var bytes: [64]u8 = undefined;
+    var cursor = try http3.stream.encodePrefix(&bytes, .control, null);
+    cursor += try http3.frame.encode(bytes[cursor..], .{ .frame_type = .settings, .payload = .{ .settings = "" } });
+    cursor += try http3.frame.encode(bytes[cursor..], .{ .frame_type = .max_push_id, .payload = .{ .max_push_id = maximum } });
+    try transport.feed(try support.clientUniId(0), bytes[0..cursor], false);
+}
+
+fn feedControlFrame(transport: *FakeConnection, value: http3.frame.Frame) !void {
+    var bytes: [32]u8 = undefined;
+    const length = try http3.frame.encode(&bytes, value);
+    try transport.feed(try support.clientUniId(0), bytes[0..length], false);
+}
+
+fn encodeGet(destination: []u8) !usize {
+    return support.encodeRequestFields(destination, 0, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = ":path", .value = "/" },
+    }, "");
 }
 
 test "compliance: control stream requires exactly one valid first SETTINGS" {
@@ -124,25 +172,125 @@ test "compliance: valid non-minimal QUIC varints are accepted throughout HTTP/3"
     }
 }
 
-test "compliance: client GOAWAY decreases and MAX_PUSH_ID strictly increases from zero" {
-    const accepted = try run(&.{.{ .id = 2, .bytes = "\x00\x04\x00\x0d\x01\x00\x0d\x01\x01\x07\x01\x05\x07\x01\x04" }});
+test "compliance: MAX_PUSH_ID starts at zero and every update increases strictly" {
+    const accepted = try run(&.{.{ .id = 2, .bytes = "\x00\x04\x00\x0d\x01\x00\x0d\x01\x01" }});
     try std.testing.expect(accepted.err == null);
     try std.testing.expect(accepted.transport.close_code == null);
-    try expectConnectionError(code(.id_error), &.{.{ .id = 2, .bytes = "\x00\x04\x00\x07\x01\x05\x07\x01\x09" }});
     try expectConnectionError(code(.id_error), &.{.{ .id = 2, .bytes = "\x00\x04\x00\x0d\x01\x09\x0d\x01\x09" }});
     try expectConnectionError(code(.id_error), &.{.{ .id = 2, .bytes = "\x00\x04\x00\x0d\x01\x09\x0d\x01\x05" }});
 }
 
-test "compliance: server Push ID registry protocol failures map to H3_ID_ERROR" {
+test "compliance: CANCEL_PUSH placement and future IDs are connection errors" {
+    try expectConnectionError(code(.frame_unexpected), &.{.{ .id = 0, .bytes = "\x03\x01\x00" }});
+    try expectConnectionError(code(.missing_settings), &.{.{ .id = 2, .bytes = "\x00\x03\x01\x00" }});
+    try expectConnectionError(code(.id_error), &.{.{ .id = 2, .bytes = "\x00\x04\x00\x03\x01\x00" }});
+}
+
+test "compliance: Push IDs are sequential never reused and obey client GOAWAY cutoff" {
     const Registry = http3.connection.push.Registry;
     var registry: Registry = .{};
-    try registry.setPeerMax(0);
-    _ = try registry.promise();
+    try registry.setPeerMax(3);
+    try std.testing.expectEqual(@as(u62, 0), try registry.promise());
+    try std.testing.expectEqual(@as(u62, 1), try registry.promise());
+    try registry.cancel(0);
+    try registry.cancel(0);
+    try std.testing.expectEqual(@as(u62, 2), try registry.promise());
+    try std.testing.expectError(error.InvalidPushId, registry.cancel(3));
+    try registry.setGoawayCutoff(3);
+    try std.testing.expectError(error.PushNotAllowed, registry.promise());
+    try registry.setGoawayCutoff(1);
+    try std.testing.expectError(error.GoawayIdIncreased, registry.setGoawayCutoff(2));
+    try std.testing.expectEqual(@as(u62, 3), registry.next_id);
     try std.testing.expectEqual(Code.id_error, http3.validation.errorCode(error.PushIdDecreased));
     try std.testing.expectEqual(Code.id_error, http3.validation.errorCode(error.InvalidPushId));
-    try std.testing.expectError(error.InvalidPushId, registry.cancel(1));
-    try registry.cancel(0);
-    try registry.cancel(0);
+}
+
+test "compliance: push streams are server-only" {
+    try expectConnectionError(code(.stream_creation_error), &.{.{ .id = 2, .bytes = "\x01\x00" }});
+}
+
+test "compliance: cancellation uses H3_REQUEST_CANCELLED QPACK uses QUIC stream IDs and shutdown drains" {
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{};
+    var state: PushState = .{};
+    var session = PushSession.init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+
+    try session.activate();
+    var instruction_storage: [128]u8 = undefined;
+    var instruction_writer: Io.Writer = .fixed(&instruction_storage);
+    try session.encoder.?.setCapacity(&instruction_writer, 256);
+    _ = try session.encoder.?.insertLiteral(&instruction_writer, "x-promise", "v", false);
+    _ = try session.encoder.?.insertLiteral(&instruction_writer, "x-response", "v", false);
+    try feedMaxPushId(&transport, 0);
+    _ = try session.poll(0);
+    transport.writes_blocked = true;
+
+    var request_bytes: [512]u8 = undefined;
+    const parent = try support.requestId(0);
+    const push_stream = try support.serverUniId(3);
+    try transport.feed(parent, request_bytes[0..try encodeGet(&request_bytes)], true);
+    for (0..300) |step| {
+        _ = try session.poll(step + 1);
+        if (state.promised.load(.acquire)) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(state.promised.load(.acquire));
+
+    var saw_parent = false;
+    var saw_push = false;
+    for (session.encoder_sections) |section| if (section.active) {
+        if (section.stream_id == parent.value) saw_parent = true;
+        if (section.stream_id == push_stream.value) saw_push = true;
+    };
+    try std.testing.expect(saw_parent);
+    try std.testing.expect(saw_push);
+
+    transport.writes_blocked = false;
+    try session.beginShutdown(400);
+    transport.writes_blocked = true;
+    try std.testing.expect(!session.drainComplete());
+    try feedControlFrame(&transport, .{ .frame_type = .cancel_push, .payload = .{ .cancel_push = 0 } });
+    _ = try session.poll(401);
+    try std.testing.expectEqual(@as(?u64, code(.request_cancelled)), transport.find(push_stream).?.reset_code);
+    try std.testing.expect(!session.drainComplete());
+
+    // Repeated cancellation is valid even after the active slot has begun to
+    // complete; the monotonic registry retains the promised-ID tombstone.
+    try feedControlFrame(&transport, .{ .frame_type = .cancel_push, .payload = .{ .cancel_push = 0 } });
+    _ = try session.poll(402);
+    try std.testing.expect(transport.close_code == null);
+
+    var decoder_wire: [32]u8 = undefined;
+    var decoder_length = try http3.stream.encodePrefix(&decoder_wire, .qpack_decoder, null);
+    var decoder_writer: Io.Writer = .fixed(decoder_wire[decoder_length..]);
+    try qpack.instructions.writeSectionAcknowledgment(&decoder_writer, @intCast(parent.value));
+    try qpack.instructions.writeStreamCancellation(&decoder_writer, @intCast(push_stream.value));
+    decoder_length += decoder_writer.buffered().len;
+    try transport.feed(try support.clientUniId(1), decoder_wire[0..decoder_length], false);
+    _ = try session.poll(403);
+    for (session.encoder_sections) |section| {
+        if (section.stream_id == parent.value or section.stream_id == push_stream.value) try std.testing.expect(!section.active);
+    }
+
+    try transport.acknowledgeFinish(push_stream);
+    transport.writes_blocked = false;
+    for (0..300) |step| {
+        _ = try session.poll(step + 500);
+        if (transport.find(parent).?.finished) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(transport.find(parent).?.finished);
+    try transport.acknowledgeFinish(parent);
+    for (0..100) |step| {
+        _ = try session.poll(step + 900);
+        if (session.drainComplete()) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(session.drainComplete());
 }
 
 test "compliance: incomplete requests carry H3_REQUEST_INCOMPLETE and semantic errors stay stream scoped" {

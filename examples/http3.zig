@@ -8,13 +8,16 @@ const quic_limits: causeway.quic.connection.Limits = .{
     .tls_output_bytes = 16 * 1024,
     .tls_transcript_bytes = 32 * 1024,
     .max_datagram_size = 1350,
-    .max_streams = 35,
+    // 16 client bidi + 16 client uni + 3 HTTP/3 critical + 4 push streams.
+    .max_streams = 39,
     .stream_receive_bytes = 64 * 1024,
     .stream_send_bytes = 64 * 1024,
 };
 
 const http3_config: causeway.http.http3.Config = .{
     .max_requests = 16,
+    .enable_server_push = true,
+    .max_pushes = 4,
     .max_peer_unidirectional_streams = 8,
     .max_body_size = 1024 * 1024,
     .max_response_body_size = 1024 * 1024,
@@ -24,7 +27,7 @@ const http3_config: causeway.http.http3.Config = .{
 
 const Http3Server = causeway.http.http3.Server(
     common.State,
-    common.Router,
+    common.Http3Router,
     quic_limits,
     16,
     16,

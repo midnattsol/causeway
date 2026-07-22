@@ -14,9 +14,10 @@ pub const Config = struct {
     const webtransport_close_message_max: usize = 1024;
 
     max_requests: usize = 16,
-    /// Server push is opt-in. `max_pushes` bounds simultaneously owned push
-    /// responses; Push IDs remain monotonic and are never recycled.
+    /// Server push is opt-in; disabled configurations allocate no push slots.
     enable_server_push: bool = false,
+    /// Maximum responses simultaneously owned by server push. This is a
+    /// concurrency/storage bound, not a Push ID limit; IDs are never recycled.
     max_pushes: usize = 8,
     max_peer_unidirectional_streams: usize = 8,
     max_frame_size: usize = 16 * 1024,

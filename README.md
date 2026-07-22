@@ -73,9 +73,11 @@ zig build example-http3
 curl -k --http3-only https://127.0.0.1:8443/
 ```
 
-The HTTP/3 curl command requires a curl build with HTTP/3 support. The example certificate, private-key seed, Retry secret, and stateless-reset secret are public deterministic development fixtures. Never reuse them in production; provide managed credentials and independently generated secrets.
+The HTTP/3 curl command requires a curl build with HTTP/3 support. Its server-push example opts in with `enable_server_push`, bounds concurrent owned push responses with `max_pushes`, and calls `Context.push(request, response)`. Push remains conditional on the client sending `MAX_PUSH_ID`: `.promised` transfers response ownership to Causeway, while `.unavailable` leaves ownership with the caller and the example falls back to the asset's normal route. Cancellation and client GOAWAY can terminate accepted pushes with `H3_REQUEST_CANCELLED`; Push IDs are sequential and never reused. QPACK section/blocked-stream limits and QUIC `max_streams` plus the peer's server-unidirectional stream allowance must be sized for enabled pushes. See [`docs/http3.md`](docs/http3.md#http3-streams-and-qpack) for unavailable reasons, ownership, limits, and shutdown behavior.
 
-All examples use the same compile-time router and handlers from `examples/common.zig`; the selected wire protocol and transport differ. `zig build test` compiles the example executables without starting their servers.
+The example certificate, private-key seed, Retry secret, and stateless-reset secret are public deterministic development fixtures. Never reuse them in production; provide managed credentials and independently generated secrets.
+
+The HTTP/1 and HTTP/2 examples share the basic router from `examples/common.zig`; HTTP/3 selects the push-capable router from the same module. `zig build test` compiles the example executables without starting their servers.
 
 ## Layers
 

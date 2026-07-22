@@ -254,9 +254,27 @@ The peer's corresponding critical streams are unique and cannot close while the 
 
 QPACK uses caller-owned dynamic-table bytes and metadata, bounded blocked-stream tracking, bounded outstanding sections, and fixed scratch buffers. Requests blocked on a required insert count are retried after encoder instructions advance the decoder table. Encoder and decoder stream failures use the RFC 9204 application error codes.
 
-Server push is opt-in through `enable_server_push`. The client must first send `MAX_PUSH_ID`; without that allowance, push requests return an unavailable outcome and no Push ID is consumed. A handler can call `Context.push(PushRequest, Response)` before its final response starts. A `.promised` `PushOutcome` transfers ownership of the response to the HTTP/3 adapter, emits `PUSH_PROMISE` on the parent request stream, and serves the response on a server-initiated push stream. `.unavailable` is an expected bounded-admission result and leaves the response caller-owned.
+Server push is opt-in and server-side only; Causeway does not implement an HTTP/3 client. Enable and bound it explicitly:
 
-Push IDs are monotonic and never recycled. Client `CANCEL_PUSH` and `STOP_SENDING` on a push stream abort the producer and reset the push stream with `H3_REQUEST_CANCELLED`; duplicate cancellation remains idempotent after completion. Client GOAWAY carries a decreasing Push ID cutoff: no new ID at or above the cutoff is accepted, and affected pushes are cancelled. Shutdown stops accepting pushes immediately and includes active push slots, producers, pipes, queued operations, and their parent requests in drain completion. Client-created push streams remain a connection error.
+```zig
+const http3_config: causeway.http.http3.Config = .{
+    .max_requests = 16,
+    .enable_server_push = true,
+    .max_pushes = 4,
+    .qpack_encoder_blocked_streams = 8,
+    .qpack_sections = 24, // at least max_requests + 2 * max_pushes
+};
+```
+
+The client must first send `MAX_PUSH_ID`; the first value may be zero and each later value must increase strictly. The value is the largest Push ID the server may use, so `MAX_PUSH_ID = 0` permits exactly Push ID zero. Without an allowance, push requests return `.unavailable.peer_disabled` and no Push ID is consumed.
+
+A handler calls `Context.push(PushRequest, Response)` before its final response starts. `PushRequest` is a borrowed, bodyless GET or HEAD description; its slices only need to remain valid for the call. A `.promised` `PushOutcome` transfers ownership of the `Response` to the HTTP/3 adapter, which assumes responsibility for body production, finalization, and completion, but does not promise that wire bytes were emitted before return. On `.unavailable` or error, ownership remains with the caller; `.unavailable` guarantees that the adapter did not access, produce, finalize, or complete the response.
+
+Unavailability is normal fallback control flow rather than a protocol failure. The reasons are: `unsupported_protocol`, `server_disabled`, `final_response_started`, `peer_disabled`, `peer_limit_reached`, `connection_draining`, `capacity`, and `stream_limit_reached`. Applications should keep the referenced resource reachable through an ordinary route so clients that disable push can fetch it normally.
+
+Push IDs are sequential, monotonic, and never recycled, including after cancellation or bounded slot reuse. Client `CANCEL_PUSH` on the control stream and `STOP_SENDING` on an active push stream abort production and reset that stream with `H3_REQUEST_CANCELLED`; `CANCEL_PUSH` for an unpromised future ID is `H3_ID_ERROR`, while repeated cancellation of an already promised ID is idempotent. A client-created push stream is `H3_STREAM_CREATION_ERROR`.
+
+Client GOAWAY carries a Push ID cutoff and successive values cannot increase. No new Push ID at or above the cutoff is admitted, and active pushes in that range are cancelled. Shutdown independently stops accepting pushes immediately and includes active push slots, producers, body pipes, queued operations, QPACK-backed parent promises, and their parent requests in drain completion.
 
 ## Streaming, flow control, and concurrent handlers
 
@@ -321,7 +339,9 @@ Timeout, peer reset, `STOP_SENDING`, connection close, and shutdown cancel block
 max_streams >= initial_max_streams_bidi + initial_max_streams_uni + 3 + max_pushes
 ```
 
-The `max_pushes` term is needed only when server push is enabled, and the peer's QUIC limit for server-initiated unidirectional streams must also leave room for those push streams. The HTTP/3 request concurrency should remain coherent with transport admission: `max_requests` should not exceed the intended client bidirectional stream concurrency. `qpack_decoder_blocked_streams` is advertised to the peer and cannot exceed `max_requests`; `qpack_encoder_blocked_streams` covers locally encoded request and push response streams and cannot exceed `max_requests + max_pushes` when push is enabled. `qpack_sections` must hold request responses plus both the parent-stream promise and push-stream response sections for every active push.
+The `max_pushes` term is needed only when server push is enabled. It bounds simultaneously adapter-owned push responses, not the lifetime total of Push IDs. The client's QUIC `MAX_STREAMS_UNI` allowance for server-initiated unidirectional streams must also leave room for the three server critical streams and desired concurrent push streams; if it does not, `Context.push` can return `.unavailable.stream_limit_reached` without consuming a Push ID.
+
+HTTP/3 request concurrency should remain coherent with transport admission: `max_requests` should not exceed the intended client bidirectional stream concurrency. `qpack_decoder_blocked_streams` is advertised to the peer and cannot exceed `max_requests`. `qpack_encoder_blocked_streams` is the local bound for encoded request-response and push-response streams and cannot exceed `max_requests + max_pushes` when push is enabled. `qpack_sections` must be at least `max_requests + 2 * max_pushes`: one request-response section per request plus a parent-stream `PUSH_PROMISE` section and push-stream response section per active push. QPACK acknowledgments and stream cancellations identify those sections with the actual parent request and push QUIC stream IDs, not Push IDs.
 
 `max_closed_streams` is separate from active concurrency. It retains receive-side final sizes after active slots are recycled so late or duplicate frames can still be validated. It must be nonzero and should be sized for the expected stream churn and packet reordering window.
 
