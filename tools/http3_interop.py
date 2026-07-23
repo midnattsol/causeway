@@ -68,7 +68,7 @@ class Http3Client(QuicConnectionProtocol):
         self.push_promises: dict[int, PushPromiseReceived] = {}
         self.pushes: dict[int, Response] = {}
         self.finished_pushes: set[int] = set()
-        self.push_waiter = asyncio.get_running_loop().create_future()
+        self.push_waiter = None
         self.header_waiters: dict[int, asyncio.Future[list[tuple[bytes, bytes]]]] = {}
         self.webtransport_waiter = None
         self.webtransport_stream_id = None
@@ -96,6 +96,11 @@ class Http3Client(QuicConnectionProtocol):
         return await asyncio.wait_for(waiter, timeout=10)
 
     async def first_push(self) -> tuple[PushPromiseReceived, Response]:
+        completed = self.finished_pushes.intersection(self.push_promises)
+        if completed:
+            push_id = min(completed)
+            return self.push_promises[push_id], self.pushes[push_id]
+        self.push_waiter = asyncio.get_running_loop().create_future()
         push_id = await asyncio.wait_for(self.push_waiter, timeout=10)
         return self.push_promises[push_id], self.pushes[push_id]
 
@@ -103,6 +108,7 @@ class Http3Client(QuicConnectionProtocol):
         if (
             push_id in self.push_promises
             and push_id in self.finished_pushes
+            and self.push_waiter is not None
             and not self.push_waiter.done()
         ):
             self.push_waiter.set_result(push_id)
@@ -153,7 +159,7 @@ class Http3Client(QuicConnectionProtocol):
                     waiter.set_exception(error)
             if self.webtransport_waiter is not None and not self.webtransport_waiter.done():
                 self.webtransport_waiter.set_exception(error)
-            if not self.push_waiter.done():
+            if self.push_waiter is not None and not self.push_waiter.done():
                 self.push_waiter.set_exception(error)
 
         elif isinstance(event, StreamReset):
