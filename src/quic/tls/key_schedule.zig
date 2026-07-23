@@ -87,6 +87,14 @@ pub fn verifyResumptionBinder(psk: []const u8, binder_transcript_hash: Transcrip
     return std.crypto.timing_safe.eql([secret_length]u8, expected, binder[0..secret_length].*);
 }
 
+/// Derives the client early traffic secret from the complete ClientHello
+/// transcript hash, including the PSK binders.
+pub fn deriveClientEarlyTrafficSecret(psk: []const u8, client_hello_hash: TranscriptHash) Secret {
+    var early = deriveEarly(psk);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&early));
+    return expand(early.early_secret, "c e traffic", &client_hello_hash, secret_length);
+}
+
 /// Derives secrets through the handshake traffic-secret stage from ECDHE,
 /// preserving the original non-PSK schedule API.
 pub fn deriveHandshake(shared_secret: []const u8, hello_transcript_hash: TranscriptHash) HandshakeSecrets {
@@ -234,6 +242,17 @@ test "RFC 8448 resumed binder and PSK-DHE schedule vectors" {
     try expectHex("005cb112fd8eb4ccc623bb88a07c64b3ede1605363fc7d0df8c7ce4ff0fb4ae6", &schedule.handshake_secret);
     try expectHex("2faac08f851d35fea3604fcb4de82dc62c9b164a70974d0462e27f1ab278700f", &schedule.client_handshake_traffic_secret);
     try expectHex("fe927ae271312e8bf0275b581c54eef020450dc4ecffaa05a1a35d27518e7803", &schedule.server_handshake_traffic_secret);
+}
+
+test "RFC 8448 resumed client early traffic secret vector" {
+    var psk: Secret = undefined;
+    _ = try std.fmt.hexToBytes(&psk, "4ecd0eb6ec3b4d87f5d6028f922ca4c5851a277fd41311c9e62d2c9492e1c4f3");
+    var client_hello_hash: TranscriptHash = undefined;
+    _ = try std.fmt.hexToBytes(&client_hello_hash, "08ad0fa05d7c7233b1775ba2ff9f4c5b8b59276b7f227f13a976245f5d960913");
+
+    var secret = deriveClientEarlyTrafficSecret(&psk, client_hello_hash);
+    defer std.crypto.secureZero(u8, &secret);
+    try expectHex("3fbbe6a60deb66c30a32795aba0eff7eaa10105586e7be5c09678d63b6caab62", &secret);
 }
 
 test "RFC 8448 full application resumption and per-ticket vectors" {
