@@ -551,6 +551,8 @@ pub const Server = struct {
         if (!transport_parameters.permitsRememberedEarlyData(current, remembered)) return false;
         if (policy.application_state_validator) |validate|
             if (!validate(selected.contents.applicationData())) return false;
+        if (policy.protocol_state_validator) |validate|
+            if (!validate(selected.contents.applicationData())) return false;
         const expires_at = std.math.add(u64, selected.contents.issued_at, selected.contents.lifetime) catch return false;
         return policy.replay_service.consume(
             selected.identity,

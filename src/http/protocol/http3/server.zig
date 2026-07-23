@@ -117,7 +117,7 @@ fn ServerType(
             self.* = .{ .allocator = allocator, .state = state };
             var endpoint_policy = policy;
             if (endpoint_policy.early_data != .disabled)
-                endpoint_policy.early_data_application_validator = validateEarlyApplicationState;
+                endpoint_policy.early_data_protocol_validator = validateEarlyApplicationState;
             try self.endpoint.init(socket, endpoint_policy);
         }
 
@@ -134,7 +134,7 @@ fn ServerType(
             self.* = .{ .allocator = allocator, .state = state };
             var endpoint_policy = policy;
             if (endpoint_policy.early_data != .disabled)
-                endpoint_policy.early_data_application_validator = validateEarlyApplicationState;
+                endpoint_policy.early_data_protocol_validator = validateEarlyApplicationState;
             try self.endpoint.bind(io, address, endpoint_policy);
         }
 

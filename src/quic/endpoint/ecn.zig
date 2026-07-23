@@ -127,8 +127,10 @@ fn readHeader(bytes: []const u8) ?std.c.cmsghdr {
 }
 
 fn alignForward(value: usize) usize {
-    return std.mem.alignForward(usize, value, @sizeOf(usize));
+    return std.mem.alignForward(usize, value, cmsg_alignment);
 }
+
+const cmsg_alignment: usize = if (builtin.os.tag == .macos) @sizeOf(u32) else @sizeOf(usize);
 
 test "ECN ancillary metadata round trips for IPv4 and IPv6" {
     if (!ancillary_supported or @TypeOf(std.c.cmsghdr) == void) return error.SkipZigTest;
@@ -156,7 +158,11 @@ test "ECN ancillary parser accepts IPv4 receive cmsg type" {
 }
 
 comptime {
+    if (ancillary_supported and @TypeOf(std.c.cmsghdr) == void)
+        @compileError("supported ECN target has no cmsghdr ABI");
+    if (builtin.os.tag == .macos and (@sizeOf(std.c.cmsghdr) != 12 or cmsg_alignment != 4))
+        @compileError("unexpected Darwin cmsghdr ABI");
     if (@TypeOf(std.c.cmsghdr) != void and
-        control_bytes < std.mem.alignForward(usize, @sizeOf(std.c.cmsghdr) + @sizeOf(c_int), @sizeOf(usize)))
+        control_bytes < std.mem.alignForward(usize, @sizeOf(std.c.cmsghdr) + @sizeOf(c_int), cmsg_alignment))
         @compileError("ECN control buffer cannot hold one integer cmsg");
 }

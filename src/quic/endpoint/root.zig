@@ -61,8 +61,10 @@ pub const Policy = struct {
     early_data_max_age_skew_ms: u32 = 10_000,
     /// Required by `.external`; the caller owns synchronization and lifetime.
     early_data_replay_service: ?tls_server.ReplayService = null,
-    /// Optional protocol-specific validation over authenticated ticket state.
+    /// Optional caller application policy over authenticated ticket state.
     early_data_application_validator: ?*const fn ([]const u8) bool = null,
+    /// Reserved for a protocol integration layered over the endpoint.
+    early_data_protocol_validator: ?*const fn ([]const u8) bool = null,
     transport_parameters: transport_parameters.Values = .{},
     /// Length of server-issued connection IDs (1...20).
     connection_id_length: u8 = 16,
@@ -418,11 +420,13 @@ pub fn EndpointWithFeatures(
                                     .consume_fn = consumeEarlyDataReplay,
                                 },
                                 .application_state_validator = self.policy.early_data_application_validator,
+                                .protocol_state_validator = self.policy.early_data_protocol_validator,
                                 .max_age_skew_ms = self.policy.early_data_max_age_skew_ms,
                             },
                             .external => .{
                                 .replay_service = self.policy.early_data_replay_service.?,
                                 .application_state_validator = self.policy.early_data_application_validator,
+                                .protocol_state_validator = self.policy.early_data_protocol_validator,
                                 .max_age_skew_ms = self.policy.early_data_max_age_skew_ms,
                             },
                         },
