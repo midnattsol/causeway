@@ -285,6 +285,7 @@ pub fn Controller(comptime config: anytype, comptime Ops: type) type {
                 if (output.isFinished()) {
                     try self.connection.finishStream(slot.id);
                     slot.send_finished = true;
+                    Ops.completePendingFinish(slot, null);
                     session_slot.wt_stream_cursor = (index + 1) % self.webtransport_streams.len;
                     return .{ .action = true };
                 }
@@ -299,7 +300,11 @@ pub fn Controller(comptime config: anytype, comptime Ops: type) type {
                     return beginOpenWebTransportStream(self, session_slot, if (operation.kind == .open_uni) .unidirectional else .bidirectional, operation);
                 },
                 .finish => {
-                    _ = try streamForOperation(self, operation);
+                    const slot = try streamForOperation(self, operation);
+                    if (slot.send_finished) return true;
+                    std.debug.assert(slot.pending_finish == null);
+                    slot.pending_finish = operation;
+                    return false;
                 },
                 .reset => {
                     const slot = try streamForOperation(self, operation);
@@ -496,6 +501,7 @@ pub fn Controller(comptime config: anytype, comptime Ops: type) type {
                 if (!slot.occupied or !slot.associated or slot.session != session_slot) continue;
                 Ops.failStream(slot, cause);
                 Ops.completePendingOpen(slot, cause);
+                Ops.completePendingFinish(slot, cause);
                 if (!slot.send_finished) resetWebTransportSend(self, slot, wt_constants.wt_session_gone) catch {
                     self.connection.resetStream(slot.id, wt_constants.wt_session_gone) catch {};
                 };

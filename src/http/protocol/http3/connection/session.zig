@@ -240,6 +240,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             handle: ?*WebTransportStreamHandle = null,
             public_stream: WebTransportStream = undefined,
             pending_open: ?*WebTransportOperation = null,
+            pending_finish: ?*WebTransportOperation = null,
 
             fn credit(raw: *anyopaque, amount: usize) void {
                 const self: *WebTransportStreamSlot = @ptrCast(@alignCast(raw));
@@ -260,8 +261,18 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 operation.done.set(self.owner.io);
             }
 
+            fn completePendingFinish(self: *WebTransportStreamSlot, err: ?anyerror) void {
+                const operation = self.pending_finish orelse return;
+                operation.err = err;
+                self.pending_finish = null;
+                operation.done.set(self.owner.io);
+            }
+
             fn recycle(self: *WebTransportStreamSlot) void {
-                if (self.occupied) self.completePendingOpen(error.WebTransportSessionClosed);
+                if (self.occupied) {
+                    self.completePendingOpen(error.WebTransportSessionClosed);
+                    self.completePendingFinish(error.WebTransportSessionClosed);
+                }
                 const generation = self.generation;
                 self.* = .{ .generation = generation };
             }
@@ -723,6 +734,9 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
             pub fn completePendingOpen(slot: *WebTransportStreamSlot, err: anyerror) void {
                 slot.completePendingOpen(err);
+            }
+            pub fn completePendingFinish(slot: *WebTransportStreamSlot, err: ?anyerror) void {
+                slot.completePendingFinish(err);
             }
             pub fn recycleStream(slot: *WebTransportStreamSlot) void {
                 slot.recycle();
@@ -1643,6 +1657,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             if (self.findWebTransportStream(id)) |slot| {
                 if (slot.handle) |handle| handle.stop_code.store(code, .release);
                 if (slot.pending_open != null) slot.completePendingOpen(error.PeerStopped);
+                slot.completePendingFinish(error.PeerStopped);
                 slot.send_finished = true;
                 if (slot.output) |output| output.abort(error.PeerStopped);
                 WtController.collectWebTransportStreams(
@@ -2526,7 +2541,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                     .quarter_stream_id = slot.id.value / 4,
                     .payload = payload,
                 });
-                self.connection.enqueueDatagram(encoded[0..length]) catch |err| switch (err) {
+                self.connection.enqueueDatagram(encoded[0..length]) catch |err| switch (@as(anyerror, err)) {
                     error.DatagramQueueFull => break,
                     error.DatagramDisabled, error.DatagramNotNegotiated, error.DatagramTooLarge => {
                         try slot.datagrams.outgoing.consume();
