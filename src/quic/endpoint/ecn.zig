@@ -1,11 +1,11 @@
-//! ECN metadata and Linux UDP ancillary-data support.
+//! ECN metadata and explicitly supported UDP ancillary-data ABIs.
 //!
 //! `std.Io.net` exposes caller-owned `IncomingMessage.control` and
 //! `OutgoingMessage.control` buffers. Its POSIX backends pass those buffers to
 //! `recvmsg(2)` and `sendmsg(2)`. Socket-option setup is not exposed by
-//! `std.Io`, so this module uses `std.posix.setsockopt` on Linux and reports an
-//! explicit unsupported status everywhere else. Keeping
-//! the boundary explicit avoids assuming a foreign `cmsghdr` ABI.
+//! `std.Io`, so this module uses `std.posix.setsockopt`. Linux, macOS, and
+//! FreeBSD have explicit layouts below; other targets report unsupported rather
+//! than assuming a generic POSIX `cmsghdr` ABI.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -27,7 +27,26 @@ pub const BackendStatus = union(enum) {
 pub const control_bytes: usize = 32;
 pub const ControlBuffer = [control_bytes]u8;
 
-const ancillary_supported = builtin.os.tag == .linux;
+const ancillary_supported = switch (builtin.os.tag) {
+    .linux, .macos, .freebsd => true,
+    else => false,
+};
+
+const Constants = struct {
+    ip_protocol: c_int,
+    ipv6_protocol: c_int,
+    ip_tos: u32,
+    ip_recvtos: u32,
+    ipv6_recv_tclass: u32,
+    ipv6_tclass: u32,
+};
+
+const constants: Constants = switch (builtin.os.tag) {
+    .linux => .{ .ip_protocol = 0, .ipv6_protocol = 41, .ip_tos = 1, .ip_recvtos = 13, .ipv6_recv_tclass = 66, .ipv6_tclass = 67 },
+    .macos => .{ .ip_protocol = 0, .ipv6_protocol = 41, .ip_tos = 3, .ip_recvtos = 27, .ipv6_recv_tclass = 35, .ipv6_tclass = 36 },
+    .freebsd => .{ .ip_protocol = 0, .ipv6_protocol = 41, .ip_tos = 3, .ip_recvtos = 68, .ipv6_recv_tclass = 57, .ipv6_tclass = 61 },
+    else => .{ .ip_protocol = 0, .ipv6_protocol = 41, .ip_tos = 0, .ip_recvtos = 0, .ipv6_recv_tclass = 0, .ipv6_tclass = 0 },
+};
 
 pub fn enableReceive(handle: std.Io.net.Socket.Handle, family: std.Io.net.IpAddress.Family) BackendStatus {
     if (!ancillary_supported or @TypeOf(std.c.cmsghdr) == void) return .unsupported;
@@ -35,12 +54,10 @@ pub fn enableReceive(handle: std.Io.net.Socket.Handle, family: std.Io.net.IpAddr
     const bytes = std.mem.asBytes(&one);
     switch (family) {
         .ip4 => {
-            if (!@hasDecl(std.posix.IP, "RECVTOS")) return .unsupported;
-            std.posix.setsockopt(handle, std.posix.IPPROTO.IP, std.posix.IP.RECVTOS, bytes) catch return .setup_failed;
+            std.posix.setsockopt(handle, constants.ip_protocol, constants.ip_recvtos, bytes) catch return .setup_failed;
         },
         .ip6 => {
-            if (!@hasDecl(std.posix.IPV6, "RECVTCLASS")) return .unsupported;
-            std.posix.setsockopt(handle, std.posix.IPPROTO.IPV6, std.posix.IPV6.RECVTCLASS, bytes) catch return .setup_failed;
+            std.posix.setsockopt(handle, constants.ipv6_protocol, constants.ipv6_recv_tclass, bytes) catch return .setup_failed;
         },
     }
     return .enabled;
@@ -51,21 +68,26 @@ pub fn encode(control: *ControlBuffer, family: std.Io.net.IpAddress.Family, code
     @memset(control, 0);
     const Header = std.c.cmsghdr;
     const data_offset = alignForward(@sizeOf(Header));
-    const data_length = @sizeOf(c_int);
+    const byte_payload = family == .ip4 and builtin.os.tag == .freebsd;
+    const data_length: usize = if (byte_payload) @sizeOf(u8) else @sizeOf(c_int);
     const header: Header = .{
         .len = @intCast(data_offset + data_length),
         .level = switch (family) {
-            .ip4 => std.posix.IPPROTO.IP,
-            .ip6 => std.posix.IPPROTO.IPV6,
+            .ip4 => constants.ip_protocol,
+            .ip6 => constants.ipv6_protocol,
         },
         .type = switch (family) {
-            .ip4 => std.posix.IP.TOS,
-            .ip6 => std.posix.IPV6.TCLASS,
+            .ip4 => @intCast(constants.ip_tos),
+            .ip6 => @intCast(constants.ipv6_tclass),
         },
     };
     @memcpy(control[0..@sizeOf(Header)], std.mem.asBytes(&header));
-    const value: c_int = @intFromEnum(codepoint);
-    @memcpy(control[data_offset..][0..data_length], std.mem.asBytes(&value));
+    if (byte_payload) {
+        control[data_offset] = @intFromEnum(codepoint);
+    } else {
+        const value: c_int = @intFromEnum(codepoint);
+        @memcpy(control[data_offset..][0..data_length], std.mem.asBytes(&value));
+    }
     return control[0..alignForward(data_offset + data_length)];
 }
 
@@ -78,8 +100,8 @@ pub fn decode(control: []const u8) ?Codepoint {
         const length: usize = @intCast(header.len);
         const data_offset = alignForward(@sizeOf(Header));
         if (length < data_offset or length > control.len - offset) return null;
-        const is_ip4 = header.level == std.posix.IPPROTO.IP and header.type == std.posix.IP.TOS;
-        const is_ip6 = header.level == std.posix.IPPROTO.IPV6 and header.type == std.posix.IPV6.TCLASS;
+        const is_ip4 = header.level == constants.ip_protocol and isIpv4Type(header.type);
+        const is_ip6 = header.level == constants.ipv6_protocol and header.type == constants.ipv6_tclass;
         if (is_ip4 or is_ip6) {
             const data = control[offset + data_offset .. offset + length];
             if (data.len == 0) return null;
@@ -91,6 +113,10 @@ pub fn decode(control: []const u8) ?Codepoint {
         offset += next;
     }
     return null;
+}
+
+fn isIpv4Type(value: c_int) bool {
+    return value == constants.ip_tos or value == constants.ip_recvtos;
 }
 
 fn readHeader(bytes: []const u8) ?std.c.cmsghdr {
@@ -117,4 +143,20 @@ test "ECN ancillary parser rejects truncated metadata" {
     var storage: ControlBuffer = undefined;
     const encoded = encode(&storage, .ip4, .ect1);
     try std.testing.expectEqual(@as(?Codepoint, null), decode(encoded[0..@sizeOf(std.c.cmsghdr)]));
+}
+
+test "ECN ancillary parser accepts IPv4 receive cmsg type" {
+    if (!ancillary_supported or @TypeOf(std.c.cmsghdr) == void) return error.SkipZigTest;
+    var storage: ControlBuffer = undefined;
+    const encoded = encode(&storage, .ip4, .ce);
+    var header = readHeader(encoded).?;
+    header.type = @intCast(constants.ip_recvtos);
+    @memcpy(storage[0..@sizeOf(std.c.cmsghdr)], std.mem.asBytes(&header));
+    try std.testing.expectEqual(Codepoint.ce, decode(encoded).?);
+}
+
+comptime {
+    if (@TypeOf(std.c.cmsghdr) != void and
+        control_bytes < std.mem.alignForward(usize, @sizeOf(std.c.cmsghdr) + @sizeOf(c_int), @sizeOf(usize)))
+        @compileError("ECN control buffer cannot hold one integer cmsg");
 }
