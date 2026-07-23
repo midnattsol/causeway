@@ -224,4 +224,24 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_http3_compliance_tests.step);
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_smoke_tests.step);
+
+    const check_step = b.step("check", "Compile examples and test artifacts without running them");
+    check_step.dependOn(&http1_example.step);
+    check_step.dependOn(&http2_example.step);
+    check_step.dependOn(&http3_example.step);
+    check_step.dependOn(&unit_tests.step);
+    check_step.dependOn(&smoke_tests.step);
+    check_step.dependOn(&http2_compliance_tests.step);
+    check_step.dependOn(&http3_compliance_tests.step);
+    check_step.dependOn(&integration_tests.step);
+    check_step.dependOn(&http2_benchmark.step);
+    check_step.dependOn(&http3_benchmark.step);
+
+    const ci_step = b.step("ci", "Run deterministic tests and finite fuzz seed suites");
+    ci_step.dependOn(test_step);
+    ci_step.dependOn(check_step);
+    ci_step.dependOn(&run_http1_fuzz_tests.step);
+    ci_step.dependOn(&run_http2_fuzz_tests.step);
+    ci_step.dependOn(&run_http3_fuzz_tests.step);
+    ci_step.dependOn(&run_quic_fuzz_tests.step);
 }

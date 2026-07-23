@@ -57,9 +57,11 @@ zig build quic-fuzz
 zig build --fuzz=100K quic-fuzz
 zig build http3-bench -Doptimize=ReleaseFast
 zig build test
+zig build check
+zig build ci
 ```
 
-The finite fuzz commands run their seed/smoke pass; `--fuzz=<limit>` starts a coverage-guided campaign with an iteration limit. Fuzz artifacts use LLVM because the configured Zig toolchain requires LLVM coverage instrumentation.
+`zig build test` compiles the examples and runs unit, compliance, integration, and public API smoke tests; it does not run fuzzers or benchmarks. `zig build check` compiles examples, tests, compliance matrices, and benchmarks without running them, which also supports cross-target validation. `zig build ci` combines `test`, `check`, and all four finite fuzz seed suites. The finite fuzz commands run their seed/smoke pass; `--fuzz=<limit>` starts a coverage-guided campaign with an iteration limit. Fuzz artifacts use LLVM because the configured Zig toolchain requires LLVM coverage instrumentation.
 
 `http2-compliance` and `http3-compliance` are self-contained repository matrices and are included by `zig build test`. `http3-fuzz` exercises HTTP/3/QPACK primitives and bounded complete-session scripts; `quic-fuzz` targets QUIC packets, transport state, recovery, streams, and TLS wire parsing. The benchmark targets report microbenchmark costs and should be run with an optimized build. These targets are regression tools, not claims of complete independent interoperability certification.
 

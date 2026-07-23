@@ -1,0 +1,68 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ZIG_VERSION: 0.17.0-dev.1413+addc3c3b8
+
+jobs:
+  fuzz:
+    name: ${{ matrix.step }} 100K
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        step:
+          - http1-fuzz
+          - http2-fuzz
+          - http3-fuzz
+          - quic-fuzz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: nightly-fuzz-${{ matrix.step }}
+      - run: timeout 30m zig build --fuzz=100K ${{ matrix.step }} -j1
+
+  cross-build:
+    name: ReleaseSafe ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-macos
+          - x86_64-freebsd
+          - x86_64-openbsd
+          - x86_64-netbsd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: cross-${{ matrix.target }}
+      - run: zig build check -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe -j1 --summary all
+
+  macos-native:
+    name: Native macOS ReleaseSafe
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build test -Doptimize=ReleaseSafe -j1 --summary all
