@@ -124,12 +124,39 @@ pub fn EndpointWithFeatures(
         pub const capacity_value = capacity;
         pub const configured_features = features;
         pub const transcript_bytes = connection_limits.tls_transcript_bytes;
+        pub const retry_attempt_capacity = capacity * 2;
         pub const new_token_replay_capacity = capacity * 2;
         pub const early_data_replay_capacity = capacity * 2;
 
         const PendingStateless = struct {
             address: net.IpAddress = undefined,
             length: usize = 0,
+            retry_attempt: ?usize = null,
+        };
+
+        const RetryAttempt = struct {
+            occupied: bool = false,
+            peer: net.IpAddress = undefined,
+            original_destination_id: [header.maximum_connection_id_length]u8 = undefined,
+            original_destination_id_len: u8 = 0,
+            source_id: [header.maximum_connection_id_length]u8 = undefined,
+            source_id_len: u8 = 0,
+            token: [retry_token.maximum_token_length]u8 = undefined,
+            token_len: u16 = 0,
+            random_bits: u8 = 0,
+            expires_at: u64 = 0,
+
+            fn originalDestinationId(self: *const RetryAttempt) []const u8 {
+                return self.original_destination_id[0..self.original_destination_id_len];
+            }
+
+            fn sourceId(self: *const RetryAttempt) []const u8 {
+                return self.source_id[0..self.source_id_len];
+            }
+
+            fn tokenBytes(self: *const RetryAttempt) []const u8 {
+                return self.token[0..self.token_len];
+            }
         };
 
         const ReplayEntry = struct {
@@ -172,6 +199,8 @@ pub fn EndpointWithFeatures(
         send_storage: [batch_size][connection_limits.max_datagram_size]u8 = undefined,
         pending_stateless: [batch_size]PendingStateless = @splat(.{}),
         pending_stateless_count: usize = 0,
+        retry_attempts: [retry_attempt_capacity]RetryAttempt = @splat(.{}),
+        retry_attempt_cursor: usize = 0,
         replay_cache: [capacity * 2]ReplayEntry = @splat(.{}),
         replay_cursor: usize = 0,
         new_token_replay_cache: [new_token_replay_capacity]NewTokenReplayEntry = @splat(.{}),
@@ -603,33 +632,68 @@ pub fn EndpointWithFeatures(
 
         fn queueRetry(self: *Self, io: Io, message: net.IncomingMessage, invariant: header.Header, now: u64) void {
             if (self.pending_stateless_count == batch_size) return;
+            const attempt_index = self.retryAttempt(io, message.from, invariant.destination_id, now) orelse return;
+            for (self.pending_stateless[0..self.pending_stateless_count]) |pending| {
+                if (pending.retry_attempt == attempt_index and net.IpAddress.eql(&pending.address, &message.from)) return;
+            }
+            const attempt = &self.retry_attempts[attempt_index];
+            const index = self.pending_stateless_count;
+            const packet = retry.write(&self.send_storage[index], .{
+                .destination_id = invariant.source_id,
+                .source_id = attempt.sourceId(),
+                .original_destination_id = invariant.destination_id,
+                .token = attempt.tokenBytes(),
+                .random_bits = attempt.random_bits,
+            }) catch return;
+            // Retry is never permitted to violate the anti-amplification budget.
+            if (packet.len > message.data.len *| 3) return;
+            self.pending_stateless[index] = .{ .address = message.from, .length = packet.len, .retry_attempt = attempt_index };
+            self.pending_stateless_count += 1;
+        }
+
+        fn retryAttempt(self: *Self, io: Io, peer: net.IpAddress, original_destination_id: []const u8, now: u64) ?usize {
+            var available: ?usize = null;
+            for (&self.retry_attempts, 0..) |*attempt, index| {
+                if (attempt.occupied and attempt.expires_at < now) attempt.occupied = false;
+                if (!attempt.occupied) {
+                    if (available == null) available = index;
+                    continue;
+                }
+                if (net.IpAddress.eql(&attempt.peer, &peer) and
+                    std.mem.eql(u8, attempt.originalDestinationId(), original_destination_id)) return index;
+            }
+
+            const selected = available orelse self.retry_attempt_cursor;
             var entropy: [retry_token.nonce_length + header.maximum_connection_id_length + 1]u8 = undefined;
             self.fillEntropy(io, &entropy);
             const cid_length: usize = self.policy.connection_id_length;
-            const retry_source_id = entropy[retry_token.nonce_length..][0..cid_length];
+            const source_id = entropy[retry_token.nonce_length..][0..cid_length];
             var token_storage: [retry_token.maximum_token_length]u8 = undefined;
             const token = retry_token.seal(
                 &token_storage,
                 self.policy.retry_token_secret.?,
                 entropy[0..retry_token.nonce_length].*,
-                message.from,
+                peer,
                 now,
                 header.version_1,
-                invariant.destination_id,
-                retry_source_id,
-            ) catch return;
-            const index = self.pending_stateless_count;
-            const packet = retry.write(&self.send_storage[index], .{
-                .destination_id = invariant.source_id,
-                .source_id = retry_source_id,
-                .original_destination_id = invariant.destination_id,
-                .token = token,
+                original_destination_id,
+                source_id,
+            ) catch return null;
+            const attempt = &self.retry_attempts[selected];
+            attempt.* = .{
+                .occupied = true,
+                .peer = peer,
+                .original_destination_id_len = @intCast(original_destination_id.len),
+                .source_id_len = @intCast(source_id.len),
+                .token_len = @intCast(token.len),
                 .random_bits = entropy[entropy.len - 1],
-            }) catch return;
-            // Retry is never permitted to violate the anti-amplification budget.
-            if (packet.len > message.data.len *| 3) return;
-            self.pending_stateless[index] = .{ .address = message.from, .length = packet.len };
-            self.pending_stateless_count += 1;
+                .expires_at = now +| self.policy.retry_token_lifetime,
+            };
+            @memcpy(attempt.original_destination_id[0..original_destination_id.len], original_destination_id);
+            @memcpy(attempt.source_id[0..source_id.len], source_id);
+            @memcpy(attempt.token[0..token.len], token);
+            self.retry_attempt_cursor = (selected + 1) % self.retry_attempts.len;
+            return selected;
         }
 
         fn queueStatelessReset(self: *Self, io: Io, message: net.IncomingMessage, destination_id: []const u8, now: u64) void {
@@ -1068,10 +1132,17 @@ test "Retry admission allocates only after valid token and restores transport pa
         .payload = "\x01",
         .minimum_datagram_size = 1200,
     });
-    var first_messages = [_]net.IncomingMessage{incoming(peer, first.packet)};
+    var first_messages = [_]net.IncomingMessage{ incoming(peer, first.packet), incoming(peer, first.packet) };
     endpoint.processBatch(std.testing.io, &first_messages, 10);
     try std.testing.expectEqual(@as(usize, 0), endpoint.activeCount());
     try std.testing.expectEqual(@as(usize, 1), endpoint.pending_stateless_count);
+
+    var first_retry_storage: [1200]u8 = undefined;
+    const first_retry_length = endpoint.pending_stateless[0].length;
+    @memcpy(first_retry_storage[0..first_retry_length], endpoint.send_storage[0][0..first_retry_length]);
+    endpoint.processBatch(std.testing.io, first_messages[0..1], 11);
+    try std.testing.expectEqual(@as(usize, 1), endpoint.pending_stateless_count);
+    try std.testing.expectEqualSlices(u8, first_retry_storage[0..first_retry_length], endpoint.send_storage[0][0..endpoint.pending_stateless[0].length]);
 
     const retry_packet = endpoint.send_storage[0][0..endpoint.pending_stateless[0].length];
     var retry_scratch: [256]u8 = undefined;
