@@ -12,6 +12,7 @@
         "tests",
         "examples",
         "docs",
+        "LICENSE",
         "README.md",
         "IDEA.md",
     },

@@ -114,3 +114,7 @@ The HTTP package is split by responsibility:
 - `src/quic/`: the UDP/QUIC transport used by HTTP/3.
 
 See [`docs/http-streaming.md`](docs/http-streaming.md) for request/response body streaming, [`docs/http-files.md`](docs/http-files.md) for file transfer and cache semantics, [`docs/http-protocol.md`](docs/http-protocol.md) for HTTP/1.x behavior, [`docs/http2.md`](docs/http2.md) for HTTP/2, and [`docs/http3.md`](docs/http3.md) for HTTP/3/QUIC architecture, limits, security, and validation.
+
+## License
+
+Causeway is licensed under the [Apache License 2.0](LICENSE).
