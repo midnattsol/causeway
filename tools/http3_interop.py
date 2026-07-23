@@ -24,13 +24,18 @@ from aioquic.h3.events import (
     WebTransportStreamDataReceived,
 )
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.events import ConnectionTerminated, HandshakeCompleted, StreamDataReceived
+from aioquic.quic.events import ConnectionTerminated, HandshakeCompleted, StreamDataReceived, StreamReset
 
 
 @dataclass
 class Response:
     headers: list[tuple[bytes, bytes]] = field(default_factory=list)
     body: bytearray = field(default_factory=bytearray)
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise AssertionError(message)
 
 
 class Draft16H3Connection(H3Connection):
@@ -62,6 +67,7 @@ class Http3Client(QuicConnectionProtocol):
         self.waiters: dict[int, asyncio.Future[Response]] = {}
         self.push_promises: dict[int, PushPromiseReceived] = {}
         self.pushes: dict[int, Response] = {}
+        self.finished_pushes: set[int] = set()
         self.push_waiter = asyncio.get_running_loop().create_future()
         self.header_waiters: dict[int, asyncio.Future[list[tuple[bytes, bytes]]]] = {}
         self.webtransport_waiter = None
@@ -93,6 +99,14 @@ class Http3Client(QuicConnectionProtocol):
         push_id = await asyncio.wait_for(self.push_waiter, timeout=10)
         return self.push_promises[push_id], self.pushes[push_id]
 
+    def complete_push(self, push_id: int) -> None:
+        if (
+            push_id in self.push_promises
+            and push_id in self.finished_pushes
+            and not self.push_waiter.done()
+        ):
+            self.push_waiter.set_result(push_id)
+
     async def webtransport_echo(self, authority: str) -> bytes:
         if self.http is None:
             self.http = Draft16H3Connection(self._quic)
@@ -113,7 +127,7 @@ class Http3Client(QuicConnectionProtocol):
         )
         self.transmit()
         headers = await asyncio.wait_for(headers_waiter, timeout=10)
-        assert dict(headers)[b":status"] == b"200"
+        require(dict(headers).get(b":status") == b"200", "WebTransport CONNECT failed")
 
         stream_id = self.http.create_webtransport_stream(session_id, is_unidirectional=False)
         self.webtransport_stream_id = stream_id
@@ -140,10 +154,24 @@ class Http3Client(QuicConnectionProtocol):
             if self.webtransport_waiter is not None and not self.webtransport_waiter.done():
                 self.webtransport_waiter.set_exception(error)
             if not self.push_waiter.done():
-                if self.push_promises:
-                    self.push_waiter.set_exception(error)
-                else:
-                    self.push_waiter.cancel()
+                self.push_waiter.set_exception(error)
+
+        elif isinstance(event, StreamReset):
+            error = RuntimeError(
+                f"stream reset: stream={event.stream_id} code={event.error_code}"
+            )
+            waiter = self.waiters.get(event.stream_id)
+            if waiter is not None and not waiter.done():
+                waiter.set_exception(error)
+            header_waiter = self.header_waiters.get(event.stream_id)
+            if header_waiter is not None and not header_waiter.done():
+                header_waiter.set_exception(error)
+            if (
+                event.stream_id == self.webtransport_stream_id
+                and self.webtransport_waiter is not None
+                and not self.webtransport_waiter.done()
+            ):
+                self.webtransport_waiter.set_exception(error)
 
         if isinstance(event, StreamDataReceived) and event.stream_id == self.webtransport_stream_id:
             self.webtransport_data.extend(event.data)
@@ -157,6 +185,7 @@ class Http3Client(QuicConnectionProtocol):
             if isinstance(http_event, PushPromiseReceived):
                 self.push_promises[http_event.push_id] = http_event
                 self.pushes.setdefault(http_event.push_id, Response())
+                self.complete_push(http_event.push_id)
                 continue
             if isinstance(http_event, WebTransportStreamDataReceived):
                 self.webtransport_data.extend(http_event.data)
@@ -185,8 +214,8 @@ class Http3Client(QuicConnectionProtocol):
             if not http_event.stream_ended:
                 continue
             if http_event.push_id is not None:
-                if not self.push_waiter.done():
-                    self.push_waiter.set_result(http_event.push_id)
+                self.finished_pushes.add(http_event.push_id)
+                self.complete_push(http_event.push_id)
             else:
                 waiter = self.waiters.get(http_event.stream_id)
                 if waiter is not None and not waiter.done():
@@ -207,7 +236,7 @@ def configuration(ticket=None, token: bytes = b"") -> QuicConfiguration:
 
 
 async def wait_for_value(values: list, name: str):
-    for _ in range(100):
+    for _ in range(1000):
         if values:
             return values[-1]
         await asyncio.sleep(0.01)
@@ -230,14 +259,14 @@ async def run(host: str, port: int) -> None:
         response = await protocol.get(authority, "/")
         handshake = await protocol.handshake
         promise, pushed = await protocol.first_push()
-        assert not handshake.session_resumed and not handshake.early_data_accepted
-        assert protocol._quic._retry_count == 1
-        assert b"hello from Causeway" in response.body
-        assert dict(promise.headers)[b":path"] == b"/assets/app.css"
-        assert b"font-family" in pushed.body
+        require(not handshake.session_resumed and not handshake.early_data_accepted, "first handshake unexpectedly resumed")
+        require(protocol._quic._retry_count == 1, "first handshake did not use Retry")
+        require(b"hello from Causeway" in response.body, "unexpected root response")
+        require(dict(promise.headers).get(b":path") == b"/assets/app.css", "unexpected push path")
+        require(b"font-family" in pushed.body, "unexpected pushed response")
         ticket = await wait_for_value(tickets, "session ticket")
         token = await wait_for_value(tokens, "NEW_TOKEN")
-        assert ticket.max_early_data_size is not None
+        require(ticket.max_early_data_size is not None, "ticket does not permit early data")
 
     resumed_tickets = []
     resumed_tokens = []
@@ -253,10 +282,10 @@ async def run(host: str, port: int) -> None:
     ) as protocol:
         response = await protocol.get(authority, "/early")
         handshake = await protocol.handshake
-        assert handshake.session_resumed, "second handshake did not resume"
-        assert not handshake.early_data_accepted, "1-RTT control connection unexpectedly sent early data"
-        assert protocol._quic._retry_count == 0
-        assert response.body == b"hello from 1-RTT\n"
+        require(handshake.session_resumed, "second handshake did not resume")
+        require(not handshake.early_data_accepted, "1-RTT control connection unexpectedly sent early data")
+        require(protocol._quic._retry_count == 0, "resumed handshake unexpectedly used Retry")
+        require(response.body == b"hello from 1-RTT\n", "unexpected resumed response")
         early_ticket = await wait_for_value(resumed_tickets, "resumed session ticket")
         early_token = resumed_tokens[-1] if resumed_tokens else token
 
@@ -269,8 +298,8 @@ async def run(host: str, port: int) -> None:
     ) as protocol:
         response = await protocol.get(authority, "/early")
         handshake = await protocol.handshake
-        assert handshake.session_resumed and handshake.early_data_accepted
-        assert response.body == b"hello from 0-RTT\n"
+        require(handshake.session_resumed and handshake.early_data_accepted, "early data was not accepted")
+        require(response.body == b"hello from 0-RTT\n", "unexpected early response")
 
     async with connect(
         host,
@@ -281,8 +310,8 @@ async def run(host: str, port: int) -> None:
     ) as protocol:
         response = await protocol.get(authority, "/early")
         handshake = await protocol.handshake
-        assert handshake.session_resumed and not handshake.early_data_accepted
-        assert response.body == b"hello from 1-RTT\n"
+        require(handshake.session_resumed and not handshake.early_data_accepted, "replayed early data was not rejected")
+        require(response.body == b"hello from 1-RTT\n", "unexpected replay fallback response")
 
     async with connect(
         host,
@@ -291,8 +320,8 @@ async def run(host: str, port: int) -> None:
         create_protocol=Http3Client,
     ) as protocol:
         echoed = await protocol.webtransport_echo(authority)
-        assert protocol._quic._retry_count == 0
-        assert echoed == b"pong"
+        require(protocol._quic._retry_count == 0, "token-authenticated handshake unexpectedly used Retry")
+        require(echoed == b"pong", "unexpected WebTransport echo")
 
     print(
         "HTTP/3 interop: Retry, NEW_TOKEN, push, resumption, 0-RTT, "

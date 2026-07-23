@@ -10,7 +10,7 @@ import time
 
 from aioquic.asyncio.client import connect
 
-from http3_interop import Http3Client, configuration, wait_for_value
+from http3_interop import Http3Client, configuration, require, wait_for_value
 
 
 def report(name: str, samples: list[int]) -> None:
@@ -39,7 +39,7 @@ async def exchange(host, port, config, *, early=False, collect_ticket=False):
         response = await protocol.get(authority, "/early")
         handshake = await protocol.handshake
         elapsed = time.perf_counter_ns() - started
-        assert response.body in (b"hello from 0-RTT\n", b"hello from 1-RTT\n")
+        require(response.body in (b"hello from 0-RTT\n", b"hello from 1-RTT\n"), "unexpected benchmark response")
         ticket = await wait_for_value(tickets, "benchmark session ticket") if collect_ticket else None
         token = tokens[-1] if tokens else config.token
         return elapsed, handshake, ticket, token
@@ -49,7 +49,7 @@ async def run(host: str, port: int, iterations: int, concurrency: int) -> None:
     full_samples = []
     for _ in range(iterations):
         elapsed, handshake, _, _ = await exchange(host, port, configuration())
-        assert not handshake.session_resumed
+        require(not handshake.session_resumed, "full handshake unexpectedly resumed")
         full_samples.append(elapsed)
 
     _, _, seed_ticket, seed_token = await exchange(
@@ -66,7 +66,7 @@ async def run(host: str, port: int, iterations: int, concurrency: int) -> None:
             configuration(resumption_ticket, seed_token),
             collect_ticket=True,
         )
-        assert handshake.session_resumed and not handshake.early_data_accepted
+        require(handshake.session_resumed and not handshake.early_data_accepted, "resumption benchmark did not use 1-RTT")
         resumed_samples.append(elapsed)
         early_tickets.append(ticket)
 
@@ -75,7 +75,7 @@ async def run(host: str, port: int, iterations: int, concurrency: int) -> None:
         elapsed, handshake, _, seed_token = await exchange(
             host, port, configuration(ticket, seed_token), early=True
         )
-        assert handshake.session_resumed and handshake.early_data_accepted
+        require(handshake.session_resumed and handshake.early_data_accepted, "early-data benchmark did not use 0-RTT")
         zero_rtt_samples.append(elapsed)
 
     authority = f"{host}:{port}"
@@ -90,7 +90,7 @@ async def run(host: str, port: int, iterations: int, concurrency: int) -> None:
             *(protocol.get(authority, "/early") for _ in range(concurrency))
         )
         concurrent_elapsed = time.perf_counter_ns() - started
-        assert all(response.body == b"hello from 1-RTT\n" for response in responses)
+        require(all(response.body == b"hello from 1-RTT\n" for response in responses), "unexpected concurrent response")
 
     report("full handshake + Retry + GET", full_samples)
     report("resumed handshake + GET", resumed_samples)
