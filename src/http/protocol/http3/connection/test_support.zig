@@ -29,6 +29,7 @@ pub const FakeConnection = struct {
         input: [2048]u8 = undefined,
         input_len: usize = 0,
         input_total: u64 = 0,
+        received_early_data: bool = false,
         reset_final_size: ?u64 = null,
         reset_received_reliable_size: ?u64 = null,
         output: [4096]u8 = undefined,
@@ -119,6 +120,11 @@ pub const FakeConnection = struct {
         return self.session_resumed;
     }
 
+    pub fn resumptionApplicationState(self: *const @This()) ?[]const u8 {
+        if (!self.session_resumed or self.ticket_state_len == 0) return null;
+        return self.ticket_state[0..self.ticket_state_len];
+    }
+
     pub fn issueSessionTicket(self: *@This(), application_state: []const u8) anyerror!void {
         self.ticket_issue_calls += 1;
         if (!self.handshake_complete) return error.HandshakeNotComplete;
@@ -181,6 +187,10 @@ pub const FakeConnection = struct {
     pub fn streamReadable(self: *@This(), id: StreamId) ![]const u8 {
         const slot = self.find(id) orelse return error.StreamNotFound;
         return slot.input[0..slot.input_len];
+    }
+
+    pub fn streamReceivedEarlyData(self: *@This(), id: StreamId) !bool {
+        return (self.find(id) orelse return error.StreamNotFound).received_early_data;
     }
 
     pub fn consumeStream(self: *@This(), id: StreamId, amount: usize) !void {
@@ -264,6 +274,12 @@ pub const FakeConnection = struct {
             try self.push(.{ .readable = id });
         }
         if (finish) try self.push(.{ .receive_finished = id });
+    }
+
+    pub fn feedEarly(self: *@This(), id: StreamId, bytes: []const u8, finish: bool) !void {
+        const slot = try self.ensure(id);
+        slot.received_early_data = true;
+        return self.feed(id, bytes, finish);
     }
 
     pub fn acknowledgeFinish(self: *@This(), id: StreamId) !void {

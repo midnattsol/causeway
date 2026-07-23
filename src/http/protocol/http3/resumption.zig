@@ -1,19 +1,19 @@
 //! Versioned, allocation-free HTTP/3 resumption application snapshots.
 //!
-//! Snapshots record only known peer SETTINGS for telemetry/application use in a
-//! stateless TLS ticket. They are never restored into a live HTTP/3 connection:
-//! every connection waits for and applies its own fresh SETTINGS and QPACK state.
+//! Snapshots record known server SETTINGS in a stateless TLS ticket. They are
+//! compatibility gates only: every connection uses fresh SETTINGS and QPACK state.
 
 const std = @import("std");
 const settings = @import("settings.zig");
 const varint = @import("../../../quic/varint.zig");
 
 pub const version: u8 = 1;
-pub const maximum_encoded_length = 1 + 2 + 8 * 8;
+pub const maximum_encoded_length = 1 + 2 + 9 * 8;
 
 pub const Snapshot = struct {
     qpack_max_table_capacity: ?u64 = null,
     qpack_blocked_streams: ?u64 = null,
+    max_field_section_size: ?u64 = null,
     enable_connect_protocol: ?u64 = null,
     h3_datagram: ?u64 = null,
     wt_enabled: ?u64 = null,
@@ -28,6 +28,7 @@ pub const Snapshot = struct {
         while (try iterator.next()) |entry| switch (entry.id) {
             .qpack_max_table_capacity => result.qpack_max_table_capacity = entry.value,
             .qpack_blocked_streams => result.qpack_blocked_streams = entry.value,
+            .max_field_section_size => result.max_field_section_size = entry.value,
             .enable_connect_protocol => {
                 if (entry.value > 1) return error.InvalidConnectProtocolSetting;
                 result.enable_connect_protocol = entry.value;
@@ -84,11 +85,33 @@ pub const Snapshot = struct {
         if (result.wt_enabled) |value| _ = try settings.webTransportEnabled(value);
         return result;
     }
+
+    pub fn permitsRemembered(self: Snapshot, remembered: Snapshot) bool {
+        return permitsLimit(self.qpack_max_table_capacity, remembered.qpack_max_table_capacity) and
+            permitsLimit(self.qpack_blocked_streams, remembered.qpack_blocked_streams) and
+            permitsLimit(self.max_field_section_size, remembered.max_field_section_size) and
+            permitsBoolean(self.enable_connect_protocol, remembered.enable_connect_protocol) and
+            permitsBoolean(self.h3_datagram, remembered.h3_datagram) and
+            permitsBoolean(self.wt_enabled, remembered.wt_enabled) and
+            permitsLimit(self.wt_initial_max_streams_uni, remembered.wt_initial_max_streams_uni) and
+            permitsLimit(self.wt_initial_max_streams_bidi, remembered.wt_initial_max_streams_bidi) and
+            permitsLimit(self.wt_initial_max_data, remembered.wt_initial_max_data);
+    }
 };
+
+fn permitsLimit(current: ?u64, remembered: ?u64) bool {
+    const required = remembered orelse return true;
+    return (current orelse 0) >= required;
+}
+
+fn permitsBoolean(current: ?u64, remembered: ?u64) bool {
+    return remembered != 1 or current == 1;
+}
 
 const field_names = .{
     "qpack_max_table_capacity",
     "qpack_blocked_streams",
+    "max_field_section_size",
     "enable_connect_protocol",
     "h3_datagram",
     "wt_enabled",
@@ -114,8 +137,24 @@ test "HTTP/3 application snapshot round trips known SETTINGS only" {
 test "HTTP/3 application snapshot is versioned strict and bounded" {
     try std.testing.expectError(error.Truncated, Snapshot.decode("\x01\x00"));
     try std.testing.expectError(error.UnsupportedSnapshotVersion, Snapshot.decode("\x02\x00\x00"));
-    try std.testing.expectError(error.UnknownSnapshotFields, Snapshot.decode("\x01\x01\x00"));
+    try std.testing.expectError(error.UnknownSnapshotFields, Snapshot.decode("\x01\x02\x00"));
     try std.testing.expectError(error.TrailingSnapshotBytes, Snapshot.decode("\x01\x00\x00x"));
     var tiny: [2]u8 = undefined;
     try std.testing.expectError(error.BufferTooSmall, (Snapshot{}).encode(&tiny));
+}
+
+test "HTTP/3 remembered settings reject reduced server policy" {
+    const remembered: Snapshot = .{
+        .qpack_max_table_capacity = 64,
+        .qpack_blocked_streams = 2,
+        .max_field_section_size = 1024,
+        .enable_connect_protocol = 1,
+    };
+    try std.testing.expect(remembered.permitsRemembered(remembered));
+    var reduced = remembered;
+    reduced.max_field_section_size = 1023;
+    try std.testing.expect(!reduced.permitsRemembered(remembered));
+    reduced = remembered;
+    reduced.enable_connect_protocol = 0;
+    try std.testing.expect(!reduced.permitsRemembered(remembered));
 }

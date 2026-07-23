@@ -206,6 +206,88 @@ test "HTTP/3 session incrementally serves a request over the generic QUIC API" {
     try std.testing.expect(transport.close_code == null);
 }
 
+test "HTTP/3 early requests require explicit replay-safe dispatch" {
+    const AppState = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        saw_early: std.atomic.Value(bool) = .init(false),
+    };
+    const UnsafeDispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            _ = context.execution.state.calls.fetchAdd(1, .acq_rel);
+            return .{ .status = .ok };
+        }
+    };
+    const SafeDispatcher = struct {
+        pub fn replaySafe(method: @import("../../../message/request.zig").Method, path: []const u8) bool {
+            return method.is(.GET) and std.mem.eql(u8, path, "/stream");
+        }
+
+        pub fn dispatch(context: anytype) !Response {
+            _ = context.execution.state.calls.fetchAdd(1, .acq_rel);
+            context.execution.state.saw_early.store(context.early_data == .accepted, .release);
+            return .{ .status = .ok, .body = .{ .bytes = "accepted" } };
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    var request_bytes: [512]u8 = undefined;
+    const request_len = try encodeGetHead(&request_bytes);
+    const request_id = try stream_id.Id.fromParts(.client, .bidirectional, 0);
+
+    const remembered: @import("../resumption.zig").Snapshot = .{
+        .qpack_max_table_capacity = test_config.qpack_capacity,
+        .qpack_blocked_streams = test_config.qpack_decoder_blocked_streams,
+        .max_field_section_size = test_config.max_field_section_size,
+        .enable_connect_protocol = 1,
+    };
+    var unsafe_transport: FakeConnection = .{ .session_resumed = true };
+    const unsafe_snapshot = try remembered.encode(&unsafe_transport.ticket_state);
+    unsafe_transport.ticket_state_len = unsafe_snapshot.len;
+    var unsafe_state: AppState = .{};
+    var unsafe_session = Session(AppState, UnsafeDispatcher, FakeConnection, test_config).init(&unsafe_transport, std.testing.allocator, &unsafe_state, threaded.io());
+    defer unsafe_session.deinit();
+    try unsafe_session.activate();
+    try unsafe_transport.feedEarly(request_id, request_bytes[0..request_len], true);
+    for (0..10_000) |step| {
+        _ = try unsafe_session.poll(step + 1);
+        if (unsafe_transport.find(request_id).?.finished) break;
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 0), unsafe_state.calls.load(.acquire));
+    try std.testing.expect(unsafe_transport.find(request_id).?.finished);
+    var unsafe_parser = frame.Parser{ .bytes = unsafe_transport.output(request_id) };
+    const unsafe_headers = (try unsafe_parser.next()).?.payload.headers;
+    var header_cursor: usize = 0;
+    _ = try qpack.field.parsePrefix(unsafe_headers, &header_cursor, test_config.qpack_capacity, 0);
+    var name_scratch: [32]u8 = undefined;
+    var value_scratch: [32]u8 = undefined;
+    const status = (try qpack.field.parse(unsafe_headers, &header_cursor, &name_scratch, &value_scratch)).indexed;
+    try std.testing.expect(status.static_table);
+    try std.testing.expectEqualStrings("425", qpack.static.entries[status.index].value);
+
+    var safe_transport: FakeConnection = .{ .session_resumed = true };
+    const safe_snapshot = try remembered.encode(&safe_transport.ticket_state);
+    safe_transport.ticket_state_len = safe_snapshot.len;
+    var safe_state: AppState = .{};
+    var safe_session = Session(AppState, SafeDispatcher, FakeConnection, test_config).init(&safe_transport, std.testing.allocator, &safe_state, threaded.io());
+    defer safe_session.deinit();
+    try safe_session.activate();
+    try safe_transport.feedEarly(request_id, request_bytes[0..request_len], true);
+    for (0..10_000) |step| {
+        _ = try safe_session.poll(step + 1);
+        if (safe_transport.find(request_id).?.finished) break;
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), safe_state.calls.load(.acquire));
+    try std.testing.expect(safe_state.saw_early.load(.acquire));
+    var parser = frame.Parser{ .bytes = safe_transport.output(request_id) };
+    _ = (try parser.next()).?;
+    const data = (try parser.next()).?;
+    try std.testing.expectEqualStrings("accepted", data.payload.data);
+}
+
 test "HTTP/3 ticket waits for Finished and first valid SETTINGS then emits once" {
     const State = struct {};
     const Dispatcher = struct {
@@ -244,9 +326,11 @@ test "HTTP/3 ticket waits for Finished and first valid SETTINGS then emits once"
     try std.testing.expect(transport.ticket_issued);
     const issued_calls = transport.ticket_issue_calls;
     const snapshot = try @import("../resumption.zig").Snapshot.decode(transport.ticket_state[0..transport.ticket_state_len]);
-    try std.testing.expectEqual(@as(?u64, 37), snapshot.qpack_max_table_capacity);
+    try std.testing.expectEqual(@as(?u64, test_config.qpack_capacity), snapshot.qpack_max_table_capacity);
+    try std.testing.expectEqual(@as(?u64, test_config.qpack_decoder_blocked_streams), snapshot.qpack_blocked_streams);
+    try std.testing.expectEqual(@as(?u64, test_config.max_field_section_size), snapshot.max_field_section_size);
     try std.testing.expectEqual(@as(?u64, 1), snapshot.enable_connect_protocol);
-    try std.testing.expectEqual(@as(?u64, 0), snapshot.h3_datagram);
+    try std.testing.expectEqual(@as(?u64, null), snapshot.h3_datagram);
     _ = try session.poll(5);
     try std.testing.expectEqual(issued_calls, transport.ticket_issue_calls);
 }

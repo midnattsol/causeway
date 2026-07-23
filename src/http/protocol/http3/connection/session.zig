@@ -327,6 +327,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             consumed_credit: std.atomic.Value(usize) = .init(0),
             fin_observed: bool = false,
             receive_finished: bool = false,
+            received_early_data: bool = false,
             dispatched: bool = false,
             task_done: bool = false,
             abandoned_input: bool = false,
@@ -784,6 +785,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         peer_settings_received: bool = false,
         peer_settings_unblocked: bool = false,
         ticket_snapshot_pending: bool = false,
+        early_data_settings_compatible: bool = false,
         ticket_snapshot_storage: [h3_resumption.maximum_encoded_length]u8 = undefined,
         ticket_snapshot_length: usize = 0,
         ticket_issuance_status: TicketIssuanceStatus = .not_requested,
@@ -829,11 +831,14 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         push_request_names: [config.max_header_bytes]u8 = undefined,
 
         pub fn init(connection: *Connection, allocator: std.mem.Allocator, state_value: *State, io: Io) Self {
-            return .{ .connection = connection, .allocator = allocator, .state = state_value, .io = io };
+            var result: Self = .{ .connection = connection, .allocator = allocator, .state = state_value, .io = io };
+            result.early_data_settings_compatible = rememberedSettingsCompatible(connection);
+            return result;
         }
 
         pub fn initInPlace(self: *Self, connection: *Connection, allocator: std.mem.Allocator, state_value: *State, io: Io) void {
             self.* = .{ .connection = connection, .allocator = allocator, .state = state_value, .io = io };
+            self.early_data_settings_compatible = rememberedSettingsCompatible(connection);
             self.messages = .init(&self.message_storage);
             self.messages_initialized = true;
         }
@@ -1283,7 +1288,13 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 if (self.findRequest(id) != null) return;
                 if (self.shutting_down) return self.rejectId(id, .request_rejected);
                 const slot = self.freeRequest() orelse return self.rejectId(id, .request_rejected);
-                slot.* = .{ .owner = self, .occupied = true, .id = id, .datagrams = .init(self.io) };
+                slot.* = .{
+                    .owner = self,
+                    .occupied = true,
+                    .id = id,
+                    .received_early_data = try self.connection.streamReceivedEarlyData(id),
+                    .datagrams = .init(self.io),
+                };
                 self.highest_request_id = if (self.highest_request_id) |highest| @max(highest, id.value) else id.value;
             } else {
                 if (self.findUni(id) != null) return;
@@ -1306,6 +1317,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 return;
             }
             const slot = self.findRequest(id) orelse return error.UnknownRequestStream;
+            slot.received_early_data = slot.received_early_data or try self.connection.streamReceivedEarlyData(id);
             if (comptime config.enable_webtransport) {
                 const classification = try WtController.classifyBidirectional(self, slot);
                 if (classification == null or classification.?) return;
@@ -2190,23 +2202,35 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             const context = if (Locals) |_| Context{
                 .execution = .{ .state = self.state, .allocator = allocator, .io = self.io },
                 .request = slot.request.?,
+                .early_data = if (slot.received_early_data) .accepted else .none,
                 .locals = &locals,
                 .exchange = &exchange,
             } else Context{
                 .execution = .{ .state = self.state, .allocator = allocator, .io = self.io },
                 .request = slot.request.?,
+                .early_data = if (slot.received_early_data) .accepted else .none,
                 .exchange = &exchange,
             };
-            var response = Dispatcher.dispatch(&context) catch |err| switch (config.application_error_policy) {
-                .internal_server_error => Response{ .status = .internal_server_error },
-                .reset_stream => return err,
-            };
+            const reject_early = slot.received_early_data and
+                (!self.early_data_settings_compatible or slot.request.?.method.is(.CONNECT) or
+                    !(if (comptime @hasDecl(Dispatcher, "replaySafe"))
+                        Dispatcher.replaySafe(slot.request.?.method, slot.request.?.path)
+                    else
+                        false));
+            var response: Response = if (reject_early)
+                .{ .status = .too_early }
+            else
+                Dispatcher.dispatch(&context) catch |err| switch (config.application_error_policy) {
+                    .internal_server_error => Response{ .status = .internal_server_error },
+                    .reset_stream => return err,
+                };
             defer response.body.finalize();
             defer if (response.takeover) |*takeover| takeover.finalize();
             if (response.write_deadline == null) if (config.response_write_timeout) |timeout| {
                 response.write_deadline = .fromNow(self.io, .{ .raw = timeout, .clock = .awake });
             };
             exchange.beginFinal();
+            if (slot.received_early_data and response.takeover != null) return error.EarlyDataTakeoverForbidden;
             try validateTakeover(slot.request.?.method, response);
             if (slot.webtransport_candidate) {
                 if (response.status.class() == .success) {
@@ -2709,7 +2733,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         }
 
         fn applySettings(self: *Self, bytes: []const u8) anyerror!void {
-            const snapshot = try h3_resumption.Snapshot.capture(bytes);
+            _ = try h3_resumption.Snapshot.capture(bytes);
             var iterator = settings.iterator(bytes);
             while (try iterator.next()) |entry| switch (entry.id) {
                 .max_field_section_size => self.peer_max_field_section_size = entry.value,
@@ -2729,6 +2753,9 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 else => {},
             };
             self.peer_settings_received = true;
+            var local_storage: [128]u8 = undefined;
+            const local_settings = try localSettingsPayload(&local_storage);
+            const snapshot = try h3_resumption.Snapshot.capture(local_settings);
             const encoded = try snapshot.encode(&self.ticket_snapshot_storage);
             self.ticket_snapshot_length = encoded.len;
             self.ticket_snapshot_pending = true;
@@ -2863,28 +2890,42 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         fn writeSettings(self: *Self) !void {
             if (config.enable_webtransport and !webtransport_policy.localRequirementsMet(self.connection)) return error.WebTransportLocalRequirementsNotMet;
             var payload: [128]u8 = undefined;
+            const settings_payload = try localSettingsPayload(&payload);
+            var encoded: [128]u8 = undefined;
+            const length = try frame.encode(&encoded, .{ .frame_type = .settings, .payload = .{ .settings = settings_payload } });
+            try self.writeAll(self.local_control, encoded[0..length]);
+        }
+
+        fn localSettingsPayload(output: []u8) ![]const u8 {
             var cursor: usize = 0;
             const entries = [_]settings.Entry{
                 .{ .id = .qpack_max_table_capacity, .value = config.qpack_capacity },
                 .{ .id = .qpack_blocked_streams, .value = config.qpack_decoder_blocked_streams },
                 .{ .id = .max_field_section_size, .value = config.max_field_section_size },
             };
-            for (entries) |entry| cursor += try settings.encodeEntry(payload[cursor..], entry);
+            for (entries) |entry| cursor += try settings.encodeEntry(output[cursor..], entry);
             if (config.enable_extended_connect) {
-                cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .enable_connect_protocol, .value = 1 });
+                cursor += try settings.encodeEntry(output[cursor..], .{ .id = .enable_connect_protocol, .value = 1 });
             }
             if (config.enable_datagrams) {
-                cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .h3_datagram, .value = 1 });
+                cursor += try settings.encodeEntry(output[cursor..], .{ .id = .h3_datagram, .value = 1 });
             }
             if (config.enable_webtransport) {
-                cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .wt_enabled, .value = 1 });
-                cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .wt_initial_max_streams_uni, .value = config.webtransport_initial_max_streams_uni });
-                cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .wt_initial_max_streams_bidi, .value = config.webtransport_initial_max_streams_bidi });
-                cursor += try settings.encodeEntry(payload[cursor..], .{ .id = .wt_initial_max_data, .value = config.webtransport_initial_max_data });
+                cursor += try settings.encodeEntry(output[cursor..], .{ .id = .wt_enabled, .value = 1 });
+                cursor += try settings.encodeEntry(output[cursor..], .{ .id = .wt_initial_max_streams_uni, .value = config.webtransport_initial_max_streams_uni });
+                cursor += try settings.encodeEntry(output[cursor..], .{ .id = .wt_initial_max_streams_bidi, .value = config.webtransport_initial_max_streams_bidi });
+                cursor += try settings.encodeEntry(output[cursor..], .{ .id = .wt_initial_max_data, .value = config.webtransport_initial_max_data });
             }
-            var encoded: [128]u8 = undefined;
-            const length = try frame.encode(&encoded, .{ .frame_type = .settings, .payload = .{ .settings = payload[0..cursor] } });
-            try self.writeAll(self.local_control, encoded[0..length]);
+            return output[0..cursor];
+        }
+
+        fn rememberedSettingsCompatible(connection: *Connection) bool {
+            const bytes = connection.resumptionApplicationState() orelse return false;
+            const remembered = h3_resumption.Snapshot.decode(bytes) catch return false;
+            var local_storage: [128]u8 = undefined;
+            const local_settings = localSettingsPayload(&local_storage) catch return false;
+            const current = h3_resumption.Snapshot.capture(local_settings) catch return false;
+            return current.permitsRemembered(remembered);
         }
 
         fn writePrefix(self: *Self, id: StreamId, stream_type: stream.Type) !void {
