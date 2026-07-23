@@ -581,7 +581,6 @@ pub fn Connection(comptime limits: Limits) type {
 
         pub fn close(self: *Self, code: u64, frame_type: ?u64, reason: []const u8, now: u64) void {
             if (self.state == .closed or self.state == .draining) return;
-            self.clearKeyMaterial();
             self.setCloseInfo(code, frame_type, reason);
             self.state = .closing;
             self.close_started = now;
@@ -892,6 +891,10 @@ test "connection termination paths clear every packet-key copy" {
             .peer_close => connection.peerClose(CloseCode.internal_error, null, "peer", 1),
             .stateless_reset => connection.onStatelessReset(1),
         }
+        if (action == .close) {
+            try std.testing.expect(connection.application_send_keys != null);
+            connection.deinit();
+        }
         try expectAllConnectionKeysCleared(&connection);
         connection.deinit();
     }
@@ -920,6 +923,8 @@ test "BadFinished cleanup clears installed Handshake and Application keys" {
     try std.testing.expectError(error.BadFinished, connection.tls.receive(.handshake, &bad_finished, &.{}, &.{}));
     connection.close(CloseCode.crypto_error_base + tls_server.alertForError(error.BadFinished), 0x06, "TLS handshake failure", 1);
     try std.testing.expectEqual(CloseCode.crypto_error_base + @intFromEnum(tls_server.AlertDescription.decrypt_error), connection.close_info.?.code);
+    try std.testing.expect(connection.handshake_local != null);
+    connection.deinit();
     try expectAllConnectionKeysCleared(&connection);
 }
 
@@ -1146,6 +1151,8 @@ test "connection CRYPTO receiver withholds out-of-order TLS message" {
 }
 
 test "illegal Initial frame enters transport closing" {
+    const frame = @import("../frame/root.zig");
+    const packet_header = @import("../packet/header.zig");
     const packet_writer = @import("../packet/writer.zig");
     const limits: Limits = .{ .crypto_receive_bytes = 64, .crypto_send_bytes = 64, .tls_output_bytes = 128 };
     var storage: Storage(limits) = .{};
@@ -1165,6 +1172,15 @@ test "illegal Initial frame enters transport closing" {
     try std.testing.expectError(error.IllegalFrame, connection.receiveDatagram(packet.packet, 1));
     try std.testing.expectEqual(State.closing, connection.state);
     try std.testing.expectEqual(CloseCode.protocol_violation, connection.close_info.?.code);
+
+    var close_storage: [1200]u8 = undefined;
+    const close_packet = try connection.buildDatagram(&close_storage, 2);
+    const close_header = try packet_header.parse(close_packet, "client".len);
+    const server_keys: protection.Keys = .{ .aes_128_gcm = crypto_initial.derive("original").server.keys };
+    const clear = try server_keys.unprotect(close_packet, close_header.packet_number_offset.?, null);
+    var frames: frame.Iterator = .{ .payload = clear.payload };
+    const close = (try frames.next()).?.connection_close;
+    try std.testing.expectEqual(CloseCode.protocol_violation, close.error_code);
 }
 
 test "unauthenticated malformed CID mismatch and tampering are silently discarded" {
