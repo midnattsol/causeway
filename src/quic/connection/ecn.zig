@@ -47,6 +47,7 @@ pub fn State(comptime path_capacity: usize) type {
 
         paths: [path_capacity][3]PathSpace = @splat(@splat(.{})),
         sent_ect0: [3]u64 = @splat(0),
+        received: [3]Counters = @splat(.{}),
         peer: [3]Counters = @splat(.{}),
         largest_acknowledged: [3]?u64 = @splat(null),
         enabled: bool = false,
@@ -100,21 +101,16 @@ pub fn State(comptime path_capacity: usize) type {
 
         pub fn onPacketReceived(self: *Self, path_id: u8, space: packet_space.Id, codepoint: Codepoint) void {
             if (!self.enabled or path_id >= path_capacity) return;
-            self.paths[path_id][@intFromEnum(space)].received.add(codepoint);
+            const index = @intFromEnum(space);
+            self.received[index].add(codepoint);
+            self.paths[path_id][index].received.add(codepoint);
         }
 
-        /// ACK_ECN counters are cumulative per packet-number space. Per-path
-        /// receive counters are summed because an ACK can cover old paths.
+        /// ACK_ECN counters are cumulative per packet-number space, including
+        /// packets received before a path slot is recycled.
         pub fn receivedCounts(self: *const Self, space: packet_space.Id) ?frame.EcnCounts {
             if (!self.enabled) return null;
-            var total: Counters = .{};
-            for (self.paths) |path| {
-                const value = path[@intFromEnum(space)].received;
-                total.ect0 +|= value.ect0;
-                total.ect1 +|= value.ect1;
-                total.ce +|= value.ce;
-            }
-            return total.frameCounts();
+            return self.received[@intFromEnum(space)].frameCounts();
         }
 
         /// Validates cumulative ACK_ECN counters globally while attributing the
@@ -289,4 +285,7 @@ test "ECN receive counters are retained per path and summed for ACK_ECN" {
     try std.testing.expectEqual(frame.EcnCounts{ .ect0 = 1, .ect1 = 0, .ce = 1 }, state.receivedCounts(.application).?);
     try std.testing.expectEqual(@as(u64, 1), state.paths[0][2].received.ect0);
     try std.testing.expectEqual(@as(u64, 1), state.paths[1][2].received.ce);
+    state.resetPath(0);
+    try std.testing.expectEqual(frame.EcnCounts{ .ect0 = 1, .ect1 = 0, .ce = 1 }, state.receivedCounts(.application).?);
+    try std.testing.expectEqual(@as(u64, 0), state.paths[0][2].received.ect0);
 }
