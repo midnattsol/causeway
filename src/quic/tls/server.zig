@@ -294,6 +294,7 @@ pub const Server = struct {
         if (frame.message_type != .client_hello) return error.UnexpectedHandshakeType;
         const hello = try frame.clientHello();
         var negotiated = try negotiation.negotiateBase(hello, &negotiation.default_cipher_suites);
+        const selected_alpn_offset: usize = @intCast(@intFromPtr(negotiated.application_protocol.ptr) - @intFromPtr(message.ptr));
         var psk_selection = try self.selectPsk(hello, negotiated.application_protocol);
         defer if (psk_selection.selected) |*selected| selected.contents.deinit();
         const selected_psk = psk_selection.selected != null;
@@ -360,7 +361,7 @@ pub const Server = struct {
         defer std.crypto.secureZero(u8, std.mem.asBytes(&app));
 
         self.selected_suite = negotiated.cipher_suite;
-        self.selected_alpn = negotiated.application_protocol;
+        self.selected_alpn = self.transcript[selected_alpn_offset..][0..negotiated.application_protocol.len];
         self.peer_parameters = self.transcript[peer_parameters_offset..][0..negotiated.transport_parameters.len];
         self.handshake_keys_value = keys;
         self.application_secrets_value = .{
@@ -866,6 +867,7 @@ test "deterministic complete QUIC TLS server handshake" {
     try std.testing.expectEqual(ResumptionFallbackReason.not_offered, server.resumptionFallbackReason().?);
     try std.testing.expect(server.takeResumptionMasterSecret() == null);
     @memset(&client_hello_buffer, 0);
+    try std.testing.expectEqualStrings("h3", server.negotiatedAlpn().?);
     try std.testing.expectEqualStrings("cp", server.peerTransportParameters().?);
     try std.testing.expect(server.handshakeKeys() != null);
     var application_secrets = server.takeApplicationTrafficSecrets().?;
