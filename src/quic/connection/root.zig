@@ -230,6 +230,8 @@ pub fn Connection(comptime limits: Limits) type {
                 return error.MissingTicketIssuanceMaterial;
             if (options.tls.ticket_service == null and options.tls.ticket_issuance != null)
                 return error.UnexpectedTicketIssuanceMaterial;
+            if (options.tls.early_data != null and options.tls.ticket_service == null)
+                return error.EarlyDataRequiresTicketService;
             if (options.original_destination_id.len > 20 or initial_destination_id.len > 20 or
                 options.client_source_id.len > 20 or options.server_connection_id.len > 20)
                 return error.InvalidConnectionIdLength;

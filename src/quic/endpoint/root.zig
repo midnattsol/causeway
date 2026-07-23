@@ -31,12 +31,20 @@ pub const Entropy = struct {
 
 pub const RetryMode = enum { disabled, always };
 pub const NewTokenUsage = enum { reusable, bounded_replay_filter };
+pub const EarlyDataMode = enum { disabled, bounded_replay_filter };
 
 pub const ReplayFilterStats = struct {
     consumed: u64 = 0,
     replays: u64 = 0,
     expired_recycled: u64 = 0,
     capacity_evictions: u64 = 0,
+};
+
+pub const EarlyDataReplayStats = struct {
+    accepted: u64 = 0,
+    replays: u64 = 0,
+    expired_recycled: u64 = 0,
+    capacity_rejections: u64 = 0,
 };
 
 pub const Policy = struct {
@@ -47,6 +55,10 @@ pub const Policy = struct {
     ticket_service: ?tls_server.TicketService = null,
     resumption_context: []const u8 = "",
     ticket_lifetime: u32 = 24 * 60 * 60,
+    /// 0-RTT is disabled by default. The bounded filter rejects on capacity;
+    /// it never evicts a live ticket and is local to this endpoint instance.
+    early_data: EarlyDataMode = .disabled,
+    early_data_max_age_skew_ms: u32 = 10_000,
     transport_parameters: transport_parameters.Values = .{},
     /// Length of server-issued connection IDs (1...20).
     connection_id_length: u8 = 16,
@@ -107,6 +119,7 @@ pub fn EndpointWithFeatures(
         pub const configured_features = features;
         pub const transcript_bytes = connection_limits.tls_transcript_bytes;
         pub const new_token_replay_capacity = capacity * 2;
+        pub const early_data_replay_capacity = capacity * 2;
 
         const PendingStateless = struct {
             address: net.IpAddress = undefined,
@@ -120,6 +133,12 @@ pub fn EndpointWithFeatures(
         };
 
         const NewTokenReplayEntry = struct {
+            occupied: bool = false,
+            fingerprint: [16]u8 = undefined,
+            expires_at: u64 = 0,
+        };
+
+        const EarlyDataReplayEntry = struct {
             occupied: bool = false,
             fingerprint: [16]u8 = undefined,
             expires_at: u64 = 0,
@@ -152,6 +171,8 @@ pub fn EndpointWithFeatures(
         new_token_replay_cache: [new_token_replay_capacity]NewTokenReplayEntry = @splat(.{}),
         new_token_replay_cursor: usize = 0,
         new_token_replay_stats: ReplayFilterStats = .{},
+        early_data_replay_cache: [early_data_replay_capacity]EarlyDataReplayEntry = @splat(.{}),
+        early_data_replay_stats: EarlyDataReplayStats = .{},
         reset_window_started_at: u64 = 0,
         reset_window_count: u16 = 0,
         shutting_down: bool = false,
@@ -163,6 +184,8 @@ pub fn EndpointWithFeatures(
             if (policy.resumption_context.len > session_ticket.maximum_context_length) return error.ContextTooLong;
             if (policy.ticket_lifetime == 0 or policy.ticket_lifetime > session_ticket.maximum_lifetime)
                 return error.InvalidTicketLifetime;
+            if (policy.early_data != .disabled and policy.ticket_service == null)
+                return error.EarlyDataRequiresTicketService;
             if (policy.transport_parameters.active_connection_id_limit > connection_limits.active_connection_ids)
                 return error.ActiveConnectionIdLimitExceedsCapacity;
             if (policy.path_validation_attempts == 0 or policy.path_validation_interval == 0)
@@ -381,6 +404,13 @@ pub fn EndpointWithFeatures(
                             .age_add = std.mem.readInt(u32, entropy_bytes[100..104], .big),
                             .nonce = entropy_bytes[104..112].*,
                         } else null,
+                        .early_data = if (self.policy.early_data == .bounded_replay_filter) .{
+                            .replay_service = .{
+                                .context = self,
+                                .consume_fn = consumeEarlyDataReplay,
+                            },
+                            .max_age_skew_ms = self.policy.early_data_max_age_skew_ms,
+                        } else null,
                     },
                     .now = now,
                     .ecn_enabled = features.ecn,
@@ -400,6 +430,39 @@ pub fn EndpointWithFeatures(
                     if (retry_contents != null) self.rememberToken(invariant.token, now);
                 }
             }
+        }
+
+        pub fn earlyDataReplayFilterStats(self: *const Self) EarlyDataReplayStats {
+            return self.early_data_replay_stats;
+        }
+
+        fn consumeEarlyDataReplay(context: *anyopaque, identity: []const u8, _: u64, expires_at: u64, now: u64) anyerror!bool {
+            const self: *Self = @ptrCast(@alignCast(context));
+            var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(identity, &digest, .{});
+            const fingerprint: [16]u8 = digest[0..16].*;
+            var available: ?*EarlyDataReplayEntry = null;
+            for (&self.early_data_replay_cache) |*entry| {
+                if (entry.occupied and entry.expires_at < now) {
+                    entry.occupied = false;
+                    self.early_data_replay_stats.expired_recycled += 1;
+                }
+                if (!entry.occupied) {
+                    if (available == null) available = entry;
+                    continue;
+                }
+                if (std.mem.eql(u8, &entry.fingerprint, &fingerprint)) {
+                    self.early_data_replay_stats.replays += 1;
+                    return false;
+                }
+            }
+            const entry = available orelse {
+                self.early_data_replay_stats.capacity_rejections += 1;
+                return false;
+            };
+            entry.* = .{ .occupied = true, .fingerprint = fingerprint, .expires_at = expires_at };
+            self.early_data_replay_stats.accepted += 1;
+            return true;
         }
 
         /// Advances timers, sends at most `batch_size` datagrams, and reaps closed slots.
@@ -756,6 +819,26 @@ pub fn EndpointWithFeatures(
             }
         }
     };
+}
+
+test "early data replay filter rejects duplicates and live-capacity eviction" {
+    const limits: connection.Limits = .{};
+    const TestEndpoint = Endpoint(limits, 1, 1);
+    var endpoint: TestEndpoint = undefined;
+    endpoint.early_data_replay_cache = @splat(.{});
+    endpoint.early_data_replay_stats = .{};
+
+    try std.testing.expect(try TestEndpoint.consumeEarlyDataReplay(&endpoint, "ticket-a", 90, 110, 100));
+    try std.testing.expect(!try TestEndpoint.consumeEarlyDataReplay(&endpoint, "ticket-a", 90, 110, 100));
+    try std.testing.expect(try TestEndpoint.consumeEarlyDataReplay(&endpoint, "ticket-b", 90, 120, 100));
+    try std.testing.expect(!try TestEndpoint.consumeEarlyDataReplay(&endpoint, "ticket-c", 90, 130, 100));
+    try std.testing.expect(try TestEndpoint.consumeEarlyDataReplay(&endpoint, "ticket-c", 90, 130, 111));
+
+    const stats = endpoint.earlyDataReplayFilterStats();
+    try std.testing.expectEqual(@as(u64, 3), stats.accepted);
+    try std.testing.expectEqual(@as(u64, 1), stats.replays);
+    try std.testing.expectEqual(@as(u64, 1), stats.capacity_rejections);
+    try std.testing.expectEqual(@as(u64, 1), stats.expired_recycled);
 }
 
 fn testCredentials() tls_server.ServerCredentials {
