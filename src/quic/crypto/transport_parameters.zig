@@ -222,17 +222,56 @@ pub fn encode(buffer: []u8, values: Values, sender: Role) ![]u8 {
     return buffer[0..writer.cursor];
 }
 
+/// Encodes only server policy that a client may rely on when constructing
+/// 0-RTT packets. Connection-specific IDs, reset tokens, and preferred address
+/// state are deliberately omitted.
+pub fn encodeRemembered(buffer: []u8, values: Values) ![]u8 {
+    try validateCommon(values);
+    var writer = ParameterWriter{ .buffer = buffer };
+    if (values.max_udp_payload_size != 65_527) try writer.integer(.max_udp_payload_size, values.max_udp_payload_size);
+    if (values.initial_max_data != 0) try writer.integer(.initial_max_data, values.initial_max_data);
+    if (values.initial_max_stream_data_bidi_local != 0) try writer.integer(.initial_max_stream_data_bidi_local, values.initial_max_stream_data_bidi_local);
+    if (values.initial_max_stream_data_bidi_remote != 0) try writer.integer(.initial_max_stream_data_bidi_remote, values.initial_max_stream_data_bidi_remote);
+    if (values.initial_max_stream_data_uni != 0) try writer.integer(.initial_max_stream_data_uni, values.initial_max_stream_data_uni);
+    if (values.initial_max_streams_bidi != 0) try writer.integer(.initial_max_streams_bidi, values.initial_max_streams_bidi);
+    if (values.initial_max_streams_uni != 0) try writer.integer(.initial_max_streams_uni, values.initial_max_streams_uni);
+    if (values.active_connection_id_limit != 2) try writer.integer(.active_connection_id_limit, values.active_connection_id_limit);
+    if (values.reset_stream_at) try writer.parameter(.reset_stream_at, &.{});
+    if (values.max_datagram_frame_size != 0) try writer.integer(.max_datagram_frame_size, values.max_datagram_frame_size);
+    return buffer[0..writer.cursor];
+}
+
+/// Parses the canonical, connection-independent server policy stored in a ticket.
+pub fn parseRemembered(bytes: []const u8) !Values {
+    const values = try parse(bytes, .client);
+    var canonical: [512]u8 = undefined;
+    const encoded = try encodeRemembered(&canonical, values);
+    if (!std.mem.eql(u8, encoded, bytes)) return error.NonCanonicalRememberedParameters;
+    return values;
+}
+
+/// Rejects 0-RTT when current server policy is less permissive than the policy
+/// authenticated in the ticket.
+pub fn permitsRememberedEarlyData(current: Values, remembered: Values) bool {
+    return current.max_udp_payload_size >= remembered.max_udp_payload_size and
+        current.initial_max_data >= remembered.initial_max_data and
+        current.initial_max_stream_data_bidi_local >= remembered.initial_max_stream_data_bidi_local and
+        current.initial_max_stream_data_bidi_remote >= remembered.initial_max_stream_data_bidi_remote and
+        current.initial_max_stream_data_uni >= remembered.initial_max_stream_data_uni and
+        current.initial_max_streams_bidi >= remembered.initial_max_streams_bidi and
+        current.initial_max_streams_uni >= remembered.initial_max_streams_uni and
+        current.active_connection_id_limit >= remembered.active_connection_id_limit and
+        (!remembered.reset_stream_at or current.reset_stream_at) and
+        current.max_datagram_frame_size >= remembered.max_datagram_frame_size;
+}
+
 fn validateForEncoding(values: Values, sender: Role) !void {
     if (values.initial_source_connection_id == null) return error.MissingInitialSourceConnectionId;
     if (sender == .server and values.original_destination_connection_id == null) return error.MissingOriginalDestinationConnectionId;
     if (sender == .client and (values.original_destination_connection_id != null or
         values.stateless_reset_token != null or values.preferred_address != null or
         values.retry_source_connection_id != null)) return error.ServerOnlyTransportParameter;
-    if (values.max_udp_payload_size < 1200 or values.max_udp_payload_size > varint.maximum) return error.InvalidMaxUdpPayloadSize;
-    if (values.initial_max_streams_bidi > 1 << 60 or values.initial_max_streams_uni > 1 << 60) return error.StreamLimitError;
-    if (values.ack_delay_exponent > 20) return error.InvalidAckDelayExponent;
-    if (values.max_ack_delay >= 1 << 14) return error.InvalidMaxAckDelay;
-    if (values.active_connection_id_limit < 2) return error.InvalidActiveConnectionIdLimit;
+    try validateCommon(values);
     inline for (.{
         values.original_destination_connection_id,
         values.initial_source_connection_id,
@@ -243,6 +282,14 @@ fn validateForEncoding(values: Values, sender: Role) !void {
     if (values.preferred_address) |preferred| {
         if (preferred.connection_id.len == 0 or preferred.connection_id.len > 20) return error.InvalidConnectionIdLength;
     }
+}
+
+fn validateCommon(values: Values) !void {
+    if (values.max_udp_payload_size < 1200 or values.max_udp_payload_size > varint.maximum) return error.InvalidMaxUdpPayloadSize;
+    if (values.initial_max_streams_bidi > 1 << 60 or values.initial_max_streams_uni > 1 << 60) return error.StreamLimitError;
+    if (values.ack_delay_exponent > 20) return error.InvalidAckDelayExponent;
+    if (values.max_ack_delay >= 1 << 14) return error.InvalidMaxAckDelay;
+    if (values.active_connection_id_limit < 2) return error.InvalidActiveConnectionIdLimit;
 }
 
 const ParameterWriter = struct {
@@ -299,6 +346,37 @@ test "QUIC transport parameters apply defaults extensions and bounds" {
     try std.testing.expectEqual(@as(u64, 100), values.initial_max_data);
     try std.testing.expectEqual(@as(u8, 20), values.ack_delay_exponent);
     try std.testing.expect(values.disable_active_migration);
+}
+
+test "remembered transport parameters omit connection identity and enforce limits" {
+    const token: [16]u8 = @splat(0x33);
+    const previous: Values = .{
+        .original_destination_connection_id = "odcid",
+        .stateless_reset_token = &token,
+        .initial_source_connection_id = "scid",
+        .initial_max_data = 100,
+        .initial_max_stream_data_bidi_remote = 50,
+        .initial_max_streams_bidi = 4,
+        .reset_stream_at = true,
+        .max_datagram_frame_size = 1200,
+    };
+    var storage: [512]u8 = undefined;
+    const encoded = try encodeRemembered(&storage, previous);
+    const remembered = try parseRemembered(encoded);
+    try std.testing.expect(remembered.original_destination_connection_id == null);
+    try std.testing.expect(remembered.stateless_reset_token == null);
+    try std.testing.expect(remembered.initial_source_connection_id == null);
+    try std.testing.expect(permitsRememberedEarlyData(previous, remembered));
+
+    var reduced = previous;
+    reduced.initial_max_data = 99;
+    try std.testing.expect(!permitsRememberedEarlyData(reduced, remembered));
+    reduced = previous;
+    reduced.reset_stream_at = false;
+    try std.testing.expect(!permitsRememberedEarlyData(reduced, remembered));
+    reduced = previous;
+    reduced.max_datagram_frame_size = 1199;
+    try std.testing.expect(!permitsRememberedEarlyData(reduced, remembered));
 }
 
 test "transport parameter encoding is canonical and preserves explicit zero-length IDs" {
