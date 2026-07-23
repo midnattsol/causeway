@@ -20,6 +20,8 @@ pub const PushUnavailable = enum {
     server_disabled,
     /// The final response has already started, after which pushes are forbidden.
     final_response_started,
+    /// The parent request is replayable early data, where push is forbidden.
+    early_data,
     /// The peer has not enabled push.
     peer_disabled,
     /// The peer-advertised Push ID allowance has been consumed.

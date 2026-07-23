@@ -11,6 +11,12 @@ const push_module = @import("message/push.zig");
 const PushOutcome = push_module.PushOutcome;
 const PushRequest = push_module.PushRequest;
 
+/// Indicates whether a handler is executing from accepted replayable early data.
+pub const EarlyData = enum {
+    none,
+    accepted,
+};
+
 /// Returns the HTTP handler-context type for an application's `State`.
 ///
 /// The context borrows all underlying resources and request data. It does not
@@ -25,6 +31,9 @@ pub fn Context(comptime State: type) type {
 
         /// Path parameters extracted by routing, or an empty view.
         params: Params = .empty,
+
+        /// Transport provenance for replay-aware application behavior.
+        early_data: EarlyData = .none,
 
         /// Request-scoped protocol control supplied by a live connection.
         exchange: ?*Exchange = null,
@@ -41,6 +50,7 @@ pub fn Context(comptime State: type) type {
         /// caller retains ownership, and on `.unavailable` the adapter does not
         /// touch `response`.
         pub fn push(self: *const @This(), request: PushRequest, response: Response) !PushOutcome {
+            if (self.early_data == .accepted) return .{ .unavailable = .early_data };
             const exchange = self.exchange orelse return .{ .unavailable = .unsupported_protocol };
             return exchange.push(request, response);
         }
@@ -58,6 +68,7 @@ pub fn ContextWithLocals(comptime State: type, comptime Locals: type) type {
         execution: CoreContext(State),
         request: Request,
         params: Params = .empty,
+        early_data: EarlyData = .none,
         locals: *Locals,
         exchange: ?*Exchange = null,
 
@@ -73,6 +84,7 @@ pub fn ContextWithLocals(comptime State: type, comptime Locals: type) type {
         /// caller retains ownership, and on `.unavailable` the adapter does not
         /// touch `response`.
         pub fn push(self: *const @This(), request: PushRequest, response: Response) !PushOutcome {
+            if (self.early_data == .accepted) return .{ .unavailable = .early_data };
             const exchange = self.exchange orelse return .{ .unavailable = .unsupported_protocol };
             return exchange.push(request, response);
         }
@@ -108,8 +120,29 @@ test "HTTP Context carries execution state and request data" {
     try std.testing.expectEqualStrings("/users", context.request.path);
     try std.testing.expectEqualStrings("active=true", context.request.query.?);
     try std.testing.expect(context.params.isEmpty());
+    try std.testing.expectEqual(EarlyData.none, context.early_data);
     const push_outcome = try context.push(.{ .path = "/assets/app.css" }, .{ .status = .ok });
     try std.testing.expectEqual(push_module.PushUnavailable.unsupported_protocol, push_outcome.unavailable);
+}
+
+test "HTTP Context refuses server push from accepted early data" {
+    const AppState = struct {};
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var state = AppState{};
+    var body_state = RequestBody.State.initAbsent();
+    const context = Context(AppState){
+        .execution = .{
+            .state = &state,
+            .allocator = std.testing.allocator,
+            .io = threaded.io(),
+        },
+        .request = try Request.init("/", .GET, .empty, RequestBody.init(&body_state)),
+        .early_data = .accepted,
+    };
+
+    const outcome = try context.push(.{ .path = "/asset.css" }, .{ .status = .ok });
+    try std.testing.expectEqual(push_module.PushUnavailable.early_data, outcome.unavailable);
 }
 
 test "HTTP ContextWithLocals shares mutable request-scoped data across copies" {
