@@ -246,6 +246,7 @@ pub fn Controller(comptime capacity: usize) type {
                 self.stats.no_sealing_key += 1;
                 return error.NoSealingKey;
             };
+            if (value.lifetime > slot.key.accept_until - now) return error.TicketOutlivesKey;
             if (slot.emissions >= maximum_issuance_per_key) {
                 self.stats.emission_limit += 1;
                 return error.KeyEmissionLimit;
@@ -667,6 +668,25 @@ test "rotation expiry and rollback are fail closed without key reactivation" {
     now.seconds = 240;
     try std.testing.expectError(error.ClockRollback, controller.seal(&new_storage, &value));
     try std.testing.expectEqual(@as(u64, 1), controller.stats.clock_rollbacks);
+}
+
+test "ticket lifetime cannot exceed sealing key acceptance window" {
+    var now: TestClock = .{ .seconds = 100 };
+    var random: TestEntropy = .{};
+    var controller = try Controller(1).init(now.clock(), random.entropy(), "service");
+    defer controller.deinit();
+    const key: Key = .{ .id = 9, .secret = @splat(0x39), .seal_from = 0, .seal_until = 120, .accept_until = 150 };
+    try controller.addKey(&key);
+    var value = samplePlaintext();
+    var storage: [maximum_ticket_length]u8 = undefined;
+
+    value.lifetime = 51;
+    try std.testing.expectError(error.TicketOutlivesKey, controller.seal(&storage, &value));
+    value.lifetime = 50;
+    const ticket = try controller.seal(&storage, &value);
+    now.seconds = 150;
+    var opened = try controller.open(ticket);
+    opened.deinit();
 }
 
 test "zero lifetime entropy key reuse and limits fail closed" {
