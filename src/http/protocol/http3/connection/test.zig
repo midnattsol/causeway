@@ -159,8 +159,10 @@ test "HTTP/3 session incrementally serves a request over the generic QUIC API" {
     defer session.deinit();
     try session.activate();
 
-    const local_control = try stream_id.Id.fromParts(.server, .unidirectional, 0);
-    const local_output = transport.output(local_control);
+    try std.testing.expectEqual(try stream_id.Id.fromParts(.server, .unidirectional, 0), session.local_encoder);
+    try std.testing.expectEqual(try stream_id.Id.fromParts(.server, .unidirectional, 1), session.local_decoder);
+    try std.testing.expectEqual(try stream_id.Id.fromParts(.server, .unidirectional, 2), session.local_control);
+    const local_output = transport.output(session.local_control);
     const prefix = try stream.parsePrefix(local_output);
     try std.testing.expectEqual(stream.Type.control, prefix.stream_type);
     const local_settings = (try frame.parse(local_output[prefix.consumed..])).frame.payload.settings;

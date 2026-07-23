@@ -887,12 +887,12 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
             self.encoder = try qpack.Encoder.init(&self.encoder_bytes, &self.encoder_entries, &self.encoder_sections, config.qpack_capacity, config.qpack_encoder_blocked_streams);
             self.decoder = try qpack.Decoder.init(&self.decoder_bytes, &self.decoder_entries, &self.decoder_blocked, config.qpack_capacity, config.qpack_decoder_blocked_streams);
-            self.local_control = try self.connection.openUnidirectionalStream();
             self.local_encoder = try self.connection.openUnidirectionalStream();
             self.local_decoder = try self.connection.openUnidirectionalStream();
-            try self.writePrefix(self.local_control, .control);
+            self.local_control = try self.connection.openUnidirectionalStream();
             try self.writePrefix(self.local_encoder, .qpack_encoder);
             try self.writePrefix(self.local_decoder, .qpack_decoder);
+            try self.writePrefix(self.local_control, .control);
             try self.writeSettings();
             self.active = true;
         }
