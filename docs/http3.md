@@ -195,6 +195,7 @@ const http3_config: causeway.http.http3.Config = .{
     .enable_webtransport = true,
     .max_webtransport_sessions = 1,
     .max_pending_webtransport_streams = 16,
+    .max_webtransport_retained_bytes_per_session = 16 * 1024 * 1024,
 };
 
 const quic_limits: causeway.quic.connection.Limits = .{
@@ -254,6 +255,8 @@ The optional `WT-Available-Protocols` request field and `WT-Protocol` response f
 
 `acceptUnidirectionalStream` and `acceptBidirectionalStream` return pending peer streams; `openUnidirectionalStream` and `openBidirectionalStream` create server streams. A unidirectional stream exposes only its usable direction (`reader` or `writer`); a bidirectional stream exposes both. `finish` closes the send direction, `reset(code)` resets it, and `stop(code)` requests that the peer stop its send direction. `resetInfo` and `stopInfo` recover a peer's 32-bit application code when the wire code lies in the draft-16 `WT_APPLICATION_ERROR` range; protocol errors are reported with `application_error = null`. Causeway maps all 32-bit application codes reversibly while skipping reserved HTTP/3 codepoints.
 
+`session.retainedMemory()` reports `{ bytes, limit }` for stream buffers, pipe state, and stable handles retained by the session arena. Retention is cumulative because recycled stream handles must remain safe to inspect for stale-generation errors until the takeover ends. A new peer stream is rejected, and a local open fails with `WebTransportStreamCapacity`, before allocation when it would exceed `max_webtransport_retained_bytes_per_session`.
+
 The stream header is the draft-16 marker (`0x54` for unidirectional streams, `0x41` for bidirectional streams) followed by the Session ID, which must be a client-initiated bidirectional CONNECT stream ID. Streams can arrive optimistically before the CONNECT is established. They are held only in the bounded pending-stream table and are associated after SETTINGS and session admission; stale sessions, failed requirements, excess buffering, or exhausted per-session quota are rejected with the corresponding draft-16 code instead of being buffered without limit.
 
 `session.datagrams` is always the WebTransport session's native HTTP Datagram channel and reports `.quic`. Datagrams are associated by Quarter Stream ID, copied through bounded queues, congestion-controlled and paced by QUIC, but not retransmitted. `send` rejects an oversized payload or a full outgoing queue; receive overflow and application-size excess drop the newest datagram and increment `dropped()`. There is no WebTransport DATAGRAM-capsule fallback.
@@ -272,6 +275,7 @@ All application-facing paths are bounded:
 
 - `max_webtransport_sessions` bounds admitted sessions and cannot exceed `max_requests`;
 - `max_pending_webtransport_streams` bounds all pending/active WebTransport stream slots and is divided into a per-session quota for isolation;
+- `max_webtransport_retained_bytes_per_session` bounds cumulative stream allocations retained until session closure, including body buffers, writer buffers, pipe state, and stable handles;
 - `webtransport_initial_max_streams_uni`, `webtransport_initial_max_streams_bidi`, `webtransport_initial_max_data`, and `max_webtransport_session_data` bound cumulative session usage;
 - request/response body-pipe sizes back WebTransport stream readers and writers, so unread input withholds QUIC and WebTransport credit and unwritten output applies backpressure;
 - `datagram_queue_capacity` and `datagram_max_payload` bound copied datagrams; `max_capsule_length` must be at least 1028 when WebTransport is enabled;
@@ -384,7 +388,7 @@ Timeout, peer reset, `STOP_SENDING`, connection close, and shutdown cancel block
 - control-message queue capacity;
 - response trailers;
 - HTTP Datagram queue capacity, application payload, and capsule length;
-- WebTransport sessions, pending/active streams, per-session stream quota, initial bilateral stream/data credit, cumulative session data, and close-message length;
+- WebTransport sessions, pending/active streams, per-session stream quota, retained stream memory, initial bilateral stream/data credit, cumulative session data, and close-message length;
 - QPACK table bytes, metadata entries, decoder/encoder blocked streams, outstanding request/promise/push sections, instruction buffering, and string scratch;
 - request/response deadlines and shutdown duration.
 

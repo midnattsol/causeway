@@ -2128,6 +2128,11 @@ test "WebTransport preserves reset and stop codes, accounts final size, and recy
         try Io.sleep(io, .fromMilliseconds(1), .awake);
         if (state.first_ready.load(.acquire)) break;
     }
+    var retained_after_one: usize = 0;
+    for (session.requests) |request_slot| if (request_slot.occupied and request_slot.id.value == connect.value) {
+        retained_after_one = request_slot.wt_retained_bytes.load(.acquire);
+    };
+    try std.testing.expect(retained_after_one > 0);
     const reset_code = wt.error_codes.toHttp(77);
     const stop_code = wt.error_codes.toHttp(88);
     try transport.peerResetAtFinalSize(first_id, reset_code, 3, 3);
@@ -2145,12 +2150,95 @@ test "WebTransport preserves reset and stop codes, accounts final size, and recy
         if (state.second_ready.load(.acquire)) break;
     }
     try std.testing.expect(state.second_ready.load(.acquire));
+    var retained_after_two: usize = 0;
+    for (session.requests) |request_slot| if (request_slot.occupied and request_slot.id.value == connect.value) {
+        retained_after_two = request_slot.wt_retained_bytes.load(.acquire);
+    };
+    try std.testing.expect(retained_after_two > retained_after_one);
     try std.testing.expectEqual(@as(?u64, null), transport.find(second_id).?.reset_reliable_size);
     try std.testing.expectEqual(@as(?u64, wt.error_codes.toHttp(9)), transport.find(second_id).?.reset_code);
 
     try transport.peerResetAtFinalSize(second_id, wt.error_codes.toHttp(1), 12, 3);
     _ = try session.poll(400);
     try std.testing.expectEqual(@as(?u64, wt.constants.wt_flow_control_error), transport.find(connect).?.reset_code);
+    state.release.store(true, .release);
+}
+
+test "WebTransport retained-byte exhaustion rejects before stream allocation" {
+    const config = comptime blk: {
+        var value = test_config;
+        value.enable_datagrams = true;
+        value.enable_webtransport = true;
+        value.datagram_max_payload = 64;
+        value.datagram_queue_capacity = 4;
+        value.max_capsule_length = 1200;
+        value.max_webtransport_retained_bytes_per_session = 1;
+        break :blk value;
+    };
+    const State = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        retained_bytes: std.atomic.Value(usize) = .init(0),
+        retained_limit: std.atomic.Value(usize) = .init(0),
+        local_open_rejected: std.atomic.Value(bool) = .init(false),
+        io: Io = undefined,
+    };
+    const Handler = struct {
+        state: *State,
+        pub fn run(self: *@This(), webtransport_session: *response_module.WebTransportSession) !void {
+            const memory = webtransport_session.retainedMemory();
+            self.state.retained_bytes.store(memory.bytes, .release);
+            self.state.retained_limit.store(memory.limit, .release);
+            if (webtransport_session.openUnidirectionalStream()) |_| {
+                return error.ExpectedWebTransportStreamCapacity;
+            } else |err| {
+                if (err != error.WebTransportStreamCapacity) return err;
+                self.state.local_open_rejected.store(true, .release);
+            }
+            self.state.started.store(true, .release);
+            while (!self.state.release.load(.acquire)) try Io.sleep(self.state.io, .fromMilliseconds(1), .awake);
+        }
+    };
+    const Dispatcher = struct {
+        pub fn dispatch(context: anytype) !Response {
+            return Response.tunnel(.ok, .empty, try response_module.Takeover.initWebTransport(
+                context.execution.allocator,
+                Handler{ .state = context.execution.state },
+            ));
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    const io = threaded.io();
+    var transport: FakeConnection = .{ .reset_stream_at_supported = true };
+    transport.datagrams = .{ .negotiated = true, .local_max_frame_size = 128, .peer_max_frame_size = 128 };
+    var state: State = .{ .io = io };
+    var session = Session(State, Dispatcher, FakeConnection, config).init(&transport, std.testing.allocator, &state, io);
+    defer session.deinit();
+    var settings_bytes: [128]u8 = undefined;
+    try transport.feed(try support.clientUniId(0), settings_bytes[0..try encodeWebTransportSettings(&settings_bytes)], false);
+    var request_bytes: [512]u8 = undefined;
+    const connect = try support.requestId(0);
+    try transport.feed(connect, request_bytes[0..try encodeWebTransportConnect(&request_bytes)], false);
+    for (0..100) |step| {
+        _ = try session.poll(step + 1);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        if (state.started.load(.acquire)) break;
+    }
+    try std.testing.expect(state.started.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), state.retained_bytes.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), state.retained_limit.load(.acquire));
+    try std.testing.expect(state.local_open_rejected.load(.acquire));
+
+    const stream_id_value = try support.requestId(1);
+    try transport.feed(stream_id_value, "\x40\x41\x00", false);
+    _ = try session.poll(200);
+    try std.testing.expectEqual(@as(?u64, wt.constants.wt_buffered_stream_rejected), transport.find(stream_id_value).?.reset_code);
+    for (session.requests) |request_slot| if (request_slot.occupied and request_slot.id.value == connect.value) {
+        try std.testing.expectEqual(@as(usize, 0), request_slot.wt_retained_bytes.load(.acquire));
+    };
     state.release.store(true, .release);
 }
 

@@ -251,6 +251,11 @@ pub const WebTransportClose = struct {
     message: []const u8,
 };
 
+pub const WebTransportRetainedMemory = struct {
+    bytes: usize,
+    limit: usize,
+};
+
 /// Type-erased server-side draft-ietf-webtrans-http3-16 session. Every method
 /// crosses a bounded controller queue or a bounded stream/datagram pipe. This is
 /// borrowed for the duration of the WebTransport takeover callback only; it and
@@ -269,6 +274,7 @@ pub const WebTransportSession = struct {
     exporter_fn: *const fn (*anyopaque, []const u8, []const u8, []u8) anyerror!void,
     close_info_fn: *const fn (*anyopaque) ?WebTransportClose,
     draining_fn: *const fn (*anyopaque) bool,
+    retained_memory_fn: *const fn (*anyopaque) WebTransportRetainedMemory,
 
     pub fn acceptUnidirectionalStream(self: *WebTransportSession) !?WebTransportStream {
         return self.accept_uni_fn(self.context);
@@ -304,6 +310,11 @@ pub const WebTransportSession = struct {
 
     pub fn isDraining(self: *WebTransportSession) bool {
         return self.draining_fn(self.context);
+    }
+
+    /// Arena memory retained by stream handles until this session closes.
+    pub fn retainedMemory(self: *WebTransportSession) WebTransportRetainedMemory {
+        return self.retained_memory_fn(self.context);
     }
 };
 

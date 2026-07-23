@@ -372,6 +372,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             wt_flow_control_enabled: bool = false,
             wt_send_flow: wt_flow.Send = undefined,
             wt_receive_flow: wt_flow.Receive = undefined,
+            wt_retained_bytes: std.atomic.Value(usize) = .init(0),
             wt_accept_uni_storage: [config.max_pending_webtransport_streams]WebTransportStream = undefined,
             wt_accept_bidi_storage: [config.max_pending_webtransport_streams]WebTransportStream = undefined,
             wt_accept_uni: Io.Queue(WebTransportStream) = undefined,
@@ -537,6 +538,14 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             fn webTransportDraining(raw: *anyopaque) bool {
                 const self: *RequestSlot = @ptrCast(@alignCast(raw));
                 return self.webtransport_draining.load(.acquire);
+            }
+
+            fn webTransportRetainedMemory(raw: *anyopaque) response_module.WebTransportRetainedMemory {
+                const self: *RequestSlot = @ptrCast(@alignCast(raw));
+                return .{
+                    .bytes = self.wt_retained_bytes.load(.acquire),
+                    .limit = config.max_webtransport_retained_bytes_per_session,
+                };
             }
 
             fn notifyCompletion(self: *RequestSlot, result: response_module.CompletionResult) void {
@@ -727,6 +736,9 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
             pub fn webTransportDraining(raw: *anyopaque) bool {
                 return RequestSlot.webTransportDraining(raw);
+            }
+            pub fn webTransportRetainedMemory(raw: *anyopaque) response_module.WebTransportRetainedMemory {
+                return RequestSlot.webTransportRetainedMemory(raw);
             }
 
             pub fn failStream(slot: *WebTransportStreamSlot, err: anyerror) void {

@@ -25,6 +25,19 @@ pub fn Controller(comptime config: anytype, comptime Ops: type) type {
         const effective_webtransport_session_limit = @max(1, @min(config.max_webtransport_sessions, config.max_pending_webtransport_streams));
         const webtransport_stream_quota = @max(1, config.max_pending_webtransport_streams / effective_webtransport_session_limit);
 
+        fn retainedStreamBytes(direction: wt_flow.Direction, incoming: bool) usize {
+            const can_receive = incoming or direction == .bidirectional;
+            const can_send = !incoming or direction == .bidirectional;
+            return @sizeOf(WebTransportStreamHandle) +
+                (if (can_receive) config.request_body_buffer_size + @sizeOf(inbound_body.Pipe) else 0) +
+                (if (can_send) config.response_body_buffer_size + config.response_writer_buffer_size + @sizeOf(outbound_body.Pipe) else 0);
+        }
+
+        fn canRetainStream(session_slot: *const RequestSlot, direction: wt_flow.Direction, incoming: bool) bool {
+            const available = config.max_webtransport_retained_bytes_per_session -| session_slot.wt_retained_bytes.load(.monotonic);
+            return retainedStreamBytes(direction, incoming) <= available;
+        }
+
         pub fn classifyBidirectional(self: *Self, request_slot: *RequestSlot) !?bool {
             if (request_slot.frame_len != 0 or request_slot.wire != null or request_slot.head != null) return false;
             const bytes = try self.connection.streamReadable(request_slot.id);
@@ -148,6 +161,11 @@ pub fn Controller(comptime config: anytype, comptime Ops: type) type {
             const allocator = slot.session.arena.?.allocator();
             const can_receive = incoming or slot.direction == .bidirectional;
             const can_send = !incoming or slot.direction == .bidirectional;
+            const retained_bytes = retainedStreamBytes(slot.direction, incoming);
+            const retained = slot.session.wt_retained_bytes.load(.monotonic);
+            if (retained_bytes > config.max_webtransport_retained_bytes_per_session -| retained)
+                return error.WebTransportStreamCapacity;
+            slot.session.wt_retained_bytes.store(retained + retained_bytes, .release);
             slot.receive_finished = !can_receive;
             slot.send_finished = !can_send;
             var reader: ?*Io.Reader = null;
@@ -360,6 +378,7 @@ pub fn Controller(comptime config: anytype, comptime Ops: type) type {
             if (session_slot.webtransport_closed.load(.acquire)) return error.WebTransportSessionClosed;
             if (session_slot.wt_flow_control_enabled and session_slot.wt_send_flow.streamAllowance(direction) == 0) return error.StreamsBlocked;
             if (Ops.webTransportSessionStreamCount(self, session_slot) >= webtransport_stream_quota) return error.WebTransportStreamCapacity;
+            if (!canRetainStream(session_slot, direction, false)) return error.WebTransportStreamCapacity;
             const slot = Ops.freeWebTransportStream(
                 self,
             ) orelse return error.WebTransportStreamCapacity;
@@ -443,6 +462,7 @@ pub fn Controller(comptime config: anytype, comptime Ops: type) type {
                 .exporter_fn = Ops.exportWebTransport,
                 .close_info_fn = Ops.webTransportCloseInfo,
                 .draining_fn = Ops.webTransportDraining,
+                .retained_memory_fn = Ops.webTransportRetainedMemory,
             };
             slot.webtransport_admitted = true;
             try preparePendingWebTransportStreams(self, slot);

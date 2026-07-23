@@ -63,6 +63,9 @@ pub const Config = struct {
     webtransport_initial_max_streams_bidi: u64 = 16,
     webtransport_initial_max_data: u64 = 1024 * 1024,
     max_webtransport_session_data: u64 = 16 * 1024 * 1024,
+    /// Cumulative arena allocations retained by stream handles until their
+    /// WebTransport session closes. Exhaustion rejects subsequent streams.
+    max_webtransport_retained_bytes_per_session: usize = 16 * 1024 * 1024,
     max_webtransport_close_message_size: usize = webtransport_close_message_max,
     application_error_policy: ApplicationErrorPolicy = .internal_server_error,
     shutdown_timeout: u64 = 30 * 1_000_000_000,
@@ -106,6 +109,7 @@ pub const Config = struct {
             if (self.webtransport_initial_max_streams_uni > webtransport_max_streams or self.webtransport_initial_max_streams_bidi > webtransport_max_streams) @compileError("HTTP/3 WebTransport initial stream limits cannot exceed 2^60");
             if (self.webtransport_initial_max_data > quic_varint_max or self.max_webtransport_session_data > quic_varint_max) @compileError("HTTP/3 WebTransport data limits must fit in a QUIC variable-length integer");
             if (self.webtransport_initial_max_data > self.max_webtransport_session_data) @compileError("HTTP/3 WebTransport initial data limit cannot exceed the per-session data limit");
+            if (self.max_webtransport_retained_bytes_per_session == 0) @compileError("HTTP/3 WebTransport retained-byte limit must be non-zero");
             if (self.max_webtransport_close_message_size > webtransport_close_message_max) @compileError("HTTP/3 WebTransport close messages cannot exceed 1024 bytes");
             if (self.max_webtransport_sessions > 1 and
                 self.webtransport_initial_max_streams_uni == 0 and
@@ -132,6 +136,7 @@ test "optional HTTP/3 features remain disabled with bounded defaults" {
     try std.testing.expect(config.max_pending_webtransport_streams > 0);
     try std.testing.expect(config.webtransportFlowControlEnabled());
     try std.testing.expect(config.webtransport_initial_max_data <= config.max_webtransport_session_data);
+    try std.testing.expect(config.max_webtransport_retained_bytes_per_session > 0);
     try std.testing.expect(config.max_webtransport_close_message_size <= 1024);
     try std.testing.expectEqual(@as(usize, 16), config.qpack_decoder_blocked_streams);
     try std.testing.expectEqual(@as(usize, 16), config.qpack_encoder_blocked_streams);
