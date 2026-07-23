@@ -340,6 +340,7 @@ pub fn EndpointWithFeatures(
 
                 var retry_contents: ?retry_token.Contents = null;
                 var new_token_valid = false;
+                var new_token_expires_at: ?u64 = null;
                 if (invariant.token.len != 0) if (token_kind.classify(invariant.token)) |kind| switch (kind) {
                     .retry => {
                         const secret = self.policy.retry_token_secret orelse {
@@ -372,7 +373,9 @@ pub fn EndpointWithFeatures(
                             self.policy.new_token_address_binding,
                         )) |contents| {
                             new_token_valid = self.policy.new_token_usage == .reusable or
-                                !self.checkAndConsumeNewToken(invariant.token, contents.validated_at, contents.expires_at);
+                                !self.newTokenWasReplayed(invariant.token, contents.validated_at);
+                            if (new_token_valid and self.policy.new_token_usage == .bounded_replay_filter)
+                                new_token_expires_at = contents.expires_at;
                         } else |_| {}
                     },
                 };
@@ -476,6 +479,7 @@ pub fn EndpointWithFeatures(
                     slot.connection.validateAddress();
                     slot.paths.validateInitial();
                     if (retry_contents != null) self.rememberToken(invariant.token, now);
+                    if (new_token_expires_at) |expires_at| self.rememberNewToken(invariant.token, expires_at);
                 }
             }
         }
@@ -758,25 +762,31 @@ pub fn EndpointWithFeatures(
             return digest[0..16].*;
         }
 
-        /// Sequential-owner, best-effort check-and-consume. Expired entries are
-        /// recycled first; full-capacity eviction deliberately provides no single-use guarantee.
-        fn checkAndConsumeNewToken(self: *Self, token: []const u8, validated_at: u64, expires_at: u64) bool {
+        fn newTokenWasReplayed(self: *Self, token: []const u8, validated_at: u64) bool {
             const fingerprint = newTokenFingerprint(token);
-            var available: ?usize = null;
-            for (&self.new_token_replay_cache, 0..) |*entry, index| {
+            for (&self.new_token_replay_cache) |*entry| {
                 if (entry.occupied and entry.expires_at < validated_at) {
                     entry.occupied = false;
                     self.new_token_replay_stats.expired_recycled +|= 1;
                 }
-                if (!entry.occupied) {
-                    if (available == null) available = index;
-                    continue;
-                }
+                if (!entry.occupied) continue;
                 if (std.crypto.timing_safe.eql([16]u8, entry.fingerprint, fingerprint)) {
                     self.new_token_replay_stats.replays +|= 1;
                     return true;
                 }
             }
+            return false;
+        }
+
+        /// Commits a token only after its Initial packet authenticated and obtained a slot.
+        /// Full-capacity eviction deliberately provides no global single-use guarantee.
+        fn rememberNewToken(self: *Self, token: []const u8, expires_at: u64) void {
+            const fingerprint = newTokenFingerprint(token);
+            var available: ?usize = null;
+            for (self.new_token_replay_cache, 0..) |entry, index| if (!entry.occupied) {
+                available = index;
+                break;
+            };
             const selected = available orelse blk: {
                 self.new_token_replay_stats.capacity_evictions +|= 1;
                 break :blk self.new_token_replay_cursor;
@@ -788,7 +798,6 @@ pub fn EndpointWithFeatures(
             };
             self.new_token_replay_cursor = (selected + 1) % self.new_token_replay_cache.len;
             self.new_token_replay_stats.consumed +|= 1;
-            return false;
         }
 
         fn prepareNewToken(self: *Self, slot: *Slot) void {
@@ -1263,8 +1272,25 @@ test "NEW_TOKEN Initial admission validates before allocation and formats cannot
     });
     defer endpoint.policy.new_token_service.?.releaseExclusiveOwner(&endpoint);
 
-    // Default IP-only binding accepts a changed source port and bypasses address validation.
+    // A token is not consumed until its Initial packet authenticates.
     const presented_address: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 5555 } };
+    var unauthenticated_storage: [1200]u8 = undefined;
+    const wrong_keys: protection.Keys = .{ .aes_128_gcm = crypto_initial.derive("wrongcid").client.keys };
+    const unauthenticated = try packet_writer.writeInitial(&unauthenticated_storage, wrong_keys, .{
+        .destination_id = "validcid",
+        .source_id = "client",
+        .token = token,
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = "\x01",
+        .minimum_datagram_size = 1200,
+    });
+    var unauthenticated_messages = [_]net.IncomingMessage{incoming(presented_address, unauthenticated.packet)};
+    endpoint.processBatch(std.testing.io, &unauthenticated_messages, 99);
+    try std.testing.expectEqual(@as(usize, 0), endpoint.activeCount());
+    try std.testing.expectEqual(@as(u64, 0), endpoint.new_token_replay_stats.consumed);
+
+    // Default IP-only binding accepts a changed source port and bypasses address validation.
     var valid_storage: [1200]u8 = undefined;
     const valid_keys: protection.Keys = .{ .aes_128_gcm = crypto_initial.derive("validcid").client.keys };
     const valid = try packet_writer.writeInitial(&valid_storage, valid_keys, .{
@@ -1315,12 +1341,16 @@ test "bounded NEW_TOKEN replay filter reports replay expiry recycling and capaci
     endpoint.new_token_replay_cache = @splat(.{});
     endpoint.new_token_replay_cursor = 0;
     endpoint.new_token_replay_stats = .{};
-    try std.testing.expect(!endpoint.checkAndConsumeNewToken("a", 1, 10));
-    try std.testing.expect(endpoint.checkAndConsumeNewToken("a", 2, 10));
-    try std.testing.expect(!endpoint.checkAndConsumeNewToken("b", 2, 20));
-    try std.testing.expect(!endpoint.checkAndConsumeNewToken("c", 2, 30));
+    try std.testing.expect(!endpoint.newTokenWasReplayed("a", 1));
+    endpoint.rememberNewToken("a", 10);
+    try std.testing.expect(endpoint.newTokenWasReplayed("a", 2));
+    try std.testing.expect(!endpoint.newTokenWasReplayed("b", 2));
+    endpoint.rememberNewToken("b", 20);
+    try std.testing.expect(!endpoint.newTokenWasReplayed("c", 2));
+    endpoint.rememberNewToken("c", 30);
     try std.testing.expectEqual(@as(u64, 1), endpoint.new_token_replay_stats.capacity_evictions);
-    try std.testing.expect(!endpoint.checkAndConsumeNewToken("d", 21, 40));
+    try std.testing.expect(!endpoint.newTokenWasReplayed("d", 21));
+    endpoint.rememberNewToken("d", 40);
     try std.testing.expect(endpoint.new_token_replay_stats.expired_recycled >= 1);
     try std.testing.expectEqual(@as(u64, 4), endpoint.new_token_replay_stats.consumed);
     try std.testing.expectEqual(@as(u64, 1), endpoint.new_token_replay_stats.replays);
