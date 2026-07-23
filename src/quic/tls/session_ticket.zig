@@ -10,7 +10,7 @@
 //!
 //! The controller owns only envelope protection. Issuance independently
 //! generates `ticket_age_add` and a unique TLS `ticket_nonce`; neither is the
-//! AES-GCM envelope nonce. This module does not implement 0-RTT.
+//! AES-GCM envelope nonce. Early-data capability is authenticated in the ticket.
 
 const std = @import("std");
 const tls = std.crypto.tls;
@@ -28,11 +28,11 @@ pub const maximum_alpn_length = 255;
 pub const maximum_quic_parameters_length = 512;
 pub const maximum_context_length = 64;
 pub const maximum_application_length = 512;
-pub const maximum_plaintext_length = 1 + 8 + 4 + 4 + 2 + psk_length + 1 + maximum_alpn_length + 2 + maximum_quic_parameters_length + 1 + maximum_context_length + 2 + maximum_application_length;
+pub const maximum_plaintext_length = 1 + 8 + 4 + 4 + 1 + 2 + psk_length + 1 + maximum_alpn_length + 2 + maximum_quic_parameters_length + 1 + maximum_context_length + 2 + maximum_application_length;
 pub const maximum_ticket_length = 4 + nonce_length + maximum_plaintext_length + tag_length;
 
-const format_version: u8 = 2;
-const aad_label = "causeway tls session ticket v2";
+const format_version: u8 = 3;
+const aad_label = "causeway tls session ticket v3";
 const nonce_prefix_length = nonce_length - @sizeOf(u32);
 
 /// Wall-clock Unix time in seconds. Implementations must not silently clamp or
@@ -70,6 +70,7 @@ pub const Key = struct {
 pub const Plaintext = struct {
     lifetime: u32,
     age_add: u32,
+    early_data: bool = false,
     cipher_suite: tls.CipherSuite,
     psk: *const [psk_length]u8,
     alpn: []const u8,
@@ -84,6 +85,7 @@ pub const Contents = struct {
     issued_at: u64,
     lifetime: u32,
     age_add: u32,
+    early_data: bool,
     cipher_suite: tls.CipherSuite,
     psk: [psk_length]u8,
     alpn_storage: [maximum_alpn_length]u8 = undefined,
@@ -255,6 +257,7 @@ pub fn Controller(comptime capacity: usize) type {
             putInt(u64, &plaintext, &cursor, now);
             putInt(u32, &plaintext, &cursor, value.lifetime);
             putInt(u32, &plaintext, &cursor, value.age_add);
+            putByte(&plaintext, &cursor, @intFromBool(value.early_data));
             putInt(u16, &plaintext, &cursor, @intFromEnum(value.cipher_suite));
             putBytes(&plaintext, &cursor, value.psk);
             putVector8(&plaintext, &cursor, value.alpn);
@@ -356,7 +359,7 @@ pub fn Controller(comptime capacity: usize) type {
 
 fn plaintextTicketLength(value: *const Plaintext) !usize {
     try validatePlaintext(value, false);
-    const plaintext_length = 1 + 8 + 4 + 4 + 2 + psk_length +
+    const plaintext_length = 1 + 8 + 4 + 4 + 1 + 2 + psk_length +
         1 + value.alpn.len + 2 + value.quic_transport_parameters.len +
         1 + value.context.len + 2 + value.application.len;
     return 4 + nonce_length + plaintext_length + tag_length;
@@ -377,10 +380,16 @@ fn validatePlaintext(value: *const Plaintext, allow_zero_lifetime: bool) !void {
 fn parsePlaintext(bytes: []const u8) !Contents {
     var cursor: usize = 0;
     if (try takeByte(bytes, &cursor) != format_version) return error.UnsupportedTicketVersion;
+    const issued_at = try takeInt(u64, bytes, &cursor);
+    const lifetime = try takeInt(u32, bytes, &cursor);
+    const age_add = try takeInt(u32, bytes, &cursor);
+    const early_data = try takeByte(bytes, &cursor);
+    if (early_data > 1) return error.InvalidEarlyDataFlag;
     var result: Contents = .{
-        .issued_at = try takeInt(u64, bytes, &cursor),
-        .lifetime = try takeInt(u32, bytes, &cursor),
-        .age_add = try takeInt(u32, bytes, &cursor),
+        .issued_at = issued_at,
+        .lifetime = lifetime,
+        .age_add = age_add,
+        .early_data = early_data == 1,
         .cipher_suite = @enumFromInt(try takeInt(u16, bytes, &cursor)),
         .psk = (try take(bytes, &cursor, psk_length))[0..psk_length].*,
         .alpn_length = 0,
@@ -409,6 +418,7 @@ fn parsePlaintext(bytes: []const u8) !Contents {
     const borrowed: Plaintext = .{
         .lifetime = result.lifetime,
         .age_add = result.age_add,
+        .early_data = result.early_data,
         .cipher_suite = result.cipher_suite,
         .psk = &result.psk,
         .alpn = result.alpn(),
@@ -514,6 +524,7 @@ fn putTestPlaintextPrefix(output: []u8, cursor: *usize, issued_at: u64, lifetime
     putInt(u64, output, cursor, issued_at);
     putInt(u32, output, cursor, lifetime);
     putInt(u32, output, cursor, 1);
+    putByte(output, cursor, 0);
     putInt(u16, output, cursor, @intFromEnum(tls.CipherSuite.AES_128_GCM_SHA256));
     putBytes(output, cursor, &test_psk);
     putVector8(output, cursor, "h3");
@@ -612,12 +623,14 @@ test "ticket round trip binds context and rejects tampering" {
     defer controller.deinit();
     var other = try fixture(&now, &random_b, "service-b");
     defer other.deinit();
-    const value = samplePlaintext();
+    var value = samplePlaintext();
+    value.early_data = true;
     var storage: [maximum_ticket_length]u8 = undefined;
     const ticket = try controller.seal(&storage, &value);
     var opened = try controller.open(ticket);
     defer opened.deinit();
     try std.testing.expectEqual(@as(u64, 100), opened.issued_at);
+    try std.testing.expect(opened.early_data);
     try std.testing.expectEqualStrings("h3", opened.alpn());
     try std.testing.expectEqualSlices(u8, &test_psk, &opened.psk);
     try std.testing.expectError(error.InvalidTicket, other.open(ticket));
