@@ -182,6 +182,10 @@ pub fn build(b: *std.Build) void {
     const http3_example_step = b.step("example-http3", "Run the HTTP/3 example server");
     http3_example_step.dependOn(&run_http3_example.step);
 
+    const build_http3_example_step = b.step("build-example-http3", "Compile the HTTP/3 example server without running it");
+    const install_http3_example = b.addInstallArtifact(http3_example, .{});
+    build_http3_example_step.dependOn(&install_http3_example.step);
+
     const unit_test_step = b.step("unit-test", "Run unit tests");
     unit_test_step.dependOn(&run_unit_tests.step);
 
