@@ -210,6 +210,7 @@ test "HTTP/3 early requests require explicit replay-safe dispatch" {
     const AppState = struct {
         calls: std.atomic.Value(usize) = .init(0),
         saw_early: std.atomic.Value(bool) = .init(false),
+        direct_push_blocked: std.atomic.Value(bool) = .init(false),
     };
     const UnsafeDispatcher = struct {
         pub fn dispatch(context: anytype) !Response {
@@ -225,6 +226,11 @@ test "HTTP/3 early requests require explicit replay-safe dispatch" {
         pub fn dispatch(context: anytype) !Response {
             _ = context.execution.state.calls.fetchAdd(1, .acq_rel);
             context.execution.state.saw_early.store(context.early_data == .accepted, .release);
+            const push = try context.exchange.?.push(.{ .path = "/asset.css" }, .{ .status = .ok });
+            context.execution.state.direct_push_blocked.store(switch (push) {
+                .unavailable => |reason| reason == .early_data,
+                .promised => false,
+            }, .release);
             return .{ .status = .ok, .body = .{ .bytes = "accepted" } };
         }
     };
@@ -282,6 +288,7 @@ test "HTTP/3 early requests require explicit replay-safe dispatch" {
     }
     try std.testing.expectEqual(@as(usize, 1), safe_state.calls.load(.acquire));
     try std.testing.expect(safe_state.saw_early.load(.acquire));
+    try std.testing.expect(safe_state.direct_push_blocked.load(.acquire));
     var parser = frame.Parser{ .bytes = safe_transport.output(request_id) };
     _ = (try parser.next()).?;
     const data = (try parser.next()).?;
