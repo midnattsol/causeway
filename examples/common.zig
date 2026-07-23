@@ -1,12 +1,13 @@
 const causeway = @import("causeway");
 const http = causeway.http;
+const std = @import("std");
 
 pub const State = struct {
-    requests: usize = 0,
+    requests: std.atomic.Value(usize) = .init(0),
 };
 
 fn hello(context: *const http.context.Context(State)) http.response.Response {
-    context.execution.state.requests += 1;
+    _ = context.execution.state.requests.fetchAdd(1, .monotonic);
     return .{
         .status = .ok,
         .headers = .{ .items = &.{.{
@@ -18,7 +19,7 @@ fn hello(context: *const http.context.Context(State)) http.response.Response {
 }
 
 fn http3Hello(context: *const http.context.Context(State)) !http.response.Response {
-    context.execution.state.requests += 1;
+    _ = context.execution.state.requests.fetchAdd(1, .monotonic);
     const outcome = try context.push(.{ .path = "/assets/app.css" }, .{
         .status = .ok,
         .headers = .{ .items = &.{.{ .name = "content-type", .value = "text/css" }} },
@@ -46,7 +47,7 @@ fn stylesheet(_: *const http.context.Context(State)) http.response.Response {
 }
 
 fn earlyHello(context: *const http.context.Context(State)) http.response.Response {
-    context.execution.state.requests += 1;
+    _ = context.execution.state.requests.fetchAdd(1, .monotonic);
     return .{
         .status = .ok,
         .headers = .{ .items = &.{.{ .name = "content-type", .value = http.response.ContentType.text }} },
@@ -59,7 +60,7 @@ const WebTransportEcho = struct {
         var stream = (try session.acceptBidirectionalStream()) orelse return error.ExpectedBidirectionalStream;
         var payload: [4]u8 = undefined;
         try stream.reader.?.readSliceAll(&payload);
-        if (!@import("std").mem.eql(u8, &payload, "ping")) return error.UnexpectedWebTransportPayload;
+        if (!std.mem.eql(u8, &payload, "ping")) return error.UnexpectedWebTransportPayload;
         try stream.writer.?.writeAll("pong");
         try stream.finish();
         try session.close(0, "done");
@@ -67,7 +68,7 @@ const WebTransportEcho = struct {
 };
 
 fn webTransport(context: *const http.context.Context(State)) !http.response.Response {
-    context.execution.state.requests += 1;
+    _ = context.execution.state.requests.fetchAdd(1, .monotonic);
     return http.response.Response.tunnel(
         .ok,
         .empty,
