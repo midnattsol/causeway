@@ -18,6 +18,7 @@ pub const ServerHello = struct {
 
 pub const EncryptedExtensions = struct {
     transport_parameters: []const u8,
+    accept_early_data: bool = false,
 };
 
 pub const CertificateVerify = struct {
@@ -60,7 +61,7 @@ pub fn encodeServerHello(buffer: []u8, hello: ServerHello) ![]u8 {
 /// already-encoded QUIC transport parameters.
 pub fn encodeEncryptedExtensions(buffer: []u8, extensions: EncryptedExtensions) ![]u8 {
     if (extensions.transport_parameters.len > max_u16) return error.LengthOverflow;
-    const extensions_length = try sum(&.{ 9, 4, extensions.transport_parameters.len });
+    const extensions_length = try sum(&.{ 9, 4, extensions.transport_parameters.len, if (extensions.accept_early_data) 4 else 0 });
     if (extensions_length > max_u16) return error.LengthOverflow;
     const body_length = try sum(&.{ 2, extensions_length });
     var writer = try Writer.initHandshake(buffer, .encrypted_extensions, body_length);
@@ -74,6 +75,10 @@ pub fn encodeEncryptedExtensions(buffer: []u8, extensions: EncryptedExtensions) 
     writer.u16(0x0039);
     writer.u16(extensions.transport_parameters.len);
     writer.bytes(extensions.transport_parameters);
+    if (extensions.accept_early_data) {
+        writer.u16(@intFromEnum(tls.ExtensionType.early_data));
+        writer.u16(0);
+    }
     return writer.finish();
 }
 
@@ -114,19 +119,20 @@ pub const NewSessionTicket = struct {
     ticket_age_add: u32,
     ticket_nonce: []const u8,
     ticket: []const u8,
+    max_early_data_size: ?u32 = null,
 };
 
 pub const maximum_ticket_lifetime: u32 = 7 * 24 * 60 * 60;
 
-/// Performs strict RFC 8446 wire framing for NewSessionTicket with no
-/// extensions. A zero lifetime is valid on the wire; issuance policy belongs
-/// to the session-ticket controller. This API cannot advertise early data.
+/// Performs strict RFC 8446 wire framing for NewSessionTicket. A zero lifetime
+/// is valid on the wire; issuance policy belongs to the session-ticket controller.
 pub fn encodeNewSessionTicket(buffer: []u8, ticket: NewSessionTicket) ![]u8 {
     if (ticket.ticket_lifetime > maximum_ticket_lifetime) return error.InvalidTicketLifetime;
     if (ticket.ticket_nonce.len > max_u8) return error.LengthOverflow;
     if (ticket.ticket.len == 0) return error.EmptyTicket;
     if (ticket.ticket.len > max_u16) return error.LengthOverflow;
-    const body_length = try sum(&.{ 4, 4, 1, ticket.ticket_nonce.len, 2, ticket.ticket.len, 2 });
+    const extensions_length: usize = if (ticket.max_early_data_size != null) 8 else 0;
+    const body_length = try sum(&.{ 4, 4, 1, ticket.ticket_nonce.len, 2, ticket.ticket.len, 2, extensions_length });
     var writer = try Writer.initHandshake(buffer, .new_session_ticket, body_length);
     writer.u32(ticket.ticket_lifetime);
     writer.u32(ticket.ticket_age_add);
@@ -134,7 +140,12 @@ pub fn encodeNewSessionTicket(buffer: []u8, ticket: NewSessionTicket) ![]u8 {
     writer.bytes(ticket.ticket_nonce);
     writer.u16(ticket.ticket.len);
     writer.bytes(ticket.ticket);
-    writer.u16(0);
+    writer.u16(extensions_length);
+    if (ticket.max_early_data_size) |maximum| {
+        writer.u16(@intFromEnum(tls.ExtensionType.early_data));
+        writer.u16(4);
+        writer.u32(maximum);
+    }
     return writer.finish();
 }
 
@@ -262,6 +273,23 @@ test "NewSessionTicket strict exact framing" {
     try std.testing.expectError(error.EmptyTicket, encodeNewSessionTicket(&buffer, .{ .ticket_lifetime = 1, .ticket_age_add = 0, .ticket_nonce = "", .ticket = "" }));
 }
 
+test "NewSessionTicket advertises exact early data limit" {
+    var buffer: [64]u8 = undefined;
+    const encoded = try encodeNewSessionTicket(&buffer, .{
+        .ticket_lifetime = 600,
+        .ticket_age_add = 0x01020304,
+        .ticket_nonce = "ab",
+        .ticket = "ticket",
+        .max_early_data_size = std.math.maxInt(u32),
+    });
+    try std.testing.expectEqualSlices(
+        u8,
+        "\x04\x00\x00\x1d\x00\x00\x02\x58\x01\x02\x03\x04\x02ab\x00\x06ticket" ++
+            "\x00\x08\x00\x2a\x00\x04\xff\xff\xff\xff",
+        encoded,
+    );
+}
+
 test "EncryptedExtensions exact ALPN and QUIC transport parameters" {
     var buffer: [64]u8 = undefined;
     const encoded = try encodeEncryptedExtensions(&buffer, .{ .transport_parameters = "\x01\x02\x03" });
@@ -270,6 +298,22 @@ test "EncryptedExtensions exact ALPN and QUIC transport parameters" {
         "\x08\x00\x00\x12\x00\x10" ++
             "\x00\x10\x00\x05\x00\x03\x02h3" ++
             "\x00\x39\x00\x03\x01\x02\x03",
+        encoded,
+    );
+}
+
+test "EncryptedExtensions acknowledges accepted early data" {
+    var buffer: [64]u8 = undefined;
+    const encoded = try encodeEncryptedExtensions(&buffer, .{
+        .transport_parameters = "\x01\x02\x03",
+        .accept_early_data = true,
+    });
+    try std.testing.expectEqualSlices(
+        u8,
+        "\x08\x00\x00\x16\x00\x14" ++
+            "\x00\x10\x00\x05\x00\x03\x02h3" ++
+            "\x00\x39\x00\x03\x01\x02\x03" ++
+            "\x00\x2a\x00\x00",
         encoded,
     );
 }
