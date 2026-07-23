@@ -11,6 +11,7 @@ fn RouteType(
     comptime Handler: type,
     comptime route_middlewares: anytype,
     comptime route_body_limit: ?usize,
+    comptime route_replay_safe: bool,
 ) type {
     return struct {
         method: Method,
@@ -19,6 +20,7 @@ fn RouteType(
 
         pub const middlewares = route_middlewares;
         pub const max_body_size = route_body_limit;
+        pub const replay_safe = route_replay_safe;
 
         /// Invokes this route's middleware and then its handler.
         pub fn invoke(comptime self: @This(), context: anytype) !Response {
@@ -31,7 +33,7 @@ fn RouteType(
 
         /// Returns the same route with `outer` middleware wrapped around its
         /// existing route-local middleware.
-        pub fn withMiddleware(comptime self: @This(), comptime outer: anytype) RouteType(Handler, outer ++ route_middlewares, route_body_limit) {
+        pub fn withMiddleware(comptime self: @This(), comptime outer: anytype) RouteType(Handler, outer ++ route_middlewares, route_body_limit, route_replay_safe) {
             return .{
                 .method = self.method,
                 .pattern = self.pattern,
@@ -40,8 +42,17 @@ fn RouteType(
         }
 
         /// Returns the same route with a stricter request-body limit.
-        pub fn withBodyLimit(comptime self: @This(), comptime maximum: usize) RouteType(Handler, route_middlewares, maximum) {
+        pub fn withBodyLimit(comptime self: @This(), comptime maximum: usize) RouteType(Handler, route_middlewares, maximum, route_replay_safe) {
             if (maximum == 0) @compileError("route body limit must be positive");
+            return .{
+                .method = self.method,
+                .pattern = self.pattern,
+                .handler_fn = self.handler_fn,
+            };
+        }
+
+        /// Marks the effective route pipeline as safe for replayable early data.
+        pub fn withReplaySafe(comptime self: @This()) RouteType(Handler, route_middlewares, route_body_limit, true) {
             return .{
                 .method = self.method,
                 .pattern = self.pattern,
@@ -64,7 +75,7 @@ pub fn route(
     comptime method: Method,
     comptime pattern: []const u8,
     comptime handler_fn: anytype,
-) RouteType(@TypeOf(handler_fn), .{}, null) {
+) RouteType(@TypeOf(handler_fn), .{}, null, false) {
     return routeWith(method, pattern, handler_fn, .{});
 }
 
@@ -74,7 +85,7 @@ pub fn routeWith(
     comptime pattern: []const u8,
     comptime handler_fn: anytype,
     comptime middlewares: anytype,
-) RouteType(@TypeOf(handler_fn), middlewares, null) {
+) RouteType(@TypeOf(handler_fn), middlewares, null, false) {
     return .{
         .method = method,
         .pattern = pattern,
@@ -90,6 +101,11 @@ pub fn withMiddleware(comptime route_value: anytype, comptime middlewares: anyty
 /// Adds a request-body limit to an existing route.
 pub fn withBodyLimit(comptime route_value: anytype, comptime maximum: usize) @TypeOf(route_value.withBodyLimit(maximum)) {
     return route_value.withBodyLimit(maximum);
+}
+
+/// Marks an existing route and all of its middleware as replay-safe.
+pub fn withReplaySafe(comptime route_value: anytype) @TypeOf(route_value.withReplaySafe()) {
+    return route_value.withReplaySafe();
 }
 
 // -----------------------------------------------------------------------------
@@ -194,6 +210,18 @@ test "route body limit is compile-time metadata and preserves middleware" {
 
     try std.testing.expectEqual(@as(?usize, 4096), @TypeOf(limited).max_body_size);
     try std.testing.expectEqual(@as(usize, 1), @TypeOf(limited).middlewares.len);
+}
+
+test "route replay safety is explicit compile-time metadata" {
+    const plain = comptime route(.GET, "/resource", firstHandler);
+    const safe = comptime withReplaySafe(plain);
+    const wrapped = comptime withMiddleware(withBodyLimit(safe, 4096), .{Outer});
+
+    try std.testing.expect(!@TypeOf(plain).replay_safe);
+    try std.testing.expect(@TypeOf(safe).replay_safe);
+    try std.testing.expect(@TypeOf(wrapped).replay_safe);
+    try std.testing.expectEqual(@as(?usize, 4096), @TypeOf(wrapped).max_body_size);
+    try std.testing.expectEqual(@as(usize, 1), @TypeOf(wrapped).middlewares.len);
 }
 
 test "additional middleware wraps existing route middleware" {

@@ -25,6 +25,14 @@ pub fn Chain(comptime middlewares: anytype, comptime Dispatcher: type) type {
             return null;
         }
 
+        /// Forwards replay-safety metadata without executing middleware.
+        pub fn replaySafe(method: Method, path: []const u8) bool {
+            if (comptime @hasDecl(Dispatcher, "replaySafe")) {
+                return Dispatcher.replaySafe(method, path);
+            }
+            return false;
+        }
+
         pub fn dispatch(context: anytype) !Response {
             return run(middlewares, DispatcherTerminal(Dispatcher), context);
         }
@@ -134,6 +142,10 @@ const LimitedDispatcher = struct {
     pub fn dispatch(_: anytype) !Response {
         return .{ .status = .ok };
     }
+
+    pub fn replaySafe(method: Method, path: []const u8) bool {
+        return method.is(.GET) and std.mem.eql(u8, path, "/immutable");
+    }
 };
 
 const FailingDispatcher = struct {
@@ -174,6 +186,11 @@ test "Chain forwards route metadata without running middleware" {
     const Dispatcher = Chain(.{ShortCircuit}, LimitedDispatcher);
     try std.testing.expectEqual(@as(?usize, 512), Dispatcher.bodyLimit(.POST, "/upload"));
     try std.testing.expectEqual(@as(?usize, null), Dispatcher.bodyLimit(.GET, "/upload"));
+    try std.testing.expect(Dispatcher.replaySafe(.GET, "/immutable"));
+    try std.testing.expect(!Dispatcher.replaySafe(.POST, "/immutable"));
+
+    const Conservative = Chain(.{}, TestDispatcher);
+    try std.testing.expect(!Conservative.replaySafe(.GET, "/immutable"));
 }
 
 test "Chain lets middleware map downstream errors" {

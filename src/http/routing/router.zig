@@ -89,6 +89,22 @@ pub fn RouterWithOptions(comptime routes: anytype, comptime options: anytype) ty
             return null;
         }
 
+        /// Reports whether the matched route explicitly permits replayable early data.
+        pub fn replaySafe(method: Method, path: []const u8) bool {
+            inline for (0..maximum_specificity + 1) |offset| {
+                const specificity = maximum_specificity - offset;
+                if (replaySafetyForRoutes(routes, specificity, method, path)) |safe| return safe;
+            }
+
+            if (method.is(.HEAD)) {
+                inline for (0..maximum_specificity + 1) |offset| {
+                    const specificity = maximum_specificity - offset;
+                    if (replaySafetyForRoutes(routes, specificity, .GET, path)) |safe| return safe;
+                }
+            }
+            return false;
+        }
+
         /// Dispatches a request context to the most specific matching route.
         pub fn dispatch(context: anytype) !Response {
             if (context.request.method.is(.OPTIONS) and isAsteriskTarget(context.request)) {
@@ -247,6 +263,22 @@ fn bodyLimitForRoutes(
         if (comptime RoutePattern.static_segment_count != specificity) continue;
         if (method.eql(route_value.method) and RoutePattern.match(path) != null) {
             return .{ .maximum = @TypeOf(route_value).max_body_size };
+        }
+    }
+    return null;
+}
+
+fn replaySafetyForRoutes(
+    comptime routes: anytype,
+    comptime specificity: usize,
+    method: Method,
+    path: []const u8,
+) ?bool {
+    inline for (routes) |route_value| {
+        const RoutePattern = Pattern(route_value.pattern);
+        if (comptime RoutePattern.static_segment_count != specificity) continue;
+        if (method.eql(route_value.method) and RoutePattern.match(path) != null) {
+            return @TypeOf(route_value).replay_safe;
         }
     }
     return null;
@@ -631,6 +663,32 @@ test "HEAD body limits use explicit metadata before GET fallback metadata" {
         route_module.route(.HEAD, "/users/:id", headHandler),
     });
     try std.testing.expectEqual(@as(?usize, null), UnlimitedExplicitRouter.bodyLimit(.HEAD, "/users/42"));
+}
+
+test "Router reports explicit replay-safe route metadata" {
+    const AppRouter = Router(.{
+        route_module.withReplaySafe(route_module.route(.GET, "/items/:id", parameterHandler)),
+        route_module.route(.GET, "/items/private", staticHandler),
+        route_module.route(.POST, "/items/:id", otherHandler),
+    });
+
+    try std.testing.expect(AppRouter.replaySafe(.GET, "/items/42"));
+    try std.testing.expect(!AppRouter.replaySafe(.GET, "/items/private"));
+    try std.testing.expect(!AppRouter.replaySafe(.POST, "/items/42"));
+    try std.testing.expect(!AppRouter.replaySafe(.GET, "/missing"));
+}
+
+test "HEAD replay safety prefers explicit route before GET fallback" {
+    const ExplicitRouter = Router(.{
+        route_module.withReplaySafe(route_module.route(.GET, "/items/:id", parameterHandler)),
+        route_module.route(.HEAD, "/items/:id", headHandler),
+    });
+    try std.testing.expect(!ExplicitRouter.replaySafe(.HEAD, "/items/42"));
+
+    const FallbackRouter = Router(.{
+        route_module.withReplaySafe(route_module.route(.GET, "/items/:id", parameterHandler)),
+    });
+    try std.testing.expect(FallbackRouter.replaySafe(.HEAD, "/items/42"));
 }
 
 test "explicit OPTIONS has priority over automatic OPTIONS across pattern specificity" {
