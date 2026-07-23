@@ -264,6 +264,7 @@ pub fn Controller(comptime config: anytype, comptime Ops: type) type {
                 const output = slot.output orelse continue;
                 if (output.failure()) |err| {
                     Ops.completePendingOpen(slot, err);
+                    Ops.completePendingFinish(slot, err);
                     slot.send_finished = true;
                     session_slot.wt_stream_cursor = (index + 1) % self.webtransport_streams.len;
                     return .{ .action = true };
@@ -311,6 +312,7 @@ pub fn Controller(comptime config: anytype, comptime Ops: type) type {
                     try resetWebTransportSend(self, slot, wt_error_codes.toHttp(operation.application_error));
                     slot.send_finished = true;
                     if (slot.output) |output| output.abort(error.StreamReset);
+                    Ops.completePendingFinish(slot, error.StreamReset);
                     collectWebTransportStreams(
                         self,
                     );
