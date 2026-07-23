@@ -8,10 +8,13 @@ const quic_limits: causeway.quic.connection.Limits = .{
     .tls_output_bytes = 16 * 1024,
     .tls_transcript_bytes = 32 * 1024,
     .max_datagram_size = 1350,
-    // 16 client bidi + 16 client uni + 3 HTTP/3 critical + 4 push streams.
-    .max_streams = 39,
+    // 16 client bidi + 16 client uni + 3 critical + 4 push + 16 WebTransport.
+    .max_streams = 55,
     .stream_receive_bytes = 64 * 1024,
     .stream_send_bytes = 64 * 1024,
+    .datagram_receive_queue = 8,
+    .datagram_send_queue = 8,
+    .datagram_max_payload = 1199,
 };
 
 const http3_config: causeway.http.http3.Config = .{
@@ -23,6 +26,9 @@ const http3_config: causeway.http.http3.Config = .{
     .max_response_body_size = 1024 * 1024,
     .qpack_decoder_blocked_streams = 8,
     .qpack_encoder_blocked_streams = 8,
+    .enable_datagrams = true,
+    .datagram_max_payload = 1199,
+    .enable_webtransport = true,
 };
 
 const Http3Server = causeway.http.http3.Server(
@@ -120,6 +126,8 @@ pub fn main(init: std.process.Init) !void {
             .initial_max_streams_uni = 16,
             .active_connection_id_limit = 2,
             .disable_active_migration = true,
+            .max_datagram_frame_size = 1200,
+            .reset_stream_at = true,
         },
     }, init.gpa, &state);
     defer server.deinit(init.io);

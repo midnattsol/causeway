@@ -54,6 +54,27 @@ fn earlyHello(context: *const http.context.Context(State)) http.response.Respons
     };
 }
 
+const WebTransportEcho = struct {
+    pub fn run(_: *@This(), session: *http.response.WebTransportSession) !void {
+        var stream = (try session.acceptBidirectionalStream()) orelse return error.ExpectedBidirectionalStream;
+        var payload: [4]u8 = undefined;
+        try stream.reader.?.readSliceAll(&payload);
+        if (!@import("std").mem.eql(u8, &payload, "ping")) return error.UnexpectedWebTransportPayload;
+        try stream.writer.?.writeAll("pong");
+        try stream.finish();
+        try session.close(0, "done");
+    }
+};
+
+fn webTransport(context: *const http.context.Context(State)) !http.response.Response {
+    context.execution.state.requests += 1;
+    return http.response.Response.tunnel(
+        .ok,
+        .empty,
+        try http.response.Takeover.initWebTransport(context.execution.allocator, WebTransportEcho{}),
+    );
+}
+
 const routes = .{
     http.routing.route.route(.GET, "/", hello),
 };
@@ -62,7 +83,11 @@ const http3_routes = .{
     http.routing.route.route(.GET, "/", http3Hello),
     http.routing.route.route(.GET, "/assets/app.css", stylesheet),
     http.routing.route.route(.GET, "/early", earlyHello).withReplaySafe(),
+    http.routing.route.route(.CONNECT, "/webtransport", webTransport),
 };
 
 pub const Router = http.routing.router.Router(routes);
-pub const Http3Router = http.routing.router.Router(http3_routes);
+pub const Http3Router = blk: {
+    @setEvalBranchQuota(2_000);
+    break :blk http.routing.router.Router(http3_routes);
+};

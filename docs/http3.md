@@ -123,7 +123,7 @@ python3 -m venv /tmp/causeway-aioquic
 /tmp/causeway-aioquic/bin/python tools/http3_interop.py
 ```
 
-The check requires a real Retry on the first connection, reuses NEW_TOKEN without Retry, receives a pushed stylesheet, performs a PSK-DHE-only resumed connection, sends an accepted replay-safe request in 0-RTT, then replays the same ticket and verifies rejection with a successful 1-RTT fallback.
+The check requires a real Retry on the first connection, reuses NEW_TOKEN without Retry, receives a pushed stylesheet, performs a PSK-DHE-only resumed connection, sends an accepted replay-safe request in 0-RTT, then replays the same ticket and verifies rejection with a successful 1-RTT fallback. It also adapts aioquic's WebTransport framing to draft-16 SETTINGS, establishes an extended CONNECT, and verifies a native bidirectional stream echo.
 
 ## Recovery and congestion control
 
