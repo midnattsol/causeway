@@ -69,7 +69,49 @@ The QUIC TLS state machine implements a TLS 1.3 server handshake for RFC 9001 an
 
 The connection enforces server anti-amplification limits until the peer address is validated. Initial and Handshake packet-number spaces and keys are discarded as the handshake advances. Application key updates are supported after handshake confirmation and acknowledgment of a packet in the current sending generation; receive-side key phase promotion retains the previous generation for reordered packets. Parsers accept every valid QUIC variable-length integer encoding, including non-minimal widths; writers always emit the shortest representation.
 
-0-RTT is not supported. The packet parser recognizes the long-header 0-RTT type, but the server does not accept or dispatch early application data and exposes no session resumption/early-data API.
+## Session resumption and 0-RTT
+
+Causeway implements server-side TLS 1.3 PSK-DHE resumption and opt-in QUIC/HTTP/3 0-RTT. Resumption alone does not enable early data. An endpoint must have an exclusively owned `TicketService` and explicitly select `.early_data = .bounded_replay_filter`:
+
+```zig
+try server.bind(io, &address, .{
+    .credentials = &credentials,
+    .ticket_service = causeway.quic.tls.resumption.TicketService.fromController(&ticket_controller),
+    .resumption_context = "production-eu-1",
+    .ticket_lifetime = 24 * 60 * 60,
+    .early_data = .bounded_replay_filter,
+    .early_data_max_age_skew_ms = 10_000,
+    .transport_parameters = transport_policy,
+}, allocator, &state);
+```
+
+The mutable ticket controller is claimed by one endpoint and must remain at a stable address for the endpoint lifetime. Its clock returns Unix seconds. Its entropy callback must be cryptographically secure and fail rather than substitute weak bytes. Ticket keys have explicit seal/accept windows and key IDs; retired IDs and key material cannot be reintroduced into the same controller. Reusing an AEAD key with reset nonce history across controller restarts is unsafe. `resumption_context` is authenticated and should bind tickets to the deployment, tenant, protocol policy, and key namespace that may resume them.
+
+Tickets are stateless AES-256-GCM envelopes. They authenticate the PSK, ALPN, cipher suite, lifetime, early-data capability, a canonical snapshot of the server's reusable QUIC limits, and a versioned snapshot of the server's HTTP/3 SETTINGS. A resumed connection still receives and applies fresh peer transport parameters and SETTINGS. Causeway never restores packet numbers, stream IDs, dynamic QPACK entries, push state, WebTransport sessions, datagram queues, or live connection state.
+
+Early acceptance requires all of the following:
+
+- the client offers `early_data` with PSK identity zero and a valid binder over the original ClientHello bytes;
+- the ticket advertises early data, has acceptable age/skew, matches ALPN/context/suite, and has not expired;
+- current QUIC flow-control, stream, DATAGRAM, CID, and reliable-reset limits are not lower than the authenticated remembered values;
+- current HTTP/3 SETTINGS are compatible with the remembered server SETTINGS;
+- the endpoint-local replay filter consumes the ticket successfully;
+- the matched effective route pipeline explicitly opts in with `.withReplaySafe()`.
+
+```zig
+const routes = .{
+    causeway.http.routing.route.route(.GET, "/immutable-config", immutableConfig)
+        .withReplaySafe(),
+};
+```
+
+HTTP methods are never inferred to be replay-safe. The marker asserts that the handler and all global/route middleware are safe to execute more than once, including logging, sessions, authorization, rate limits, and external side effects. Accepted handlers observe `context.early_data == .accepted`; HTTP/1, HTTP/2, and ordinary HTTP/3 requests observe `.none`.
+
+An unmarked early request receives `425 Too Early` without invoking middleware or the handler. That stream is terminal and cannot be dispatched after handshake completion; a retry is a new request. CONNECT, extended CONNECT, WebTransport, takeover, and server push are prohibited in early data. `Context.push` returns `.unavailable.early_data` without touching the supplied response. A marked handler that attempts takeover fails before response commitment.
+
+The built-in replay filter is fixed-capacity and endpoint-local. It rejects duplicate live tickets and rejects new early data when full; it never evicts a live entry to make room. This gives no global single-use guarantee across processes, shards, hosts, controller restarts, or independently configured endpoints. Deployments requiring that guarantee need coordinated admission outside this local filter and must not advertise 0-RTT until such coordination exists. Rejecting early data does not fail a valid resumed handshake; the client can retry in 1-RTT.
+
+0-RTT and 1-RTT share the QUIC application packet-number space, but Causeway keeps distinct receive keys and validates frame legality before state mutation. ACK, CRYPTO, PATH, NEW_TOKEN, and other 1-RTT-only frames are rejected in 0-RTT. Stream provenance is conservative: if any bytes for a request arrived in accepted 0-RTT, that request is treated as early. Causeway does not allocate an endpoint slot from a standalone unknown 0-RTT packet and does not buffer undecryptable early packets received before their Initial/ClientHello; retransmission recovers reliable stream data, but an early QUIC DATAGRAM can be lost.
 
 ## Recovery and congestion control
 
@@ -240,6 +282,10 @@ The endpoint can be configured with:
 
 Retry tokens bind the admission data expected by the endpoint and are checked against a bounded replay cache. Stateless reset generation and recognition use per-CID reset tokens and bounded response batching/rate limiting.
 
+`NEW_TOKEN` is a separate, opt-in stateless service configured with `new_token_service`, lifetime, IP or IP+port address binding, and `.reusable` or `.bounded_replay_filter` usage. Its controller has an authenticated context, rotating key ring, clock in Unix seconds, CSPRNG, and a persistent nonzero `issuer_id`. Independent emitters sharing a root secret must use distinct issuer IDs; the same issuer+secret pair requires one globally coordinated emitter. The bounded replay mode is best-effort and can evict on capacity, unlike the early-data filter, so it does not promise global single use.
+
+Do not interchange the three credentials: a Retry token validates the current Initial admission path, a `NEW_TOKEN` can validate an address on a later connection, and a TLS session ticket authenticates PSK resumption and remembered policy. Their wire discriminants, AEAD contexts, lifetimes, replay semantics, and failure behavior are intentionally separate. Invalid Retry produces `INVALID_TOKEN`; invalid `NEW_TOKEN` leaves the address unvalidated; an unknown or expired TLS ticket falls back to a full handshake.
+
 The QUIC connection processes `NEW_CONNECTION_ID` and `RETIRE_CONNECTION_ID`, enforces active CID limits, issues replacement server CIDs, and tracks peer stateless-reset tokens. Authenticated `PATH_CHALLENGE` and `PATH_RESPONSE` frames are associated with endpoint-owned peer addresses. New paths remain provisional until validation unless unsafe immediate NAT rebinding is explicitly enabled. Per-path anti-amplification accounting applies before validation, and failed validation is retried only up to the configured bounded attempt count.
 
 ## HTTP/3 streams and QPACK
@@ -390,7 +436,7 @@ These targets validate Causeway's own invariants and regression cases. They do n
 
 ## Explicit non-goals and current exclusions
 
-- 0-RTT/early data and session resumption are unsupported.
+- Causeway provides only a bounded endpoint-local anti-replay filter; global 0-RTT single-use across processes or nodes is not provided.
 - WebTransport client mode and compatibility with drafts before `draft-ietf-webtrans-http3-16` are unsupported.
 - Reliable stream reset drafts before `draft-ietf-quic-reliable-stream-reset-09` are unsupported.
 - Causeway does not enforce an Origin allowlist for WebTransport; that authorization policy belongs to the application.
