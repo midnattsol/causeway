@@ -360,8 +360,9 @@ test "frame legality rejects 1-RTT-only controls from 0-RTT" {
     try std.testing.expect(allowedIn(.{ .stream = .{ .id = 0, .offset = 0, .data = "x", .fin = false } }, .zero_rtt));
     try std.testing.expect(!allowedIn(.{ .ack = .{ .largest = 0, .delay = 0, .first_range = 0, .ranges = "", .range_count = 0, .ecn = null } }, .zero_rtt));
     try std.testing.expect(!allowedIn(.{ .crypto = .{ .offset = 0, .data = "x" } }, .zero_rtt));
-    try std.testing.expect(!allowedIn(.{ .path_challenge = @splat(0) }, .zero_rtt));
+    try std.testing.expect(allowedIn(.{ .path_challenge = @splat(0) }, .zero_rtt));
     try std.testing.expect(allowedIn(.{ .path_challenge = @splat(0) }, .one_rtt));
+    try std.testing.expect(!allowedIn(.{ .path_response = @splat(0) }, .zero_rtt));
 }
 
 test "QUIC connection IDs and close reasons remain borrowed" {

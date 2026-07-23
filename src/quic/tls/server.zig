@@ -285,6 +285,9 @@ pub const Server = struct {
     }
 
     fn receiveClientHello(self: *Server, level: EncryptionLevel, message: []const u8, initial_out: []u8, handshake_out: []u8) !Outputs {
+        if (self.early_receive_keys_value) |*keys| keys.clear();
+        self.early_receive_keys_value = null;
+        self.early_data_state = .not_offered;
         if (level != .initial) return error.WrongEncryptionLevel;
         const frame = wire.parseHandshake(message) catch |err| return err;
         if (frame.message_type != .client_hello) return error.UnexpectedHandshakeType;
@@ -297,21 +300,6 @@ pub const Server = struct {
             negotiated.cipher_suite = selected.contents.cipher_suite;
         } else {
             _ = try negotiation.negotiateCertificateAuthentication(hello, &.{self.credentials.signatureScheme()});
-        }
-        const accept_early_data = self.acceptEarlyData(
-            hello,
-            if (psk_selection.selected) |*selected| selected else null,
-        ) catch false;
-        self.early_data_state = if (!hello.early_data) .not_offered else if (accept_early_data) .accepted else .rejected;
-        if (accept_early_data) {
-            const selected = &psk_selection.selected.?;
-            var secret = key_schedule.deriveClientEarlyTrafficSecret(&selected.contents.psk, key_schedule.transcriptHash(message));
-            defer std.crypto.secureZero(u8, &secret);
-            self.early_receive_keys_value = try packet_keys.derive(secret, negotiated.cipher_suite);
-            errdefer {
-                self.early_receive_keys_value.?.clear();
-                self.early_receive_keys_value = null;
-            }
         }
         const peer_parameters_offset: usize = @intCast(@intFromPtr(negotiated.transport_parameters.ptr) - @intFromPtr(message.ptr));
         const key_pair = try self.x25519.keyPair();
@@ -337,6 +325,23 @@ pub const Server = struct {
         const hello_transcript_length = std.math.add(usize, message.len, server_hello.len) catch return error.TranscriptBufferTooSmall;
         const complete_transcript_bound = std.math.add(usize, hello_transcript_length, minimum_handshake) catch return error.TranscriptBufferTooSmall;
         if (complete_transcript_bound > self.transcript.len) return error.TranscriptBufferTooSmall;
+
+        const accept_early_data = self.acceptEarlyData(
+            hello,
+            if (psk_selection.selected) |*selected| selected else null,
+        ) catch false;
+        self.early_data_state = if (!hello.early_data) .not_offered else if (accept_early_data) .accepted else .rejected;
+        errdefer {
+            if (self.early_receive_keys_value) |*early_keys| early_keys.clear();
+            self.early_receive_keys_value = null;
+            self.early_data_state = if (hello.early_data) .rejected else .not_offered;
+        }
+        if (accept_early_data) {
+            const selected = &psk_selection.selected.?;
+            var secret = key_schedule.deriveClientEarlyTrafficSecret(&selected.contents.psk, key_schedule.transcriptHash(message));
+            defer std.crypto.secureZero(u8, &secret);
+            self.early_receive_keys_value = try packet_keys.derive(secret, negotiated.cipher_suite);
+        }
         self.appendTranscript(message) catch unreachable;
         self.appendTranscript(server_hello) catch unreachable;
 

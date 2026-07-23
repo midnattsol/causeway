@@ -129,7 +129,8 @@ pub fn allowedIn(value: Frame, kind: PacketKind) bool {
     return switch (value) {
         .padding, .ping => true,
         .ack, .crypto => kind != .zero_rtt,
-        .new_token, .handshake_done, .path_challenge, .path_response => kind == .one_rtt,
+        .new_token, .handshake_done, .path_response => kind == .one_rtt,
+        .path_challenge => kind == .zero_rtt or kind == .one_rtt,
         .reset_stream,
         .reset_stream_at,
         .stop_sending,

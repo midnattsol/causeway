@@ -1608,16 +1608,27 @@ test "zero RTT streams share application packet space and retain provenance" {
     try std.testing.expectEqual(@as(?u64, 0), connection.space(.application).received.largest());
     try std.testing.expect(connection.ack_pending[@intFromEnum(Level.application)]);
 
+    const datagram_frame = try frame.writer.encode(&frame_storage, .{ .datagram_len = "replayable" });
+    const early_datagram = try packet_writer.writeZeroRtt(&packet_storage, keys, .{
+        .destination_id = "original",
+        .source_id = "client",
+        .packet_number = 1,
+        .packet_number_length = 2,
+        .payload = datagram_frame,
+    });
+    try connection.receiveDatagram(early_datagram.packet, 2);
+    try std.testing.expect(connection.nextDatagram() == null);
+
     const one_rtt = try packet_writer.writeOneRtt(&packet_storage, keys, .{
         .destination_id = "server",
-        .packet_number = 1,
+        .packet_number = 2,
         .packet_number_length = 2,
         .payload = "\x01\x00\x00\x00",
         .key_phase = false,
     });
-    try connection.receiveDatagram(one_rtt.packet, 2);
+    try connection.receiveDatagram(one_rtt.packet, 3);
     try std.testing.expect(connection.zero_rtt_remote == null);
-    try std.testing.expectEqual(@as(?u64, 1), connection.space(.application).received.largest());
+    try std.testing.expectEqual(@as(?u64, 2), connection.space(.application).received.largest());
 }
 
 test "protected RESET_STREAM_AT is negotiated and enforces normative transport errors" {

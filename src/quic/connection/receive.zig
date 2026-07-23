@@ -141,6 +141,9 @@ fn dispatchFrames(self: anytype, level: types.Level, kind: frame.PacketKind, des
             .datagram, .datagram_len => |datagram_payload| {
                 try requireApplication(level);
                 ack_eliciting = true;
+                // HTTP/3 does not admit replayable datagram operations. Keep the
+                // legal transport frame ack-eliciting, but do not expose payload.
+                if (kind == .zero_rtt) continue;
                 self.datagrams.receive(datagram_payload, iterator.cursor - frame_start) catch |err| {
                     const frame_type = if (std.meta.activeTag(value) == .datagram)
                         frame.datagram_type

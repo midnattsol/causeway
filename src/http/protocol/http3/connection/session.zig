@@ -1317,7 +1317,8 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                 return;
             }
             const slot = self.findRequest(id) orelse return error.UnknownRequestStream;
-            slot.received_early_data = slot.received_early_data or try self.connection.streamReceivedEarlyData(id);
+            if (!slot.dispatched)
+                slot.received_early_data = slot.received_early_data or try self.connection.streamReceivedEarlyData(id);
             if (comptime config.enable_webtransport) {
                 const classification = try WtController.classifyBidirectional(self, slot);
                 if (classification == null or classification.?) return;
@@ -2176,6 +2177,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
             }
 
             pub fn push(self: *@This(), request: PushRequest, response: Response) !PushOutcome {
+                if (self.slot.received_early_data) return .{ .unavailable = .early_data };
                 if (comptime !config.enable_server_push) return .{ .unavailable = .server_disabled };
                 var operation: PushOperation = .{ .parent = self.slot, .request = request, .response = response };
                 try self.owner.submitPushOperation(&operation);
