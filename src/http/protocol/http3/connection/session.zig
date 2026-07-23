@@ -2141,6 +2141,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
 
         fn failRequest(self: *Self, slot: *RequestSlot, code: errors.Code, err: anyerror) void {
             if (!slot.occupied) return;
+            if (!slot.dispatched) slot.task_done = true;
             self.abortParentPushes(slot, err);
             if (slot.webtransport_candidate) {
                 if (slot.webtransport_admitted) {
