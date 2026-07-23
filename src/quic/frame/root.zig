@@ -26,6 +26,7 @@ pub const ConnectionId = types.ConnectionId;
 pub const ConnectionClose = types.ConnectionClose;
 pub const PacketKind = types.PacketKind;
 pub const Frame = types.Frame;
+pub const allowedIn = types.allowedIn;
 pub const new_token_type = types.new_token_type;
 pub const new_token_is_ack_eliciting = types.new_token_is_ack_eliciting;
 pub const new_token_is_congestion_controlled = types.new_token_is_congestion_controlled;
@@ -352,6 +353,15 @@ test "QUIC DATAGRAM frame metadata follows RFC 9221" {
     try std.testing.expect(datagram_is_ack_eliciting);
     try std.testing.expect(datagram_is_congestion_controlled);
     try std.testing.expect(!datagram_is_retransmittable);
+}
+
+test "frame legality rejects 1-RTT-only controls from 0-RTT" {
+    try std.testing.expect(allowedIn(.ping, .zero_rtt));
+    try std.testing.expect(allowedIn(.{ .stream = .{ .id = 0, .offset = 0, .data = "x", .fin = false } }, .zero_rtt));
+    try std.testing.expect(!allowedIn(.{ .ack = .{ .largest = 0, .delay = 0, .first_range = 0, .ranges = "", .range_count = 0, .ecn = null } }, .zero_rtt));
+    try std.testing.expect(!allowedIn(.{ .crypto = .{ .offset = 0, .data = "x" } }, .zero_rtt));
+    try std.testing.expect(!allowedIn(.{ .path_challenge = @splat(0) }, .zero_rtt));
+    try std.testing.expect(allowedIn(.{ .path_challenge = @splat(0) }, .one_rtt));
 }
 
 test "QUIC connection IDs and close reasons remain borrowed" {

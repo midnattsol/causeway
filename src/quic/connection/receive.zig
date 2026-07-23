@@ -15,27 +15,29 @@ pub fn datagram(self: anytype, bytes: []u8, now: u64) !void {
         const invariant = header.parse(bytes[cursor..], self.serverConnectionId().len) catch return;
         const packet_end = cursor + invariant.packet_end;
         if (packet_end <= cursor or packet_end > bytes.len) return;
-        const level = packetLevel(invariant.packet_type) orelse {
+        const classification = classifyPacket(invariant.packet_type) orelse {
             cursor = packet_end;
             continue;
         };
-        if (!validDestination(self, invariant.destination_id, level) or
+        const level = classification.level;
+        if (!validDestination(self, invariant.destination_id, classification.kind) or
             (invariant.isLong() and invariant.source_id.len != 0 and !std.mem.eql(u8, invariant.source_id, self.initialClientConnectionId())))
         {
             cursor = packet_end;
             continue;
         }
 
-        if (self.receiveKeys(level)) |keys| {
+        const receive_keys = if (classification.kind == .zero_rtt) self.zero_rtt_remote else self.receiveKeys(level);
+        if (receive_keys) |keys| {
             const packet = bytes[cursor..packet_end];
             const pn_offset = invariant.packet_number_offset orelse {
                 cursor = packet_end;
                 continue;
             };
             const largest = self.space(level).received.largest();
-            const clear = switch (level) {
-                .initial, .handshake => keys.unprotect(packet, pn_offset, largest),
-                .application => if (self.application_receive_keys) |*application_keys|
+            const clear = switch (classification.kind) {
+                .initial, .zero_rtt, .handshake => keys.unprotect(packet, pn_offset, largest),
+                .one_rtt => if (self.application_receive_keys) |*application_keys|
                     application_keys.unprotect(packet, pn_offset, largest)
                 else
                     keys.unprotect(packet, pn_offset, largest),
@@ -53,10 +55,14 @@ pub fn datagram(self: anytype, bytes: []u8, now: u64) !void {
             }
             const recorded = try self.space(level).recordReceived(clear.packet_number);
             if (recorded == .inserted) {
+                if (classification.kind == .one_rtt) {
+                    if (self.zero_rtt_remote) |*early_keys| early_keys.clear();
+                    self.zero_rtt_remote = null;
+                }
                 self.ecn.onPacketReceived(self.receive_metadata.path_id, types.levelId(level), self.receive_metadata.ecn);
                 if (level == .handshake) self.address_validated = true;
                 const destination_sequence = self.localConnectionIdSequence(invariant.destination_id) orelse 0;
-                const ack_eliciting = dispatchFrames(self, level, destination_sequence, clear.payload, now) catch |err| {
+                const ack_eliciting = dispatchFrames(self, level, classification.kind, destination_sequence, clear.payload, now) catch |err| {
                     if (self.state != .closing) fail(self, mapError(err), null, "invalid frame", now);
                     return err;
                 };
@@ -68,26 +74,33 @@ pub fn datagram(self: anytype, bytes: []u8, now: u64) !void {
     }
 }
 
-fn packetLevel(packet_type: header.Type) ?types.Level {
+const PacketClassification = struct {
+    level: types.Level,
+    kind: frame.PacketKind,
+};
+
+fn classifyPacket(packet_type: header.Type) ?PacketClassification {
     return switch (packet_type) {
-        .initial => .initial,
-        .handshake => .handshake,
-        .short => .application,
+        .initial => .{ .level = .initial, .kind = .initial },
+        .zero_rtt => .{ .level = .application, .kind = .zero_rtt },
+        .handshake => .{ .level = .handshake, .kind = .handshake },
+        .short => .{ .level = .application, .kind = .one_rtt },
         else => null,
     };
 }
 
-fn validDestination(self: anytype, id: []const u8, level: types.Level) bool {
+fn validDestination(self: anytype, id: []const u8, kind: frame.PacketKind) bool {
     if (self.acceptsLocalConnectionId(id)) return true;
-    return level == .initial and std.mem.eql(u8, id, self.initialDestinationId());
+    return (kind == .initial or kind == .zero_rtt) and std.mem.eql(u8, id, self.initialDestinationId());
 }
 
-fn dispatchFrames(self: anytype, level: types.Level, destination_sequence: u64, payload: []const u8, now: u64) !bool {
+fn dispatchFrames(self: anytype, level: types.Level, kind: frame.PacketKind, destination_sequence: u64, payload: []const u8, now: u64) !bool {
     var iterator: frame.Iterator = .{ .payload = payload };
     var ack_eliciting = false;
     while (iterator.cursor < payload.len) {
         const frame_start = iterator.cursor;
         const value = (try iterator.next()).?;
+        if (!frame.allowedIn(value, kind)) return error.IllegalFrame;
         switch (value) {
             .padding => {},
             .ping => ack_eliciting = true,
@@ -140,7 +153,7 @@ fn dispatchFrames(self: anytype, level: types.Level, destination_sequence: u64, 
             .stream => |value_stream| {
                 try requireApplication(level);
                 ack_eliciting = true;
-                try self.application.onStream(value_stream);
+                try self.application.onStreamWithEarlyData(value_stream, kind == .zero_rtt);
             },
             .reset_stream => |reset| {
                 try requireApplication(level);

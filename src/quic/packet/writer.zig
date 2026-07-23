@@ -49,6 +49,10 @@ pub fn writeHandshake(buffer: []u8, keys: protection.Keys, options: LongOptions)
     return writeLong(buffer, keys, options, .handshake, 0);
 }
 
+pub fn writeZeroRtt(buffer: []u8, keys: protection.Keys, options: LongOptions) !Packet {
+    return writeLong(buffer, keys, options, .zero_rtt, 0);
+}
+
 pub fn writeOneRtt(buffer: []u8, keys: protection.Keys, options: OneRttOptions) !Packet {
     return writeShort(buffer, keys, options);
 }
@@ -58,7 +62,7 @@ pub fn writeOneRtt(buffer: []u8, keys: protection.Keys, options: OneRttOptions) 
 pub const Cursor = struct {
     buffer: []u8,
     offset: usize = 0,
-    stage: enum { empty, initial, handshake, one_rtt } = .empty,
+    stage: enum { empty, initial, zero_rtt, handshake, one_rtt } = .empty,
 
     pub fn init(buffer: []u8) Cursor {
         return .{ .buffer = buffer };
@@ -81,6 +85,14 @@ pub const Cursor = struct {
         const result = try writeLong(self.buffer[self.offset..], keys, options, .handshake, self.offset);
         self.offset += result.packet.len;
         self.stage = .handshake;
+        return result;
+    }
+
+    pub fn zeroRtt(self: *Cursor, keys: protection.Keys, options: LongOptions) !Packet {
+        if (self.stage != .empty and self.stage != .initial) return error.InvalidCoalescedPacketOrder;
+        const result = try writeLong(self.buffer[self.offset..], keys, options, .zero_rtt, self.offset);
+        self.offset += result.packet.len;
+        self.stage = .zero_rtt;
         return result;
     }
 
@@ -117,7 +129,7 @@ fn writeLongPadded(
     minimum_datagram_size: ?usize,
     initial_token: []const u8,
 ) !Packet {
-    if (packet_type != .initial and packet_type != .handshake) return error.InvalidPacketType;
+    if (packet_type != .initial and packet_type != .zero_rtt and packet_type != .handshake) return error.InvalidPacketType;
     try validateConnectionId(options.destination_id);
     try validateConnectionId(options.source_id);
 
@@ -145,6 +157,7 @@ fn writeLongPadded(
     var cursor: usize = 0;
     const type_bits: u8 = switch (packet_type) {
         .initial => 0xc0,
+        .zero_rtt => 0xd0,
         .handshake => 0xe0,
         else => unreachable,
     };

@@ -80,6 +80,7 @@ pub fn Application(
             occupied: bool = false,
             id: stream.Id = .{ .value = 0 },
             accepted: bool = false,
+            received_early_data: bool = false,
             receiver: ?stream.Receiver = null,
             receive_flow: ?stream.ReceiveStreamFlow = null,
             sender: ?stream.Sender = null,
@@ -236,6 +237,11 @@ pub fn Application(
             return receiver.readable();
         }
 
+        pub fn receivedEarlyData(self: *Self, id: stream.Id) !bool {
+            const slot = self.find(id) orelse return error.StreamNotFound;
+            return slot.received_early_data;
+        }
+
         pub fn consume(self: *Self, id: stream.Id, amount: usize) !void {
             const slot = self.find(id) orelse return error.StreamNotFound;
             var receiver = &(slot.receiver orelse return error.StreamNotReceivable);
@@ -309,15 +315,21 @@ pub fn Application(
         }
 
         pub fn onStream(self: *Self, value: frame.Stream) !void {
+            return self.onStreamWithEarlyData(value, false);
+        }
+
+        pub fn onStreamWithEarlyData(self: *Self, value: frame.Stream, early_data: bool) !void {
             try self.requireParameters();
             const id = try stream.Id.init(value.id);
             if (!id.canReceive(.server)) return error.StreamStateError;
             if (self.find(id)) |slot| {
+                slot.received_early_data = slot.received_early_data or early_data;
                 try self.receiveInto(slot, value);
                 return;
             }
             if (self.findClosedReceive(id)) |closed| return validateClosedStream(closed, value);
             const slot = try self.incoming(id);
+            slot.received_early_data = early_data;
             try self.receiveInto(slot, value);
         }
 

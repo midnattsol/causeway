@@ -123,3 +123,33 @@ pub const Frame = union(enum) {
     /// DATAGRAM_LEN (type 0x31): carries an explicit payload length.
     datagram_len: []const u8,
 };
+
+/// RFC 9000 Table 3 packet-type legality, extended for negotiated frame types.
+pub fn allowedIn(value: Frame, kind: PacketKind) bool {
+    return switch (value) {
+        .padding, .ping => true,
+        .ack, .crypto => kind != .zero_rtt,
+        .new_token, .handshake_done, .path_challenge, .path_response => kind == .one_rtt,
+        .reset_stream,
+        .reset_stream_at,
+        .stop_sending,
+        .stream,
+        .max_data,
+        .max_stream_data,
+        .max_streams_bidi,
+        .max_streams_uni,
+        .data_blocked,
+        .stream_data_blocked,
+        .streams_blocked_bidi,
+        .streams_blocked_uni,
+        .new_connection_id,
+        .retire_connection_id,
+        .datagram,
+        .datagram_len,
+        => kind == .zero_rtt or kind == .one_rtt,
+        .connection_close => |close| if (close.frame_type == null)
+            kind == .zero_rtt or kind == .one_rtt
+        else
+            true,
+    };
+}

@@ -174,6 +174,7 @@ pub fn Connection(comptime limits: Limits) type {
         initial_remote: ?protection.Keys,
         handshake_local: ?protection.Keys = null,
         handshake_remote: ?protection.Keys = null,
+        zero_rtt_remote: ?protection.Keys = null,
         application_local: ?protection.Keys = null,
         application_remote: ?protection.Keys = null,
         application_send_keys: ?packet_keys.ApplicationKeys = null,
@@ -299,6 +300,7 @@ pub fn Connection(comptime limits: Limits) type {
             clearPacketKeys(&self.initial_remote);
             clearPacketKeys(&self.handshake_local);
             clearPacketKeys(&self.handshake_remote);
+            clearPacketKeys(&self.zero_rtt_remote);
             clearPacketKeys(&self.application_local);
             clearPacketKeys(&self.application_remote);
             clearApplicationKeys(&self.application_send_keys);
@@ -492,6 +494,9 @@ pub fn Connection(comptime limits: Limits) type {
         pub fn streamReadable(self: *Self, id: Self.StreamId) ![]const u8 {
             return self.application.readable(id);
         }
+        pub fn streamReceivedEarlyData(self: *Self, id: Self.StreamId) !bool {
+            return self.application.receivedEarlyData(id);
+        }
         pub fn consumeStream(self: *Self, id: Self.StreamId, amount: usize) !void {
             return self.application.consume(id, amount);
         }
@@ -628,6 +633,10 @@ pub fn Connection(comptime limits: Limits) type {
             };
         }
         pub fn installTlsKeys(self: *Self) !void {
+            if (self.tls.takeEarlyReceiveKeys()) |transferred| {
+                clearPacketKeys(&self.zero_rtt_remote);
+                self.zero_rtt_remote = transferred;
+            }
             if (self.tls.takeHandshakeKeys()) |transferred| {
                 var keys = transferred;
                 defer std.crypto.secureZero(u8, std.mem.asBytes(&keys));
@@ -839,6 +848,7 @@ fn populateAllConnectionKeys(connection: anytype) !void {
     connection.initial_remote = aes;
     connection.handshake_local = aes;
     connection.handshake_remote = aes;
+    connection.zero_rtt_remote = aes;
     connection.application_local = aes;
     connection.application_remote = aes;
     var send = try packet_keys.ApplicationKeys.init(@splat(0x61), .AES_128_GCM_SHA256);
@@ -856,6 +866,7 @@ fn expectAllConnectionKeysCleared(connection: anytype) !void {
     try std.testing.expect(connection.initial_remote == null);
     try std.testing.expect(connection.handshake_local == null);
     try std.testing.expect(connection.handshake_remote == null);
+    try std.testing.expect(connection.zero_rtt_remote == null);
     try std.testing.expect(connection.application_local == null);
     try std.testing.expect(connection.application_remote == null);
     try std.testing.expect(connection.application_send_keys == null);
@@ -1538,6 +1549,73 @@ test "application stream frames round trip through protected packets" {
         };
     }
     try std.testing.expect(found_response);
+}
+
+test "zero RTT streams share application packet space and retain provenance" {
+    const packet_writer = @import("../packet/writer.zig");
+    const frame = @import("../frame/root.zig");
+    const limits: Limits = .{
+        .crypto_receive_bytes = 64,
+        .crypto_send_bytes = 64,
+        .tls_output_bytes = 128,
+        .max_streams = 2,
+        .stream_receive_bytes = 64,
+        .stream_send_bytes = 64,
+    };
+    var storage: Storage(limits) = .{};
+    var transcript: [512]u8 = undefined;
+    const credentials = testCredentials();
+    var connection = try Connection(limits).init(&storage, testInit(&credentials, &transcript));
+    defer connection.deinit();
+    const keys: protection.Keys = .{ .aes_128_gcm = .{
+        .key = @splat(0x31),
+        .iv = @splat(0x42),
+        .hp = @splat(0x53),
+    } };
+    connection.zero_rtt_remote = keys;
+    connection.application_remote = keys;
+    try connection.application.applyTransportParameters(.{
+        .initial_max_data = 64,
+        .initial_max_stream_data_bidi_remote = 64,
+        .initial_max_streams_bidi = 1,
+    }, .{
+        .initial_max_data = 64,
+        .initial_max_stream_data_bidi_local = 64,
+        .initial_max_streams_bidi = 1,
+    });
+
+    var frame_storage: [64]u8 = undefined;
+    const stream_frame = try frame.writer.encode(&frame_storage, .{ .stream = .{
+        .id = 0,
+        .offset = 0,
+        .data = "early request",
+        .fin = true,
+    } });
+    var packet_storage: [160]u8 = undefined;
+    const early_packet = try packet_writer.writeZeroRtt(&packet_storage, keys, .{
+        .destination_id = "original",
+        .source_id = "client",
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = stream_frame,
+    });
+    try connection.receiveDatagram(early_packet.packet, 1);
+    const accepted = connection.acceptStream().?;
+    try std.testing.expectEqualStrings("early request", try connection.streamReadable(accepted));
+    try std.testing.expect(try connection.streamReceivedEarlyData(accepted));
+    try std.testing.expectEqual(@as(?u64, 0), connection.space(.application).received.largest());
+    try std.testing.expect(connection.ack_pending[@intFromEnum(Level.application)]);
+
+    const one_rtt = try packet_writer.writeOneRtt(&packet_storage, keys, .{
+        .destination_id = "server",
+        .packet_number = 1,
+        .packet_number_length = 2,
+        .payload = "\x01\x00\x00\x00",
+        .key_phase = false,
+    });
+    try connection.receiveDatagram(one_rtt.packet, 2);
+    try std.testing.expect(connection.zero_rtt_remote == null);
+    try std.testing.expectEqual(@as(?u64, 1), connection.space(.application).received.largest());
 }
 
 test "protected RESET_STREAM_AT is negotiated and enforces normative transport errors" {
