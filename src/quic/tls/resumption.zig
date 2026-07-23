@@ -23,6 +23,22 @@ pub const TicketIssuanceMaterial = struct {
     nonce: [8]u8,
 };
 
+/// Single-owner replay admission invoked only after ticket and binder validation.
+pub const ReplayService = struct {
+    context: *anyopaque,
+    consume_fn: *const fn (*anyopaque, []const u8, u64, u64, u64) anyerror!bool,
+
+    pub fn consume(self: ReplayService, identity: []const u8, issued_at: u64, expires_at: u64, now: u64) !bool {
+        return self.consume_fn(self.context, identity, issued_at, expires_at, now);
+    }
+};
+
+pub const EarlyDataPolicy = struct {
+    replay_service: ReplayService,
+    /// Maximum absolute difference between client and server ticket ages.
+    max_age_skew_ms: u32 = 10_000,
+};
+
 /// Type-erased mutable ticket service. One endpoint owner may use it across that
 /// endpoint's connections. It must not be shared with another endpoint, thread,
 /// or independent owner. `claimExclusiveOwner` enforces cooperative endpoint

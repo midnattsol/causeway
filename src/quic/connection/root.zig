@@ -324,8 +324,8 @@ pub fn Connection(comptime limits: Limits) type {
         }
 
         /// Emits at most one TLS 1.3 NewSessionTicket after authenticated Finished.
-        /// The authenticated application state is copied into the stateless ticket;
-        /// no remembered QUIC state is installed on a resumed connection.
+        /// The stateless ticket authenticates application state and the reusable
+        /// subset of local transport policy; live connection state is never restored.
         pub fn issueSessionTicket(self: *Self, application_state: []const u8) !void {
             if (self.state != .active or self.tls.state != .connected) return error.HandshakeNotComplete;
             const service = self.tls.ticket_service orelse return error.SessionTicketsDisabled;
@@ -333,15 +333,16 @@ pub fn Connection(comptime limits: Limits) type {
             if (self.ticket_issue_attempted) return error.SessionTicketAlreadyIssued;
             if (application_state.len > limits.max_ticket_state_bytes) return error.TicketStateTooLarge;
 
-            const peer_bytes = self.tls.peerTransportParameters() orelse return error.TransportParametersUnavailable;
-            const peer = try quic_transport_parameters.parse(peer_bytes, .client);
+            const local = try quic_transport_parameters.parse(self.tls.local_transport_parameters, .server);
             var normalized_storage: [session_ticket.maximum_quic_parameters_length]u8 = undefined;
-            const normalized = try quic_transport_parameters.encode(&normalized_storage, peer, .client);
+            const normalized = try quic_transport_parameters.encodeRemembered(&normalized_storage, local);
+            const early_data = self.tls.early_data_policy != null;
             var psk = try self.tls.deriveTicketPsk(&issuance.nonce);
             defer std.crypto.secureZero(u8, &psk);
             const plaintext: session_ticket.Plaintext = .{
                 .lifetime = self.tls.ticket_lifetime,
                 .age_add = issuance.age_add,
+                .early_data = early_data,
                 .cipher_suite = self.tls.negotiatedSuite() orelse return error.CipherSuiteUnavailable,
                 .psk = &psk,
                 .alpn = self.tls.negotiatedAlpn() orelse return error.AlpnUnavailable,
@@ -351,19 +352,20 @@ pub fn Connection(comptime limits: Limits) type {
             };
             const ticket_length = try service.sealedLength(&plaintext);
             if (ticket_length == 0 or ticket_length > limits.max_ticket_bytes) return error.TicketTooLarge;
-            const nst_length = 4 + 4 + 4 + 1 + issuance.nonce.len + 2 + ticket_length + 2;
+            const nst_length = 4 + 4 + 4 + 1 + issuance.nonce.len + 2 + ticket_length + 2 + if (early_data) @as(usize, 8) else 0;
             if (self.crypto.application.sender.writableLen() < nst_length) return error.SendBufferFull;
 
             var ticket_storage: [session_ticket.maximum_ticket_length]u8 = undefined;
             defer std.crypto.secureZero(u8, &ticket_storage);
             const ticket = try service.seal(ticket_storage[0..ticket_length], &plaintext);
             if (ticket.len != ticket_length) return error.TicketServiceLengthMismatch;
-            var nst_storage: [4 + 4 + 4 + 1 + 8 + 2 + session_ticket.maximum_ticket_length + 2]u8 = undefined;
+            var nst_storage: [4 + 4 + 4 + 1 + 8 + 2 + session_ticket.maximum_ticket_length + 2 + 8]u8 = undefined;
             const nst = nst_encoder.encodeNewSessionTicket(&nst_storage, .{
                 .ticket_lifetime = self.tls.ticket_lifetime,
                 .ticket_age_add = issuance.age_add,
                 .ticket_nonce = &issuance.nonce,
                 .ticket = ticket,
+                .max_early_data_size = if (early_data) std.math.maxInt(u32) else null,
             }) catch unreachable;
             std.debug.assert(nst.len == nst_length);
             const written = self.crypto.application.sender.write(nst) catch unreachable;
@@ -1050,7 +1052,7 @@ test "connection emits one bounded NST into application CRYPTO after Finished" {
     var contents = try controller.open(nst[23..][0..ticket_length]);
     defer contents.deinit();
     try std.testing.expectEqualStrings("h3", contents.alpn());
-    try std.testing.expectEqualStrings("\x0f\x06client", contents.quicTransportParameters());
+    try std.testing.expectEqualStrings("\x04\x02\x40\x40", contents.quicTransportParameters());
     try std.testing.expectEqualStrings("endpoint-a", contents.contextData());
     try std.testing.expectEqualStrings("snapshot", contents.applicationData());
 

@@ -19,6 +19,7 @@ const hash_length = 32;
 pub const ServerCredentials = credentials_module.ServerCredentials;
 pub const TicketService = resumption.TicketService;
 pub const TicketIssuanceMaterial = resumption.TicketIssuanceMaterial;
+pub const EarlyDataPolicy = resumption.EarlyDataPolicy;
 pub const ResumptionLimits = resumption.Limits;
 pub const ResumptionInfo = resumption.Info;
 pub const ResumptionFallbackReason = resumption.FallbackReason;
@@ -115,6 +116,7 @@ pub const Config = struct {
     resumption_limits: resumption.Limits = .{},
     ticket_lifetime: u32 = 24 * 60 * 60,
     ticket_issuance: ?resumption.TicketIssuanceMaterial = null,
+    early_data: ?resumption.EarlyDataPolicy = null,
 };
 
 pub const Outputs = struct {
@@ -135,6 +137,8 @@ pub const ApplicationTrafficSecrets = struct {
     cipher_suite: tls.CipherSuite,
 };
 
+pub const EarlyDataState = enum { not_offered, rejected, accepted };
+
 pub const Server = struct {
     state: State = .expect_client_hello,
     credentials: *const ServerCredentials,
@@ -146,6 +150,7 @@ pub const Server = struct {
     resumption_limits: resumption.Limits,
     ticket_lifetime: u32,
     ticket_issuance: ?resumption.TicketIssuanceMaterial,
+    early_data_policy: ?resumption.EarlyDataPolicy,
     transcript: []u8,
     transcript_length: usize = 0,
 
@@ -154,6 +159,8 @@ pub const Server = struct {
     peer_parameters: ?[]const u8 = null,
     handshake_keys_value: ?KeyPair = null,
     application_secrets_value: ?ApplicationTrafficSecrets = null,
+    early_receive_keys_value: ?packet_keys.PacketKeys = null,
+    early_data_state: EarlyDataState = .not_offered,
     exporter_master_secret: ?key_schedule.Secret = null,
     pending_master_secret: ?key_schedule.Secret = null,
     resumption_master_secret: ?key_schedule.Secret = null,
@@ -172,6 +179,7 @@ pub const Server = struct {
             .resumption_limits = config.resumption_limits,
             .ticket_lifetime = config.ticket_lifetime,
             .ticket_issuance = config.ticket_issuance,
+            .early_data_policy = config.early_data,
             .transcript = config.transcript_scratch,
         };
     }
@@ -225,6 +233,16 @@ pub const Server = struct {
         std.crypto.secureZero(u8, &self.application_secrets_value.?.client);
         self.application_secrets_value = null;
         return result;
+    }
+    /// Transfers ownership of accepted client 0-RTT packet keys once.
+    pub fn takeEarlyReceiveKeys(self: *Server) ?packet_keys.PacketKeys {
+        const result = self.early_receive_keys_value orelse return null;
+        self.early_receive_keys_value.?.clear();
+        self.early_receive_keys_value = null;
+        return result;
+    }
+    pub fn earlyDataState(self: *const Server) EarlyDataState {
+        return self.early_data_state;
     }
 
     /// Derives a per-ticket PSK while retaining the resumption master secret.
@@ -280,6 +298,21 @@ pub const Server = struct {
         } else {
             _ = try negotiation.negotiateCertificateAuthentication(hello, &.{self.credentials.signatureScheme()});
         }
+        const accept_early_data = self.acceptEarlyData(
+            hello,
+            if (psk_selection.selected) |*selected| selected else null,
+        ) catch false;
+        self.early_data_state = if (!hello.early_data) .not_offered else if (accept_early_data) .accepted else .rejected;
+        if (accept_early_data) {
+            const selected = &psk_selection.selected.?;
+            var secret = key_schedule.deriveClientEarlyTrafficSecret(&selected.contents.psk, key_schedule.transcriptHash(message));
+            defer std.crypto.secureZero(u8, &secret);
+            self.early_receive_keys_value = try packet_keys.derive(secret, negotiated.cipher_suite);
+            errdefer {
+                self.early_receive_keys_value.?.clear();
+                self.early_receive_keys_value = null;
+            }
+        }
         const peer_parameters_offset: usize = @intCast(@intFromPtr(negotiated.transport_parameters.ptr) - @intFromPtr(message.ptr));
         const key_pair = try self.x25519.keyPair();
         var shared = X25519.scalarmult(key_pair.secret_key, negotiated.key_share.*) catch return error.InvalidKeyShare;
@@ -316,7 +349,7 @@ pub const Server = struct {
             .local = try packet_keys.derive(hs.server_handshake_traffic_secret, negotiated.cipher_suite),
             .remote = try packet_keys.derive(hs.client_handshake_traffic_secret, negotiated.cipher_suite),
         };
-        const handshake_flight = try self.createHandshakeFlight(handshake_out, hs.server_finished_key, selected_psk);
+        const handshake_flight = try self.createHandshakeFlight(handshake_out, hs.server_finished_key, selected_psk, accept_early_data);
         var app = key_schedule.deriveApplication(hs.handshake_secret, key_schedule.transcriptHash(self.transcriptBytes()));
         defer std.crypto.secureZero(u8, std.mem.asBytes(&app));
 
@@ -351,12 +384,15 @@ pub const Server = struct {
         return .{ .initial = server_hello, .handshake = handshake_flight };
     }
 
-    fn createHandshakeFlight(self: *Server, out: []u8, server_finished_key: [32]u8, resumed_handshake: bool) ![]u8 {
+    fn createHandshakeFlight(self: *Server, out: []u8, server_finished_key: [32]u8, resumed_handshake: bool, accept_early_data: bool) ![]u8 {
         const start_transcript = self.transcript_length;
         var cursor: usize = 0;
         errdefer self.transcript_length = start_transcript;
 
-        const ee = encoder.encodeEncryptedExtensions(out[cursor..], .{ .transport_parameters = self.local_transport_parameters }) catch |err| return mapBufferError(err);
+        const ee = encoder.encodeEncryptedExtensions(out[cursor..], .{
+            .transport_parameters = self.local_transport_parameters,
+            .accept_early_data = accept_early_data,
+        }) catch |err| return mapBufferError(err);
         cursor += ee.len;
         try self.appendTranscript(ee);
         if (!resumed_handshake) {
@@ -415,6 +451,8 @@ pub const Server = struct {
 
     const SelectedPsk = struct {
         index: u16,
+        obfuscated_ticket_age: u32,
+        identity: []const u8,
         contents: session_ticket.Contents,
     };
 
@@ -458,22 +496,11 @@ pub const Server = struct {
                 fallback = .unknown_ticket;
                 continue;
             }
-            var normalized_storage: [session_ticket.maximum_quic_parameters_length]u8 = undefined;
-            const remembered = transport_parameters.parse(contents.quicTransportParameters(), .client) catch {
+            _ = transport_parameters.parseRemembered(contents.quicTransportParameters()) catch {
                 contents.deinit();
                 fallback = .unknown_ticket;
                 continue;
             };
-            const normalized = transport_parameters.encode(&normalized_storage, remembered, .client) catch {
-                contents.deinit();
-                fallback = .unknown_ticket;
-                continue;
-            };
-            if (!std.mem.eql(u8, normalized, contents.quicTransportParameters())) {
-                contents.deinit();
-                fallback = .unknown_ticket;
-                continue;
-            }
             if (!std.mem.eql(u8, contents.alpn(), negotiated_alpn)) {
                 contents.deinit();
                 fallback = .alpn_mismatch;
@@ -489,9 +516,40 @@ pub const Server = struct {
                 self.clearSecrets();
                 return error.BadBinder;
             }
-            return .{ .selected = .{ .index = @intCast(index), .contents = contents }, .fallback = fallback };
+            return .{ .selected = .{
+                .index = @intCast(index),
+                .obfuscated_ticket_age = identity.obfuscated_ticket_age,
+                .identity = identity.identity,
+                .contents = contents,
+            }, .fallback = fallback };
         }
         return .{ .fallback = fallback };
+    }
+
+    fn acceptEarlyData(self: *Server, hello: wire.ClientHello, selected_optional: ?*const SelectedPsk) !bool {
+        if (!hello.early_data) return false;
+        const selected = selected_optional orelse return false;
+        if (selected.index != 0 or !selected.contents.early_data) return false;
+        const policy = self.early_data_policy orelse return false;
+
+        const client_age = selected.obfuscated_ticket_age -% selected.contents.age_add;
+        const age_seconds = selected.contents.opened_at - selected.contents.issued_at;
+        const server_age = std.math.mul(u64, age_seconds, 1000) catch return false;
+        if (server_age > std.math.maxInt(u32)) return false;
+        const client_age_ms: u64 = client_age;
+        const age_difference = if (client_age_ms > server_age) client_age_ms - server_age else server_age - client_age_ms;
+        if (age_difference > policy.max_age_skew_ms) return false;
+
+        const remembered = transport_parameters.parseRemembered(selected.contents.quicTransportParameters()) catch return false;
+        const current = transport_parameters.parse(self.local_transport_parameters, .server) catch return false;
+        if (!transport_parameters.permitsRememberedEarlyData(current, remembered)) return false;
+        const expires_at = std.math.add(u64, selected.contents.issued_at, selected.contents.lifetime) catch return false;
+        return policy.replay_service.consume(
+            selected.identity,
+            selected.contents.issued_at,
+            expires_at,
+            selected.contents.opened_at,
+        );
     }
 
     fn clearSecrets(self: *Server) void {
@@ -503,6 +561,10 @@ pub const Server = struct {
             std.crypto.secureZero(u8, &secrets.server);
             std.crypto.secureZero(u8, &secrets.client);
             self.application_secrets_value = null;
+        }
+        if (self.early_receive_keys_value) |*keys| {
+            keys.clear();
+            self.early_receive_keys_value = null;
         }
         if (self.exporter_master_secret) |*secret| {
             std.crypto.secureZero(u8, secret);
@@ -533,7 +595,7 @@ pub const Server = struct {
 
 fn resumedFlightUpperBound(parameters: []const u8) !usize {
     // EncryptedExtensions framing/fixed extensions + parameters, Finished.
-    return std.math.add(usize, 26 + parameters.len, 36) catch error.OutputBufferTooSmall;
+    return std.math.add(usize, 30 + parameters.len, 36) catch error.OutputBufferTooSmall;
 }
 
 fn handshakeFlightUpperBound(chain: []const []const u8, parameters: []const u8) !usize {
@@ -729,6 +791,22 @@ const ServerTestEntropy = struct {
     }
 };
 
+const ServerTestReplay = struct {
+    consumed: bool = false,
+
+    fn consume(context: *anyopaque, _: []const u8, issued_at: u64, expires_at: u64, now: u64) anyerror!bool {
+        const self: *ServerTestReplay = @ptrCast(@alignCast(context));
+        try std.testing.expect(issued_at <= now and now <= expires_at);
+        if (self.consumed) return false;
+        self.consumed = true;
+        return true;
+    }
+
+    fn policy(self: *ServerTestReplay) EarlyDataPolicy {
+        return .{ .replay_service = .{ .context = self, .consume_fn = consume } };
+    }
+};
+
 fn fixtureServerWithResumption(
     transcript: []u8,
     credentials: *const ServerCredentials,
@@ -821,7 +899,7 @@ test "deterministic resumed PSK-DHE handshake omits certificate rejects early da
         .cipher_suite = .AES_128_GCM_SHA256,
         .psk = &psk,
         .alpn = "h3",
-        .quic_transport_parameters = "\x0f\x00",
+        .quic_transport_parameters = "",
         .context = "endpoint-a",
         .application = "snapshot",
     };
@@ -869,6 +947,98 @@ test "deterministic resumed PSK-DHE handshake omits certificate rejects early da
     try std.testing.expect(!std.mem.eql(u8, &exported, &@as([32]u8, @splat(0))));
 }
 
+test "resumed handshake accepts eligible early data once" {
+    const client_key = try X25519.KeyPair.generateDeterministic(@splat(0x11));
+    var now: ServerTestClock = .{ .seconds = 100 };
+    var random: ServerTestEntropy = .{};
+    var replay: ServerTestReplay = .{};
+    var controller = try session_ticket.Controller(1).init(now.clock(), random.entropy(), "service-a");
+    defer controller.deinit();
+    const ticket_key: session_ticket.Key = .{
+        .id = 7,
+        .secret = @splat(0x31),
+        .seal_from = 0,
+        .seal_until = 200,
+        .accept_until = 300,
+    };
+    try controller.addKey(&ticket_key);
+
+    const server_parameters: transport_parameters.Values = .{
+        .original_destination_connection_id = "odcid",
+        .initial_source_connection_id = "scid",
+        .initial_max_data = 1024,
+        .initial_max_stream_data_bidi_remote = 512,
+        .initial_max_streams_bidi = 4,
+    };
+    var remembered_storage: [512]u8 = undefined;
+    const remembered = try transport_parameters.encodeRemembered(&remembered_storage, server_parameters);
+    const psk: [32]u8 = @splat(0x42);
+    const plaintext: session_ticket.Plaintext = .{
+        .lifetime = 120,
+        .age_add = 0,
+        .early_data = true,
+        .cipher_suite = .AES_128_GCM_SHA256,
+        .psk = &psk,
+        .alpn = "h3",
+        .quic_transport_parameters = remembered,
+        .context = "endpoint-a",
+    };
+    var ticket_storage: [session_ticket.maximum_ticket_length]u8 = undefined;
+    const ticket = try controller.seal(&ticket_storage, &plaintext);
+    var hello_storage: [2048]u8 = undefined;
+    const hello = try makePskClientHello(&hello_storage, client_key.public_key, ticket, &psk, @intFromEnum(wire.PskKeyExchangeMode.psk_dhe_ke), false, true);
+    var parameters_storage: [512]u8 = undefined;
+    const parameters = try transport_parameters.encode(&parameters_storage, server_parameters, .server);
+    const credentials = testCredentials();
+
+    var transcript: [4096]u8 = undefined;
+    var server = Server.init(.{
+        .credentials = &credentials,
+        .server_random = @splat(0x53),
+        .x25519 = .{ .seed = @splat(0x22) },
+        .transport_parameters = parameters,
+        .transcript_scratch = &transcript,
+        .ticket_service = TicketService.fromController(&controller),
+        .resumption_context = "endpoint-a",
+        .early_data = replay.policy(),
+    });
+    defer server.deinit();
+    var initial: [256]u8 = undefined;
+    var handshake: [1024]u8 = undefined;
+    const flights = try server.receive(.initial, hello, &initial, &handshake);
+    try std.testing.expectEqual(EarlyDataState.accepted, server.earlyDataState());
+    var early_keys = server.takeEarlyReceiveKeys().?;
+    early_keys.clear();
+    try std.testing.expect(server.takeEarlyReceiveKeys() == null);
+
+    const ee_length = 4 + (@as(usize, flights.handshake[1]) << 16) + (@as(usize, flights.handshake[2]) << 8) + flights.handshake[3];
+    const ee = try wire.parseHandshake(flights.handshake[0..ee_length]);
+    var found_early_data = false;
+    var extensions = wire.ExtensionIterator{ .bytes = ee.body[2..] };
+    while (extensions.next()) |extension| if (extension.extension_type == .early_data) {
+        try std.testing.expectEqual(@as(usize, 0), extension.data.len);
+        found_early_data = true;
+    };
+    try std.testing.expect(found_early_data);
+
+    var replay_transcript: [4096]u8 = undefined;
+    var replayed = Server.init(.{
+        .credentials = &credentials,
+        .server_random = @splat(0x54),
+        .x25519 = .{ .seed = @splat(0x23) },
+        .transport_parameters = parameters,
+        .transcript_scratch = &replay_transcript,
+        .ticket_service = TicketService.fromController(&controller),
+        .resumption_context = "endpoint-a",
+        .early_data = replay.policy(),
+    });
+    defer replayed.deinit();
+    _ = try replayed.receive(.initial, hello, &initial, &handshake);
+    try std.testing.expect(replayed.resumed());
+    try std.testing.expectEqual(EarlyDataState.rejected, replayed.earlyDataState());
+    try std.testing.expect(replayed.takeEarlyReceiveKeys() == null);
+}
+
 fn expectPskFallback(
     controller: anytype,
     ticket: []const u8,
@@ -905,7 +1075,7 @@ test "PSK selection fallback reasons and psk_ke-only behavior preserve full hand
     try controller.addKey(&ticket_key);
     const psk: [32]u8 = @splat(0x42);
     var ticket_storage: [3][session_ticket.maximum_ticket_length]u8 = undefined;
-    var plaintext: session_ticket.Plaintext = .{ .lifetime = 120, .age_add = 1, .cipher_suite = .AES_128_GCM_SHA256, .psk = &psk, .alpn = "h3", .quic_transport_parameters = "\x0f\x00", .context = "endpoint-a", .application = "snapshot" };
+    var plaintext: session_ticket.Plaintext = .{ .lifetime = 120, .age_add = 1, .cipher_suite = .AES_128_GCM_SHA256, .psk = &psk, .alpn = "h3", .quic_transport_parameters = "", .context = "endpoint-a", .application = "snapshot" };
     const valid = try controller.seal(&ticket_storage[0], &plaintext);
     plaintext.alpn = "h2";
     const wrong_alpn = try controller.seal(&ticket_storage[1], &plaintext);
@@ -1000,7 +1170,7 @@ test "recognized ticket with bad binder is fatal BadBinder" {
     const ticket_key: session_ticket.Key = .{ .id = 7, .secret = @splat(0x31), .seal_from = 0, .seal_until = 200, .accept_until = 300 };
     try controller.addKey(&ticket_key);
     const psk: [32]u8 = @splat(0x42);
-    const plaintext: session_ticket.Plaintext = .{ .lifetime = 120, .age_add = 1, .cipher_suite = .AES_128_GCM_SHA256, .psk = &psk, .alpn = "h3", .quic_transport_parameters = "\x0f\x00", .context = "endpoint-a", .application = "snapshot" };
+    const plaintext: session_ticket.Plaintext = .{ .lifetime = 120, .age_add = 1, .cipher_suite = .AES_128_GCM_SHA256, .psk = &psk, .alpn = "h3", .quic_transport_parameters = "", .context = "endpoint-a", .application = "snapshot" };
     var ticket_storage: [session_ticket.maximum_ticket_length]u8 = undefined;
     const ticket = try controller.seal(&ticket_storage, &plaintext);
     var hello_storage: [2048]u8 = undefined;

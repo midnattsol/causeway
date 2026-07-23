@@ -83,6 +83,7 @@ pub const Plaintext = struct {
 /// payload copies as soon as resumption selection finishes.
 pub const Contents = struct {
     issued_at: u64,
+    opened_at: u64,
     lifetime: u32,
     age_add: u32,
     early_data: bool,
@@ -305,6 +306,7 @@ pub fn Controller(comptime capacity: usize) type {
             ) catch return self.reject(error.InvalidTicket);
 
             var result = parsePlaintext(plaintext[0..ciphertext_length]) catch |err| return self.reject(err);
+            result.opened_at = now;
             if (result.lifetime == 0 or result.issued_at > now or now - result.issued_at > result.lifetime) {
                 result.deinit();
                 self.stats.expired += 1;
@@ -387,6 +389,7 @@ fn parsePlaintext(bytes: []const u8) !Contents {
     if (early_data > 1) return error.InvalidEarlyDataFlag;
     var result: Contents = .{
         .issued_at = issued_at,
+        .opened_at = 0,
         .lifetime = lifetime,
         .age_add = age_add,
         .early_data = early_data == 1,
