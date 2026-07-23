@@ -281,7 +281,7 @@ pub fn EndpointWithFeatures(
                 else
                     .not_ect;
                 const invariant = header.parse(message.data, self.policy.connection_id_length) catch continue;
-                if (self.find(invariant.destination_id)) |slot| {
+                if (self.findIncoming(invariant.destination_id, message.from)) |slot| {
                     const known_path = if (features.ecn) slot.paths.find(message.from) != null else false;
                     var challenge: [8]u8 = undefined;
                     self.fillEntropy(io, &challenge);
@@ -535,6 +535,17 @@ pub fn EndpointWithFeatures(
         fn find(self: *Self, destination_id: []const u8) ?*Slot {
             for (&self.slots) |*slot| {
                 if (slot.occupied and slot.connection.acceptsLocalConnectionId(destination_id)) return slot;
+            }
+            return null;
+        }
+
+        fn findIncoming(self: *Self, destination_id: []const u8, peer: net.IpAddress) ?*Slot {
+            for (&self.slots) |*slot| {
+                if (!slot.occupied) continue;
+                if (slot.connection.acceptsLocalConnectionId(destination_id)) return slot;
+                if (slot.connection.state == .handshaking and
+                    std.mem.eql(u8, destination_id, slot.connection.initialDestinationId()) and
+                    net.IpAddress.eql(slot.paths.address(0), &peer)) return slot;
             }
             return null;
         }
@@ -971,6 +982,56 @@ test "endpoint bounds its pool, demuxes by server CID, enforces peer, and reaps"
     try std.testing.expectEqual(@as(usize, 0), endpoint.activeCount());
 }
 
+test "endpoint demuxes a fragmented Initial flight by its original destination CID" {
+    const crypto_initial = @import("../crypto/initial.zig");
+    const protection = @import("../packet/protection.zig");
+    const packet_writer = @import("../packet/writer.zig");
+    const limits: connection.Limits = .{
+        .crypto_receive_bytes = 64,
+        .crypto_send_bytes = 64,
+        .tls_output_bytes = 128,
+        .max_datagram_size = 1200,
+    };
+    const E = Endpoint(limits, 2, 2);
+    const credentials = testCredentials();
+    var endpoint: E = undefined;
+    try endpoint.init(undefined, .{
+        .credentials = &credentials,
+        .transport_parameters = .{},
+        .connection_id_length = 8,
+        .entropy = .{ .context = null, .fillFn = deterministicEntropy },
+    });
+
+    const peer: net.IpAddress = .{ .ip4 = .loopback(4433) };
+    const keys: protection.Keys = .{ .aes_128_gcm = crypto_initial.derive("original").client.keys };
+    var first_storage: [1200]u8 = undefined;
+    const first = try packet_writer.writeInitial(&first_storage, keys, .{
+        .destination_id = "original",
+        .source_id = "client",
+        .packet_number = 0,
+        .packet_number_length = 2,
+        .payload = "\x01",
+        .minimum_datagram_size = 1200,
+    });
+    var second_storage: [1200]u8 = undefined;
+    const second = try packet_writer.writeInitial(&second_storage, keys, .{
+        .destination_id = "original",
+        .source_id = "client",
+        .packet_number = 1,
+        .packet_number_length = 2,
+        .payload = "\x01",
+        .minimum_datagram_size = 1200,
+    });
+    var messages = [_]net.IncomingMessage{ incoming(peer, first.packet), incoming(peer, second.packet) };
+    endpoint.processBatch(std.testing.io, &messages, 1);
+
+    try std.testing.expectEqual(@as(usize, 1), endpoint.activeCount());
+    try std.testing.expectEqual(@as(?u64, 1), endpoint.slots[0].connection.space(.initial).received.largest());
+    try std.testing.expect(endpoint.findIncoming("original", peer) == &endpoint.slots[0]);
+    endpoint.slots[0].connection.state = .active;
+    try std.testing.expect(endpoint.findIncoming("original", peer) == null);
+}
+
 test "Retry admission allocates only after valid token and restores transport parameters" {
     const crypto_initial = @import("../crypto/initial.zig");
     const protection = @import("../packet/protection.zig");
@@ -1048,12 +1109,12 @@ test "Retry admission allocates only after valid token and restores transport pa
     );
     try std.testing.expectEqualSlices(u8, parameters.stateless_reset_token.?, &endpoint.slots[0].connection.cids.local[0].reset_token);
 
-    // Replaying an admitted token does not allocate or replace connection state.
+    // Further Initial packets in the admitted flight bypass token replay checks.
     const generation = endpoint.slots[0].generation;
     endpoint.processBatch(std.testing.io, &second_messages, 21);
     try std.testing.expectEqual(generation, endpoint.slots[0].generation);
     try std.testing.expectEqual(@as(usize, 1), endpoint.activeCount());
-    try std.testing.expectEqual(@as(usize, 1), endpoint.pending_stateless_count);
+    try std.testing.expectEqual(@as(usize, 0), endpoint.pending_stateless_count);
 }
 
 test "invalid Retry token and wrong address never allocate a slot" {
