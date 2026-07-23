@@ -45,6 +45,15 @@ fn stylesheet(_: *const http.context.Context(State)) http.response.Response {
     };
 }
 
+fn earlyHello(context: *const http.context.Context(State)) http.response.Response {
+    context.execution.state.requests += 1;
+    return .{
+        .status = .ok,
+        .headers = .{ .items = &.{.{ .name = "content-type", .value = http.response.ContentType.text }} },
+        .body = .{ .bytes = if (context.early_data == .accepted) "hello from 0-RTT\n" else "hello from 1-RTT\n" },
+    };
+}
+
 const routes = .{
     http.routing.route.route(.GET, "/", hello),
 };
@@ -52,6 +61,7 @@ const routes = .{
 const http3_routes = .{
     http.routing.route.route(.GET, "/", http3Hello),
     http.routing.route.route(.GET, "/assets/app.css", stylesheet),
+    http.routing.route.route(.GET, "/early", earlyHello).withReplaySafe(),
 };
 
 pub const Router = http.routing.router.Router(routes);

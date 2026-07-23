@@ -31,3 +31,5 @@ Thumbs.db
 # Local tool environments
 .direnv/
 IDEA.md
+__pycache__/
+*.py[cod]

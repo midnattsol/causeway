@@ -113,6 +113,18 @@ The built-in replay filter is fixed-capacity and endpoint-local. It rejects dupl
 
 0-RTT and 1-RTT share the QUIC application packet-number space, but Causeway keeps distinct receive keys and validates frame legality before state mutation. ACK, CRYPTO, PATH_RESPONSE, NEW_TOKEN, and other 1-RTT-only frames are rejected in 0-RTT; RFC 9000 permits PATH_CHALLENGE in both 0-RTT and 1-RTT. Stream provenance is conservative: if any bytes for a request arrived in accepted 0-RTT, that request is treated as early. Causeway acknowledges but discards legal 0-RTT QUIC DATAGRAM payloads because HTTP/3 does not admit replayable datagram operations. It does not allocate an endpoint slot from a standalone unknown 0-RTT packet and does not buffer undecryptable early packets received before their Initial/ClientHello.
 
+The development HTTP/3 example enables tickets, endpoint-local anti-replay, NEW_TOKEN, Retry, Server Push, and the replay-safe `/early` route. Its service keys are random and process-local, so restarting it intentionally invalidates outstanding tickets and tokens. External interoperability can be checked with aioquic 1.3.0:
+
+```sh
+python3 -m venv /tmp/causeway-aioquic
+/tmp/causeway-aioquic/bin/pip install -r tools/http3-interop-requirements.txt
+# In another shell:
+/home/midnattsol/.zvm/bin/zig build example-http3
+/tmp/causeway-aioquic/bin/python tools/http3_interop.py
+```
+
+The check requires a real Retry on the first connection, reuses NEW_TOKEN without Retry, receives a pushed stylesheet, performs a PSK-DHE-only resumed connection, sends an accepted replay-safe request in 0-RTT, then replays the same ticket and verifies rejection with a successful 1-RTT fallback.
+
 ## Recovery and congestion control
 
 The bounded RFC 9002 implementation includes:
