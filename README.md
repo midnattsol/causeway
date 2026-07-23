@@ -15,6 +15,19 @@ HTTP/3 is server-side and poll-driven over UDP. It supports bounded streaming re
 
 WebTransport is implemented specifically for `draft-ietf-webtrans-http3-16` and depends on `RESET_STREAM_AT` from `draft-ietf-quic-reliable-stream-reset-09`; Causeway does not provide compatibility modes for earlier WebTransport or reliable-reset drafts. Applications opt in through HTTP/3 `Config`, return a takeover created by `Takeover.initWebTransport`, and receive borrowed `WebTransportSession`/`WebTransportStream` handles. The application remains responsible for authenticating requests and enforcing its Origin policy.
 
+### HTTP/3 scope and exclusions
+
+The implemented scope is a bounded **server-side** HTTP/3 stack, not a universal client-and-server implementation. Current exclusions and qualification boundaries are:
+
+- no HTTP/3 or WebTransport client API;
+- no compatibility with WebTransport drafts before `draft-ietf-webtrans-http3-16` or reliable-reset drafts before `draft-ietf-quic-reliable-stream-reset-09`;
+- no global 0-RTT single-use guarantee across processes or nodes without an application-provided external replay service;
+- no built-in WebTransport Origin allowlist; authentication and Origin authorization remain application policy;
+- native ECN execution is verified on Linux, while macOS and FreeBSD currently have ABI coverage through cross-compilation but still require native kernel-loopback qualification;
+- repository compliance/fuzz matrices and aioquic interoperability are regression evidence, not independent certification against every HTTP/3 implementation.
+
+See [the explicit HTTP/3 non-goals](docs/http3.md#explicit-non-goals-and-current-exclusions) for the maintained detailed list.
+
 REST, GraphQL, OpenAPI, and adapters remain separate higher-level phases.
 
 ## Toolchain
