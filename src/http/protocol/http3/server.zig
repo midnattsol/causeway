@@ -10,6 +10,7 @@ const quic = @import("../../../quic/root.zig");
 const options_module = @import("connection/options.zig");
 const session_module = @import("connection/session.zig");
 const errors = @import("error.zig");
+const h3_resumption = @import("resumption.zig");
 const Response = @import("../../message/response.zig").Response;
 
 const Io = std.Io;
@@ -114,7 +115,10 @@ fn ServerType(
             state: *State,
         ) !void {
             self.* = .{ .allocator = allocator, .state = state };
-            try self.endpoint.init(socket, policy);
+            var endpoint_policy = policy;
+            if (endpoint_policy.early_data != .disabled)
+                endpoint_policy.early_data_application_validator = validateEarlyApplicationState;
+            try self.endpoint.init(socket, endpoint_policy);
         }
 
         /// Binds a UDP socket and initializes the fixed endpoint and session pool.
@@ -128,7 +132,10 @@ fn ServerType(
             state: *State,
         ) !void {
             self.* = .{ .allocator = allocator, .state = state };
-            try self.endpoint.bind(io, address, policy);
+            var endpoint_policy = policy;
+            if (endpoint_policy.early_data != .disabled)
+                endpoint_policy.early_data_application_validator = validateEarlyApplicationState;
+            try self.endpoint.bind(io, address, endpoint_policy);
         }
 
         pub fn deinit(self: *Self, io: Io) void {
@@ -137,6 +144,11 @@ fn ServerType(
                 slot.* = .{};
             }
             self.endpoint.deinit(io);
+        }
+
+        fn validateEarlyApplicationState(bytes: []const u8) bool {
+            const remembered = h3_resumption.Snapshot.decode(bytes) catch return false;
+            return h3_resumption.serverSnapshot(http3_config).permitsRemembered(remembered);
         }
 
         pub fn localAddress(self: *const Self) net.IpAddress {

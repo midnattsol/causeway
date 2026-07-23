@@ -20,6 +20,7 @@ pub const ServerCredentials = credentials_module.ServerCredentials;
 pub const TicketService = resumption.TicketService;
 pub const TicketIssuanceMaterial = resumption.TicketIssuanceMaterial;
 pub const EarlyDataPolicy = resumption.EarlyDataPolicy;
+pub const ReplayService = resumption.ReplayService;
 pub const ResumptionLimits = resumption.Limits;
 pub const ResumptionInfo = resumption.Info;
 pub const ResumptionFallbackReason = resumption.FallbackReason;
@@ -548,6 +549,8 @@ pub const Server = struct {
         const remembered = transport_parameters.parseRemembered(selected.contents.quicTransportParameters()) catch return false;
         const current = transport_parameters.parse(self.local_transport_parameters, .server) catch return false;
         if (!transport_parameters.permitsRememberedEarlyData(current, remembered)) return false;
+        if (policy.application_state_validator) |validate|
+            if (!validate(selected.contents.applicationData())) return false;
         const expires_at = std.math.add(u64, selected.contents.issued_at, selected.contents.lifetime) catch return false;
         return policy.replay_service.consume(
             selected.identity,
@@ -812,6 +815,10 @@ const ServerTestReplay = struct {
     }
 };
 
+fn rejectEarlyApplicationState(_: []const u8) bool {
+    return false;
+}
+
 fn fixtureServerWithResumption(
     transcript: []u8,
     credentials: *const ServerCredentials,
@@ -995,6 +1002,27 @@ test "resumed handshake accepts eligible early data once" {
     var parameters_storage: [512]u8 = undefined;
     const parameters = try transport_parameters.encode(&parameters_storage, server_parameters, .server);
     const credentials = testCredentials();
+
+    var incompatible_policy = replay.policy();
+    incompatible_policy.application_state_validator = rejectEarlyApplicationState;
+    var incompatible_transcript: [4096]u8 = undefined;
+    var incompatible = Server.init(.{
+        .credentials = &credentials,
+        .server_random = @splat(0x52),
+        .x25519 = .{ .seed = @splat(0x21) },
+        .transport_parameters = parameters,
+        .transcript_scratch = &incompatible_transcript,
+        .ticket_service = TicketService.fromController(&controller),
+        .resumption_context = "endpoint-a",
+        .early_data = incompatible_policy,
+    });
+    defer incompatible.deinit();
+    var incompatible_initial: [256]u8 = undefined;
+    var incompatible_handshake: [1024]u8 = undefined;
+    _ = try incompatible.receive(.initial, hello, &incompatible_initial, &incompatible_handshake);
+    try std.testing.expect(incompatible.resumed());
+    try std.testing.expectEqual(EarlyDataState.rejected, incompatible.earlyDataState());
+    try std.testing.expect(!replay.consumed);
 
     var transcript: [4096]u8 = undefined;
     var server = Server.init(.{

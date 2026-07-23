@@ -35,6 +35,8 @@ pub const ReplayService = struct {
 
 pub const EarlyDataPolicy = struct {
     replay_service: ReplayService,
+    /// Validates authenticated application state before TLS accepts early data.
+    application_state_validator: ?*const fn ([]const u8) bool = null,
     /// Maximum absolute difference between client and server ticket ages.
     max_age_skew_ms: u32 = 10_000,
 };

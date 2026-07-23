@@ -31,7 +31,7 @@ pub const Entropy = struct {
 
 pub const RetryMode = enum { disabled, always };
 pub const NewTokenUsage = enum { reusable, bounded_replay_filter };
-pub const EarlyDataMode = enum { disabled, bounded_replay_filter };
+pub const EarlyDataMode = enum { disabled, bounded_replay_filter, external };
 
 pub const ReplayFilterStats = struct {
     consumed: u64 = 0,
@@ -59,6 +59,10 @@ pub const Policy = struct {
     /// it never evicts a live ticket and is local to this endpoint instance.
     early_data: EarlyDataMode = .disabled,
     early_data_max_age_skew_ms: u32 = 10_000,
+    /// Required by `.external`; the caller owns synchronization and lifetime.
+    early_data_replay_service: ?tls_server.ReplayService = null,
+    /// Optional protocol-specific validation over authenticated ticket state.
+    early_data_application_validator: ?*const fn ([]const u8) bool = null,
     transport_parameters: transport_parameters.Values = .{},
     /// Length of server-issued connection IDs (1...20).
     connection_id_length: u8 = 16,
@@ -186,6 +190,8 @@ pub fn EndpointWithFeatures(
                 return error.InvalidTicketLifetime;
             if (policy.early_data != .disabled and policy.ticket_service == null)
                 return error.EarlyDataRequiresTicketService;
+            if ((policy.early_data == .external) != (policy.early_data_replay_service != null))
+                return error.InvalidEarlyDataReplayService;
             if (policy.transport_parameters.active_connection_id_limit > connection_limits.active_connection_ids)
                 return error.ActiveConnectionIdLimitExceedsCapacity;
             if (policy.path_validation_attempts == 0 or policy.path_validation_interval == 0)
@@ -404,13 +410,22 @@ pub fn EndpointWithFeatures(
                             .age_add = std.mem.readInt(u32, entropy_bytes[100..104], .big),
                             .nonce = entropy_bytes[104..112].*,
                         } else null,
-                        .early_data = if (self.policy.early_data == .bounded_replay_filter) .{
-                            .replay_service = .{
-                                .context = self,
-                                .consume_fn = consumeEarlyDataReplay,
+                        .early_data = switch (self.policy.early_data) {
+                            .disabled => null,
+                            .bounded_replay_filter => .{
+                                .replay_service = .{
+                                    .context = self,
+                                    .consume_fn = consumeEarlyDataReplay,
+                                },
+                                .application_state_validator = self.policy.early_data_application_validator,
+                                .max_age_skew_ms = self.policy.early_data_max_age_skew_ms,
                             },
-                            .max_age_skew_ms = self.policy.early_data_max_age_skew_ms,
-                        } else null,
+                            .external => .{
+                                .replay_service = self.policy.early_data_replay_service.?,
+                                .application_state_validator = self.policy.early_data_application_validator,
+                                .max_age_skew_ms = self.policy.early_data_max_age_skew_ms,
+                            },
+                        },
                     },
                     .now = now,
                     .ecn_enabled = features.ecn,

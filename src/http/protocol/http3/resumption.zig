@@ -99,6 +99,20 @@ pub const Snapshot = struct {
     }
 };
 
+pub fn serverSnapshot(comptime config: anytype) Snapshot {
+    return .{
+        .qpack_max_table_capacity = config.qpack_capacity,
+        .qpack_blocked_streams = config.qpack_decoder_blocked_streams,
+        .max_field_section_size = config.max_field_section_size,
+        .enable_connect_protocol = if (config.enable_extended_connect) 1 else null,
+        .h3_datagram = if (config.enable_datagrams) 1 else null,
+        .wt_enabled = if (config.enable_webtransport) 1 else null,
+        .wt_initial_max_streams_uni = if (config.enable_webtransport) config.webtransport_initial_max_streams_uni else null,
+        .wt_initial_max_streams_bidi = if (config.enable_webtransport) config.webtransport_initial_max_streams_bidi else null,
+        .wt_initial_max_data = if (config.enable_webtransport) config.webtransport_initial_max_data else null,
+    };
+}
+
 fn permitsLimit(current: ?u64, remembered: ?u64) bool {
     const required = remembered orelse return true;
     return (current orelse 0) >= required;

@@ -2924,9 +2924,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
         fn rememberedSettingsCompatible(connection: *Connection) bool {
             const bytes = connection.resumptionApplicationState() orelse return false;
             const remembered = h3_resumption.Snapshot.decode(bytes) catch return false;
-            var local_storage: [128]u8 = undefined;
-            const local_settings = localSettingsPayload(&local_storage) catch return false;
-            const current = h3_resumption.Snapshot.capture(local_settings) catch return false;
+            const current = h3_resumption.serverSnapshot(config);
             return current.permitsRemembered(remembered);
         }
 
