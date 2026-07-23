@@ -125,6 +125,13 @@ python3 -m venv /tmp/causeway-aioquic
 
 The check requires a real Retry on the first connection, reuses NEW_TOKEN without Retry, receives a pushed stylesheet, performs a PSK-DHE-only resumed connection, sends an accepted replay-safe request in 0-RTT, then replays the same ticket and verifies rejection with a successful 1-RTT fallback. It also adapts aioquic's WebTransport framing to draft-16 SETTINGS, establishes an extended CONNECT, and verifies a native bidirectional stream echo.
 
+With the same server and virtual environment, `tools/http3_e2e_benchmark.py` measures loopback full handshake plus Retry, PSK resumption, accepted 0-RTT, and concurrent HTTP/3 requests. These timings include client/server protocol work and UDP I/O, unlike the deterministic `http3-bench` microbenchmarks:
+
+```sh
+/tmp/causeway-aioquic/bin/python tools/http3_e2e_benchmark.py \
+    --iterations 10 --concurrency 16
+```
+
 ## Recovery and congestion control
 
 The bounded RFC 9002 implementation includes:
