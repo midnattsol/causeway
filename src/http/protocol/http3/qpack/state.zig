@@ -335,8 +335,8 @@ pub const Decoder = struct {
         try instructions.writeSectionAcknowledgment(output, stream_id);
     }
     pub fn writeStreamCancellation(self: *Decoder, output: *Io.Writer, stream_id: u62) !void {
-        self.unblock(stream_id);
         try instructions.writeStreamCancellation(output, stream_id);
+        self.unblock(stream_id);
     }
     pub fn writeInsertCountIncrement(self: *Decoder, output: *Io.Writer) !void {
         const increment = self.dynamic.insert_count - self.dynamic.known_received_count;
@@ -474,4 +474,27 @@ test "blocked stream limit and malformed references map to decompression failed"
     try std.testing.expectError(error.Blocked, decoder.decodeSection(&.{ 0x02, 0x00 }, 1, &name, &value, {}, Ignore.emit));
     try std.testing.expectError(error.QpackDecompressionFailed, decoder.decodeSection(&.{ 0x02, 0x00 }, 2, &name, &value, {}, Ignore.emit));
     try std.testing.expectError(error.QpackDecompressionFailed, decoder.decodeSection(&.{ 0x00, 0x00, 0xff }, 1, &name, &value, {}, Ignore.emit));
+}
+
+test "failed stream cancellation preserves blocked state" {
+    var bytes: [64]u8 = undefined;
+    var entries: [2]table.Entry = undefined;
+    var blocked: [1]BlockedStream = undefined;
+    var decoder = try Decoder.init(&bytes, &entries, &blocked, 64, 1);
+    var name: [16]u8 = undefined;
+    var value: [16]u8 = undefined;
+    const Ignore = struct {
+        fn emit(_: void, _: Field) !void {}
+    };
+    try std.testing.expectError(error.Blocked, decoder.decodeSection(&.{ 0x02, 0x00 }, 1, &name, &value, {}, Ignore.emit));
+
+    var empty: [0]u8 = .{};
+    var full: Io.Writer = .fixed(&empty);
+    try std.testing.expectError(error.WriteFailed, decoder.writeStreamCancellation(&full, 1));
+    try std.testing.expect(blocked[0].active);
+
+    var storage: [16]u8 = undefined;
+    var writer: Io.Writer = .fixed(&storage);
+    try decoder.writeStreamCancellation(&writer, 1);
+    try std.testing.expect(!blocked[0].active);
 }
