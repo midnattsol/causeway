@@ -9,6 +9,7 @@ pub const core = @import("core/root.zig");
 pub const quic = @import("quic/root.zig");
 pub const http = @import("http/root.zig");
 pub const api = @import("api/root.zig");
+pub const testing = @import("testing/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

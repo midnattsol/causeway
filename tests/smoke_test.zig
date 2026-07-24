@@ -5,6 +5,13 @@ test "public module exposes architectural layers" {
     _ = causeway.core;
     _ = causeway.http;
     _ = causeway.api;
+    _ = causeway.testing;
+    try std.testing.expect(true);
+}
+
+test "public API exposes in-process testing" {
+    _ = causeway.testing.Client;
+    _ = causeway.testing.Response;
     try std.testing.expect(true);
 }
 
