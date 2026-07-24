@@ -12,7 +12,6 @@ const response_module = @import("../../../message/response.zig");
 const Response = response_module.Response;
 const http_context = @import("../../../context.zig");
 const route = @import("../../../routing/route.zig");
-const router = @import("../../../routing/router.zig");
 const push_message = @import("../../../message/push.zig");
 const wt = @import("../webtransport/root.zig");
 const capsule = @import("../capsule/root.zig");
@@ -233,8 +232,7 @@ test "HTTP/3 JSON API matches typed success and extraction error responses" {
             return .created(.{ .id = 1, .name = input.value.name });
         }
     };
-    const Router = router.Router(.{route.route(.POST, "/users", Handlers.create)});
-    const Dispatcher = api.Dispatcher(Router);
+    const Dispatcher = api.Router(.{route.route(.POST, "/users", Handlers.create)});
     const api_test_config = comptime blk: {
         var value = test_config;
         value.max_response_body_size = 256;

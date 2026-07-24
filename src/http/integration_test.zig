@@ -380,13 +380,15 @@ fn apiCreateUser(context: *const causeway.http.context.Context(ApiState), input:
     if (validation.hasIssues()) return .validation(validation.issues());
     const id = context.execution.state.next_id;
     context.execution.state.next_id += 1;
-    return .created(.{ .id = id, .name = input.value.name });
+    return api.JsonResult(ApiUser).created(.{ .id = id, .name = input.value.name }).withHeaders(.{ .items = &.{.{
+        .name = "cache-control",
+        .value = "no-store",
+    }} });
 }
 
-const ApiRouter = routing.router.Router(.{
+const ApiDispatcher = api.Router(.{
     routing.route.route(.POST, "/users", apiCreateUser),
 });
-const ApiDispatcher = api.Dispatcher(ApiRouter);
 const ApiApp = app_module.AppWithOptions(ApiState, ApiDispatcher, .{});
 
 test "end-to-end JSON API normalizes typed responses and extraction errors" {
@@ -408,6 +410,7 @@ test "end-to-end JSON API normalizes typed responses and extraction errors" {
     const created = try parseResponse(created_raw, 0);
     try testing.expectEqual(@as(u16, 201), created.status);
     try testing.expectEqualStrings("application/json", created.header("content-type").?);
+    try testing.expectEqualStrings("no-store", created.header("cache-control").?);
     try testing.expectEqualStrings("{\"id\":1,\"name\":\"Alice\"}", created.body);
 
     const invalid_raw = try rawRequest(testing.allocator, io, harness.address, "POST /users HTTP/1.1\r\n" ++

@@ -67,7 +67,10 @@ fn createUser(context: *const http.context.Context(State), input: api.Json(Creat
     if (validation.hasIssues()) return .validation(validation.issues());
 
     const id = context.execution.state.next_user_id.fetchAdd(1, .monotonic);
-    return .created(.{ .id = id, .name = input.value.name });
+    return api.JsonResult(User).created(.{ .id = id, .name = input.value.name }).withHeaders(.{ .items = &.{.{
+        .name = "cache-control",
+        .value = "no-store",
+    }} });
 }
 
 fn earlyHello(context: *const http.context.Context(State)) http.response.Response {
@@ -113,8 +116,8 @@ const http3_routes = .{
     http.routing.route.route(.CONNECT, "/webtransport", webTransport),
 };
 
-pub const Router = api.Dispatcher(http.routing.router.Router(routes));
+pub const Router = api.Router(routes);
 pub const Http3Router = blk: {
     @setEvalBranchQuota(4_000);
-    break :blk api.Dispatcher(http.routing.router.Router(http3_routes));
+    break :blk api.Router(http3_routes);
 };

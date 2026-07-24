@@ -42,7 +42,22 @@ return causeway.api.JsonResponse(User).created(user);
 ```
 
 Available constructors are `init(status, value)`, `ok(value)`, and
-`created(value)`.
+`created(value)`. The inferred helpers `api.ok(value)` and `api.created(value)`
+avoid repeating the value type.
+
+Additional borrowed headers may be attached before normalization:
+
+```zig
+return causeway.api.created(user).withHeaders(.{ .items = &.{.{
+    .name = "cache-control",
+    .value = "no-store",
+}} });
+```
+
+The header slice, names, and values must remain valid until `intoResponse`
+runs. Causeway allocates the combined header array in the request arena.
+`content-type` cannot be overridden; attempting it returns
+`error.JsonContentTypeOverride`.
 
 ## Structured errors
 
@@ -50,6 +65,15 @@ Wrap a router or dispatcher with the default API policy:
 
 ```zig
 const Dispatcher = causeway.api.Dispatcher(Router);
+```
+
+For the common case, `api.Router(routes)` constructs the HTTP router and wraps
+it with the same policy:
+
+```zig
+const Dispatcher = causeway.api.Router(.{
+    causeway.http.routing.route.route(.POST, "/users", create),
+});
 ```
 
 Known JSON and HTTP extractor failures become responses shaped as:
@@ -175,6 +199,7 @@ defer response.deinit();
 
 try response.expectStatus(.created);
 try response.expectHeader("content-type", "application/json");
+try response.expectJson(User{ .id = 1, .name = "Alice" });
 const user = try response.json(User);
 ```
 

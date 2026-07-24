@@ -9,7 +9,6 @@ const frame_writer = @import("../frame/writer.zig");
 const hpack = @import("../hpack/codec.zig");
 const http_context = @import("../../../context.zig");
 const route = @import("../../../routing/route.zig");
-const router = @import("../../../routing/router.zig");
 const headers_module = @import("../../../message/headers.zig");
 const Header = headers_module.Header;
 const Headers = headers_module.Headers;
@@ -87,8 +86,7 @@ test "HTTP/2 JSON API matches typed success and extraction error responses" {
             return .created(.{ .id = 1, .name = input.value.name });
         }
     };
-    const Router = router.Router(.{route.route(.POST, "/users", Handlers.create)});
-    const Dispatcher = api.Dispatcher(Router);
+    const Dispatcher = api.Router(.{route.route(.POST, "/users", Handlers.create)});
     const Run = struct {
         fn request(io: Io, body: []const u8, content_type: ?[]const u8, expected_status: []const u8, expected_body: []const u8) !void {
             var wire: Io.Writer.Allocating = .init(std.testing.allocator);

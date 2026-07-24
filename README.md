@@ -80,12 +80,12 @@ const CreateUser = struct { name: []const u8 };
 const User = struct { id: usize, name: []const u8 };
 
 fn createUser(input: api.Json(CreateUser)) api.JsonResponse(User) {
-    return .created(.{ .id = 1, .name = input.value.name });
+    return api.created(User{ .id = 1, .name = input.value.name });
 }
 
-const Router = api.Dispatcher(http.routing.router.Router(.{
+const Router = api.Router(.{
     http.routing.route.route(.POST, "/users", createUser),
-}));
+});
 ```
 
 `api.Json(T)` requires a JSON media type and copies decoded strings into the request allocator. Its value remains valid through response completion but must be copied before being retained longer. `api.Dispatcher` maps JSON and built-in HTTP extractor failures to a stable JSON error response before protocol-specific fallback policies run. See [`docs/api.md`](docs/api.md) for ownership, validation, errors, and in-process testing.
