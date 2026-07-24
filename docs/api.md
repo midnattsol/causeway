@@ -66,6 +66,20 @@ Unrelated application errors remain errors and reach the configured HTTP
 protocol fallback policy. Errors raised before application dispatch, such as
 invalid wire framing, remain protocol-level failures rather than API responses.
 
+For a syntactically valid request that reaches `api.Dispatcher`, HTTP/1,
+HTTP/2, and HTTP/3 share this observable JSON policy:
+
+| Condition | Status | Error type |
+| --- | ---: | --- |
+| malformed JSON | 400 | `invalid_json` |
+| missing JSON body | 400 | `missing_json_body` |
+| missing or unsupported media type | 415 | `unsupported_media_type` |
+| body exceeds the extractor limit | 413 | `payload_too_large` |
+
+Protocol admission limits are a separate boundary. A body rejected before
+dispatch may produce a protocol-specific `413`, stream reset, or connection
+error because no API request exists to map at that point.
+
 `ApiError` is serializable response data, not a Zig error value. Zig error sets
 cannot carry status, detail, or field payloads.
 
@@ -100,8 +114,12 @@ var response = try client.post("/users").sendJson(.{ .name = "Alice" });
 defer response.deinit();
 
 try response.expectStatus(.created);
+try response.expectHeader("content-type", "application/json");
 const user = try response.json(User);
 ```
+
+`RequestBuilder.withHeader` returns `error.TooManyRequestHeaders` when its
+fixed test-request capacity is exhausted.
 
 The captured response owns an arena. Parsed JSON and copied headers/body remain
 valid until `response.deinit()`. Wire-level integration tests remain necessary

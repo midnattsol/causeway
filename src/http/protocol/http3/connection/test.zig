@@ -1,4 +1,5 @@
 const std = @import("std");
+const api = @import("../../../../api/root.zig");
 const Io = std.Io;
 const stream_id = @import("../../../../quic/stream/id.zig");
 const frame = @import("../frame/root.zig");
@@ -9,6 +10,8 @@ const Session = @import("session.zig").Session;
 const Headers = @import("../../../message/headers.zig").Headers;
 const response_module = @import("../../../message/response.zig");
 const Response = response_module.Response;
+const route = @import("../../../routing/route.zig");
+const router = @import("../../../routing/router.zig");
 const push_message = @import("../../../message/push.zig");
 const wt = @import("../webtransport/root.zig");
 const capsule = @import("../capsule/root.zig");
@@ -206,6 +209,91 @@ test "HTTP/3 session incrementally serves a request over the generic QUIC API" {
     const data = (try parser.next()).?;
     try std.testing.expectEqualStrings("pong", data.payload.data);
     try std.testing.expect(transport.close_code == null);
+}
+
+test "HTTP/3 JSON API matches typed success and extraction error responses" {
+    const State = struct {};
+    const Input = struct { name: []const u8 };
+    const User = struct { id: u8, name: []const u8 };
+    const Handlers = struct {
+        fn create(input: api.Json(Input)) api.JsonResponse(User) {
+            return .created(.{ .id = 1, .name = input.value.name });
+        }
+    };
+    const Router = router.Router(.{route.route(.POST, "/users", Handlers.create)});
+    const Dispatcher = api.Dispatcher(Router);
+    const Run = struct {
+        fn request(io: Io, body: []const u8, content_type: ?[]const u8, expected_status: []const u8, expected_body: []const u8) !void {
+            var transport: FakeConnection = .{};
+            var state: State = .{};
+            var session = Session(State, Dispatcher, FakeConnection, test_config).init(&transport, std.testing.allocator, &state, io);
+            defer session.deinit();
+            try session.activate();
+            try transport.feed(try support.clientUniId(0), "\x00\x04\x00", false);
+            _ = try session.poll(1);
+
+            var request_bytes: [512]u8 = undefined;
+            var length_storage: [32]u8 = undefined;
+            const length = try std.fmt.bufPrint(&length_storage, "{d}", .{body.len});
+            var fields: [6]qpack.Field = undefined;
+            fields[0..4].* = .{
+                .{ .name = ":method", .value = "POST" },
+                .{ .name = ":scheme", .value = "https" },
+                .{ .name = ":authority", .value = "example.test" },
+                .{ .name = ":path", .value = "/users" },
+            };
+            var field_count: usize = 4;
+            if (content_type) |value| {
+                fields[field_count] = .{ .name = "content-type", .value = value };
+                field_count += 1;
+            }
+            fields[field_count] = .{ .name = "content-length", .value = length };
+            field_count += 1;
+            const request_len = try support.encodeRequestFields(&request_bytes, 0, fields[0..field_count], body);
+            const request_id = try support.requestId(0);
+            try transport.feed(request_id, request_bytes[0..request_len], true);
+            for (0..10_000) |step| {
+                if (transport.find(request_id).?.finished) break;
+                std.Thread.yield() catch {};
+                _ = try session.poll(2 + step);
+            }
+            try std.testing.expect(transport.find(request_id).?.finished);
+            try expectHttp3Response(transport.output(request_id), request_id.value, expected_status, expected_body);
+        }
+    };
+
+    var threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(8));
+    try Run.request(threaded.io(), "{\"name\":\"Alice\"}", "application/json", "201", "{\"id\":1,\"name\":\"Alice\"}");
+    try Run.request(
+        threaded.io(),
+        "{",
+        "application/json",
+        "400",
+        "{\"type\":\"invalid_json\",\"status\":400,\"detail\":\"Invalid JSON request body\"}",
+    );
+    try Run.request(
+        threaded.io(),
+        "{}",
+        "text/plain",
+        "415",
+        "{\"type\":\"unsupported_media_type\",\"status\":415,\"detail\":\"Expected an application/json request body\"}",
+    );
+    try Run.request(
+        threaded.io(),
+        "{}",
+        null,
+        "415",
+        "{\"type\":\"unsupported_media_type\",\"status\":415,\"detail\":\"Expected an application/json request body\"}",
+    );
+    try Run.request(
+        threaded.io(),
+        "",
+        "application/json",
+        "400",
+        "{\"type\":\"missing_json_body\",\"status\":400,\"detail\":\"Missing JSON request body\"}",
+    );
 }
 
 test "HTTP/3 early requests require explicit replay-safe dispatch" {
@@ -3907,4 +3995,44 @@ test "HTTP/3 push responses alternate between active push slots" {
     try std.testing.expectEqual(second_stream, observed[1]);
     try std.testing.expectEqual(first_stream, observed[2]);
     try std.testing.expectEqual(second_stream, observed[3]);
+}
+
+fn collectQpackHeader(list: *std.ArrayList(qpack.Field), field_value: qpack.Field) !void {
+    try list.append(std.testing.allocator, field_value);
+}
+
+fn expectHttp3Response(bytes: []const u8, stream_value: u64, expected_status: []const u8, expected_body: []const u8) !void {
+    var parser = frame.Parser{ .bytes = bytes };
+    const headers = (try parser.next()) orelse return error.MissingResponseHeaders;
+    if (headers.payload != .headers) return error.MissingResponseHeaders;
+
+    var dynamic_bytes: [1]u8 = undefined;
+    var entries: [1]qpack.table.Entry = undefined;
+    var blocked: [1]qpack.state.BlockedStream = undefined;
+    var decoder = try qpack.Decoder.init(&dynamic_bytes, &entries, &blocked, 0, 0);
+    var name_scratch: [128]u8 = undefined;
+    var value_scratch: [128]u8 = undefined;
+    var decoded: std.ArrayList(qpack.Field) = .empty;
+    defer decoded.deinit(std.testing.allocator);
+    try decoder.decodeSection(
+        headers.payload.headers,
+        @intCast(stream_value),
+        &name_scratch,
+        &value_scratch,
+        &decoded,
+        collectQpackHeader,
+    );
+    var status: ?[]const u8 = null;
+    var content_type: ?[]const u8 = null;
+    for (decoded.items) |header| {
+        if (std.mem.eql(u8, header.name, ":status")) status = header.value;
+        if (std.ascii.eqlIgnoreCase(header.name, "content-type")) content_type = header.value;
+    }
+    try std.testing.expectEqualStrings(expected_status, status orelse return error.MissingResponseStatus);
+    try std.testing.expectEqualStrings("application/json", content_type orelse return error.MissingResponseContentType);
+
+    const data = (try parser.next()) orelse return error.MissingResponseBody;
+    if (data.payload != .data) return error.MissingResponseBody;
+    try std.testing.expectEqualStrings(expected_body, data.payload.data);
+    try std.testing.expect((try parser.next()) == null);
 }

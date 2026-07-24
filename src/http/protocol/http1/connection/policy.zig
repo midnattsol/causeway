@@ -16,7 +16,11 @@ pub fn wireVersion(version: request_module.Version) std.http.Version {
 }
 
 pub fn requestHasFramedBody(framing: head_module.Framing) bool {
-    return framing != .none;
+    return switch (framing) {
+        .none => false,
+        .content_length => |length| length != 0,
+        .chunked => true,
+    };
 }
 
 pub fn framingContentLength(framing: head_module.Framing) ?u64 {
@@ -109,6 +113,7 @@ pub fn dispatchFailure(err: anyerror, policy: HandlerErrorPolicy) ?DispatchFailu
 
 test "HTTP/1 connection policy maps framing and application failures" {
     try std.testing.expect(requestHasFramedBody(.{ .content_length = 1 }));
+    try std.testing.expect(!requestHasFramedBody(.{ .content_length = 0 }));
     try std.testing.expect(!requestHasFramedBody(.none));
     try std.testing.expectEqual(@as(?u64, 3), framingContentLength(.{ .content_length = 3 }));
     try std.testing.expectEqual(std.http.Status.request_timeout, dispatchFailure(error.RequestBodyTimeout, .internal_server_error).?.status);

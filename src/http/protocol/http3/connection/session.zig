@@ -1497,7 +1497,7 @@ fn SessionType(comptime State: type, comptime Locals: ?type, comptime Dispatcher
                             head.protocol != null and std.mem.eql(u8, head.protocol.?, wt_constants.upgrade_token);
                         slot.capsule_requested = config.enable_datagrams and head.method.is(.CONNECT) and
                             (slot.webtransport_candidate or capsuleProtocolEnabled(head.headers));
-                        if (head.content_length != null or head.method.is(.CONNECT)) try self.ensureRequest(slot, true);
+                        if ((head.content_length orelse 0) != 0 or head.method.is(.CONNECT)) try self.ensureRequest(slot, true);
                     } else {
                         const trailers = semantics.validateTrailers(section_fields) catch return error.MessageError;
                         trailer_policy.validateIncoming(trailers, config.max_header_count, config.max_header_bytes) catch return error.MessageError;

@@ -54,7 +54,7 @@ pub fn Client(comptime State: type, comptime Dispatcher: type) type {
         state: *State,
 
         const Self = @This();
-        const maximum_headers = 16;
+        pub const maximum_headers = 16;
 
         pub const RequestBuilder = struct {
             client: *Self,
@@ -230,4 +230,24 @@ test "Client executes JSON routing extraction conversion and errors without sock
     try invalid_response.expectHeader("content-type", "application/json");
     const problem = try invalid_response.json(api.ApiError);
     try std.testing.expectEqualStrings("invalid_json", problem.type);
+
+    const wrong_type_builder = try client_value.post("/users").withHeader("content-type", "text/plain");
+    var wrong_type = try wrong_type_builder.sendBody("{}");
+    defer wrong_type.deinit();
+    try wrong_type.expectStatus(.unsupported_media_type);
+
+    var missing_type = try client_value.post("/users").sendBody("{}");
+    defer missing_type.deinit();
+    try missing_type.expectStatus(.unsupported_media_type);
+
+    const missing_body_builder = try client_value.post("/users").withHeader("content-type", "application/json");
+    var missing_body = try missing_body_builder.send();
+    defer missing_body.deinit();
+    try missing_body.expectStatus(.bad_request);
+    const missing_problem = try missing_body.json(api.ApiError);
+    try std.testing.expectEqualStrings("missing_json_body", missing_problem.type);
+
+    var full = client_value.get("/");
+    for (0..Client(State, AppDispatcher).maximum_headers) |_| full = try full.withHeader("x-test", "value");
+    try std.testing.expectError(error.TooManyRequestHeaders, full.withHeader("x-extra", "value"));
 }

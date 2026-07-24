@@ -407,6 +407,36 @@ test "end-to-end JSON API normalizes typed responses and extraction errors" {
         "{\"type\":\"invalid_json\",\"status\":400,\"detail\":\"Invalid JSON request body\"}",
         invalid.body,
     );
+
+    const wrong_type_raw = try rawRequest(testing.allocator, io, harness.address, "POST /users HTTP/1.1\r\n" ++
+        "Host: localhost\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+    defer testing.allocator.free(wrong_type_raw);
+    const wrong_type = try parseResponse(wrong_type_raw, 0);
+    try testing.expectEqual(@as(u16, 415), wrong_type.status);
+    try testing.expectEqualStrings(
+        "{\"type\":\"unsupported_media_type\",\"status\":415,\"detail\":\"Expected an application/json request body\"}",
+        wrong_type.body,
+    );
+
+    const missing_type_raw = try rawRequest(testing.allocator, io, harness.address, "POST /users HTTP/1.1\r\n" ++
+        "Host: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+    defer testing.allocator.free(missing_type_raw);
+    const missing_type = try parseResponse(missing_type_raw, 0);
+    try testing.expectEqual(@as(u16, 415), missing_type.status);
+    try testing.expectEqualStrings(
+        "{\"type\":\"unsupported_media_type\",\"status\":415,\"detail\":\"Expected an application/json request body\"}",
+        missing_type.body,
+    );
+
+    const missing_body_raw = try rawRequest(testing.allocator, io, harness.address, "POST /users HTTP/1.1\r\n" ++
+        "Host: localhost\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    defer testing.allocator.free(missing_body_raw);
+    const missing_body = try parseResponse(missing_body_raw, 0);
+    try testing.expectEqual(@as(u16, 400), missing_body.status);
+    try testing.expectEqualStrings(
+        "{\"type\":\"missing_json_body\",\"status\":400,\"detail\":\"Missing JSON request body\"}",
+        missing_body.body,
+    );
     try harness.stop();
 }
 
