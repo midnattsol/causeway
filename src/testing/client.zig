@@ -37,6 +37,11 @@ pub const Response = struct {
         if (!std.mem.eql(u8, actual, expected)) return error.UnexpectedHeader;
     }
 
+    pub fn expectJson(self: *Response, expected: anytype) !void {
+        const actual = try self.json(@TypeOf(expected));
+        try std.testing.expectEqualDeep(expected, actual);
+    }
+
     /// Parses JSON into the response arena. Returned slices remain valid until
     /// `deinit`; callers do not separately free the result.
     pub fn json(self: *Response, comptime T: type) !T {
@@ -216,9 +221,7 @@ test "Client executes JSON routing extraction conversion and errors without sock
         }
     };
     const route = @import("../http/routing/route.zig");
-    const router = @import("../http/routing/router.zig");
-    const Router = router.Router(.{route.route(.POST, "/users", Handler.create)});
-    const AppDispatcher = api.Dispatcher(Router);
+    const AppDispatcher = api.Router(.{route.route(.POST, "/users", Handler.create)});
 
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -231,6 +234,7 @@ test "Client executes JSON routing extraction conversion and errors without sock
     const user = try created.json(User);
     try std.testing.expectEqual(@as(usize, 1), user.id);
     try std.testing.expectEqualStrings("Alice", user.name);
+    try created.expectJson(User{ .id = 1, .name = "Alice" });
 
     var invalid = try client_value.post("/users")
         .withHeader("content-type", "application/json");

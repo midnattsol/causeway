@@ -18,6 +18,13 @@ test "public API exposes in-process testing" {
 test "public API exposes typed JSON and structured errors" {
     _ = causeway.api.Json;
     _ = causeway.api.JsonResponse;
+    _ = causeway.api.JsonResult;
+    _ = causeway.api.Router;
+    _ = causeway.api.ok;
+    _ = causeway.api.created;
+    _ = causeway.api.Issue;
+    _ = causeway.api.Validation;
+    _ = causeway.api.ValidationError;
     _ = causeway.api.ApiError;
     _ = causeway.api.ErrorMiddleware;
     _ = causeway.api.Dispatcher;

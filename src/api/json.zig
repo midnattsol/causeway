@@ -9,6 +9,14 @@ const Response = response_module.Response;
 
 pub const media_type = "application/json";
 
+pub fn ok(value: anytype) JsonResponse(@TypeOf(value)) {
+    return .ok(value);
+}
+
+pub fn created(value: anytype) JsonResponse(@TypeOf(value)) {
+    return .created(value);
+}
+
 /// Returns a JSON request extractor whose decoded value belongs to the request
 /// allocator and remains valid through response completion. Strings are always
 /// copied so they never depend on mutable body storage.
@@ -43,6 +51,7 @@ pub fn JsonResponse(comptime T: type) type {
     return struct {
         status: std.http.Status = .ok,
         value: T,
+        headers: Headers = .empty,
 
         pub const is_http_response = true;
         pub const Value = T;
@@ -62,13 +71,25 @@ pub fn JsonResponse(comptime T: type) type {
             return init(.created, value);
         }
 
+        /// Adds borrowed response headers. Names and values must remain valid
+        /// until `intoResponse` runs. Causeway owns the JSON Content-Type.
+        pub fn withHeaders(self: @This(), headers: Headers) @This() {
+            var result = self;
+            result.headers = headers;
+            return result;
+        }
+
         pub fn intoResponse(self: @This(), allocator: std.mem.Allocator) !Response {
+            if (self.headers.contains("content-type")) return error.JsonContentTypeOverride;
             var output: std.Io.Writer.Allocating = .init(allocator);
             errdefer output.deinit();
             try std.json.Stringify.value(self.value, .{}, &output.writer);
+            const combined_headers = try allocator.alloc(Header, self.headers.items.len + 1);
+            combined_headers[0] = json_headers[0];
+            @memcpy(combined_headers[1..], self.headers.items);
             return .{
                 .status = self.status,
-                .headers = .{ .items = &json_headers },
+                .headers = .{ .items = combined_headers },
                 .body = .fromBytes(output.written()),
             };
         }
@@ -149,4 +170,24 @@ test "JsonResponse serializes through the common typed response contract" {
     try std.testing.expectEqual(std.http.Status.created, response.status);
     try std.testing.expectEqualStrings(media_type, response.headers.get("content-type").?);
     try std.testing.expectEqualStrings("{\"id\":7,\"name\":\"Alice\"}", response.body.asBytes().?);
+}
+
+test "JSON response helpers preserve additional headers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const response = try created(.{ .id = @as(u8, 1) }).withHeaders(.{ .items = &.{.{
+        .name = "location",
+        .value = "/users/1",
+    }} }).intoResponse(arena.allocator());
+
+    try std.testing.expectEqual(std.http.Status.created, response.status);
+    try std.testing.expectEqualStrings(media_type, response.headers.get("content-type").?);
+    try std.testing.expectEqualStrings("/users/1", response.headers.get("location").?);
+    try std.testing.expectError(
+        error.JsonContentTypeOverride,
+        ok(.{ .id = @as(u8, 1) }).withHeaders(.{ .items = &.{.{
+            .name = "Content-Type",
+            .value = "text/plain",
+        }} }).intoResponse(arena.allocator()),
+    );
 }

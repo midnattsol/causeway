@@ -59,7 +59,10 @@ pub const ValidationError = struct {
 pub fn JsonResult(comptime T: type) type {
     return union(enum) {
         success: json.JsonResponse(T),
-        validation_failed: []const Issue,
+        validation_failed: struct {
+            issues: []const Issue,
+            headers: @import("../http/message/headers.zig").Headers = .empty,
+        },
 
         pub const is_http_response = true;
         pub const Value = T;
@@ -78,14 +81,26 @@ pub fn JsonResult(comptime T: type) type {
         }
 
         pub fn validation(issues_value: []const Issue) @This() {
-            return .{ .validation_failed = issues_value };
+            return .{ .validation_failed = .{ .issues = issues_value } };
+        }
+
+        /// Adds borrowed headers to either response variant.
+        pub fn withHeaders(self: @This(), headers: @import("../http/message/headers.zig").Headers) @This() {
+            return switch (self) {
+                .success => |result| .{ .success = result.withHeaders(headers) },
+                .validation_failed => |failure| .{ .validation_failed = .{
+                    .issues = failure.issues,
+                    .headers = headers,
+                } },
+            };
         }
 
         pub fn intoResponse(self: @This(), allocator: std.mem.Allocator) !Response {
             return switch (self) {
                 .success => |result| result.intoResponse(allocator),
-                .validation_failed => |issues_value| json.JsonResponse(ValidationError)
-                    .init(.unprocessable_entity, .{ .issues = issues_value })
+                .validation_failed => |failure| json.JsonResponse(ValidationError)
+                    .init(.unprocessable_entity, .{ .issues = failure.issues })
+                    .withHeaders(failure.headers)
                     .intoResponse(allocator),
             };
         }
