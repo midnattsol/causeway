@@ -11,6 +11,10 @@ pub const JsonResponse = json.JsonResponse;
 pub const ApiError = errors.ApiError;
 pub const ErrorMiddleware = errors.ErrorMiddleware;
 pub const Dispatcher = errors.Dispatcher;
+pub const Issue = validation.Issue;
+pub const Validation = validation.Validation;
+pub const ValidationError = validation.ValidationError;
+pub const JsonResult = validation.JsonResult;
 pub const validate = validation.validate;
 
 test {
