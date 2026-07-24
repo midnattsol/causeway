@@ -204,11 +204,32 @@ const user = try response.json(User);
 ```
 
 `RequestBuilder.withHeader` returns `error.TooManyRequestHeaders` when its
-fixed test-request capacity is exhausted.
+fixed test-request capacity is exhausted. `withEarlyData(.accepted)` marks the
+context as accepted early data so replay-aware handler behavior can be tested;
+it does not simulate HTTP/3 replay-safety admission.
+
+Applications using typed request locals can use the matching client:
+
+```zig
+var client = causeway.testing.ClientWithLocals(
+    State,
+    Locals,
+    Dispatcher,
+).init(allocator, io, &state);
+```
+
+Each request receives a fresh `Locals{}` value, matching the live protocol
+handlers. Middleware, extractors, and the routed handler share the same pointer
+for that request.
 
 The captured response owns an arena. Parsed JSON and copied headers/body remain
-valid until `response.deinit()`. Wire-level integration tests remain necessary
-for framing, flow control, keep-alive, and protocol-specific behavior.
+valid until `response.deinit()`. Streaming bodies are produced once, finalized,
+and then reported as successful to completion observers. Production failures
+finalize the body and report failure before returning the error.
+
+The client executes custom middleware and error mappers, but intentionally does
+not apply protocol body limits or simulate framing, flow control, keep-alive,
+replay admission, or stream resets. Those require wire-level integration tests.
 
 ## Current boundary
 
