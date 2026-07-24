@@ -12,6 +12,7 @@ fn RouteType(
     comptime route_middlewares: anytype,
     comptime route_body_limit: ?usize,
     comptime route_replay_safe: bool,
+    comptime route_response_status: ?std.http.Status,
 ) type {
     return struct {
         method: Method,
@@ -22,6 +23,7 @@ fn RouteType(
         pub const middlewares = route_middlewares;
         pub const max_body_size = route_body_limit;
         pub const replay_safe = route_replay_safe;
+        pub const response_status = route_response_status;
 
         /// Invokes this route's middleware and then its handler.
         pub fn invoke(comptime self: @This(), context: anytype) !Response {
@@ -34,7 +36,7 @@ fn RouteType(
 
         /// Returns the same route with `outer` middleware wrapped around its
         /// existing route-local middleware.
-        pub fn withMiddleware(comptime self: @This(), comptime outer: anytype) RouteType(HandlerFn, outer ++ route_middlewares, route_body_limit, route_replay_safe) {
+        pub fn withMiddleware(comptime self: @This(), comptime outer: anytype) RouteType(HandlerFn, outer ++ route_middlewares, route_body_limit, route_replay_safe, route_response_status) {
             return .{
                 .method = self.method,
                 .pattern = self.pattern,
@@ -43,7 +45,7 @@ fn RouteType(
         }
 
         /// Returns the same route with a stricter request-body limit.
-        pub fn withBodyLimit(comptime self: @This(), comptime maximum: usize) RouteType(HandlerFn, route_middlewares, maximum, route_replay_safe) {
+        pub fn withBodyLimit(comptime self: @This(), comptime maximum: usize) RouteType(HandlerFn, route_middlewares, maximum, route_replay_safe, route_response_status) {
             if (maximum == 0) @compileError("route body limit must be positive");
             return .{
                 .method = self.method,
@@ -53,7 +55,18 @@ fn RouteType(
         }
 
         /// Marks the effective route pipeline as safe for replayable early data.
-        pub fn withReplaySafe(comptime self: @This()) RouteType(HandlerFn, route_middlewares, route_body_limit, true) {
+        pub fn withReplaySafe(comptime self: @This()) RouteType(HandlerFn, route_middlewares, route_body_limit, true, route_response_status) {
+            return .{
+                .method = self.method,
+                .pattern = self.pattern,
+                .handler_fn = self.handler_fn,
+            };
+        }
+
+        /// Declares the primary successful response status for documentation.
+        pub fn withResponseStatus(comptime self: @This(), comptime status: std.http.Status) RouteType(HandlerFn, route_middlewares, route_body_limit, route_replay_safe, status) {
+            if (@intFromEnum(status) < 200 or @intFromEnum(status) >= 400)
+                @compileError("documented route response status must be successful");
             return .{
                 .method = self.method,
                 .pattern = self.pattern,
@@ -76,7 +89,7 @@ pub fn route(
     comptime method: Method,
     comptime pattern: []const u8,
     comptime handler_fn: anytype,
-) RouteType(@TypeOf(handler_fn), .{}, null, false) {
+) RouteType(@TypeOf(handler_fn), .{}, null, false, null) {
     return routeWith(method, pattern, handler_fn, .{});
 }
 
@@ -86,7 +99,7 @@ pub fn routeWith(
     comptime pattern: []const u8,
     comptime handler_fn: anytype,
     comptime middlewares: anytype,
-) RouteType(@TypeOf(handler_fn), middlewares, null, false) {
+) RouteType(@TypeOf(handler_fn), middlewares, null, false, null) {
     return .{
         .method = method,
         .pattern = pattern,
@@ -107,6 +120,11 @@ pub fn withBodyLimit(comptime route_value: anytype, comptime maximum: usize) @Ty
 /// Marks an existing route and all of its middleware as replay-safe.
 pub fn withReplaySafe(comptime route_value: anytype) @TypeOf(route_value.withReplaySafe()) {
     return route_value.withReplaySafe();
+}
+
+/// Declares the route's primary successful response status for tooling.
+pub fn withResponseStatus(comptime route_value: anytype, comptime status: std.http.Status) @TypeOf(route_value.withResponseStatus(status)) {
+    return route_value.withResponseStatus(status);
 }
 
 // -----------------------------------------------------------------------------
@@ -224,6 +242,16 @@ test "route replay safety is explicit compile-time metadata" {
     try std.testing.expect(@TypeOf(wrapped).replay_safe);
     try std.testing.expectEqual(@as(?usize, 4096), @TypeOf(wrapped).max_body_size);
     try std.testing.expectEqual(@as(usize, 1), @TypeOf(wrapped).middlewares.len);
+}
+
+test "route response status is explicit compile-time metadata" {
+    const plain = comptime route(.POST, "/users", firstHandler);
+    const created = comptime withResponseStatus(plain, .created);
+    const wrapped = comptime withMiddleware(created, .{Outer});
+
+    try std.testing.expectEqual(@as(?std.http.Status, null), @TypeOf(plain).response_status);
+    try std.testing.expectEqual(@as(?std.http.Status, .created), @TypeOf(created).response_status);
+    try std.testing.expectEqual(@as(?std.http.Status, .created), @TypeOf(wrapped).response_status);
 }
 
 test "additional middleware wraps existing route middleware" {

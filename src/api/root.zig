@@ -5,6 +5,7 @@ const std = @import("std");
 pub const json = @import("json.zig");
 pub const errors = @import("error.zig");
 pub const validation = @import("validation.zig");
+pub const openapi = @import("openapi.zig");
 
 pub const Json = json.Json;
 pub const JsonResponse = json.JsonResponse;

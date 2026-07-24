@@ -26,6 +26,9 @@ test "public API exposes typed JSON and structured errors" {
     _ = causeway.api.Issue;
     _ = causeway.api.Validation;
     _ = causeway.api.ValidationError;
+    _ = causeway.api.openapi.generate;
+    _ = causeway.api.openapi.write;
+    _ = causeway.api.openapi.response;
     _ = causeway.api.ApiError;
     _ = causeway.api.ErrorMiddleware;
     _ = causeway.api.Dispatcher;
@@ -48,6 +51,7 @@ test "public HTTP API exposes typed app routing configuration" {
     _ = causeway.http.context.ContextWithLocals;
     _ = causeway.http.routing.route.routeWith;
     _ = causeway.http.routing.route.withBodyLimit;
+    _ = causeway.http.routing.route.withResponseStatus;
     _ = causeway.http.routing.group.groupWith;
     try std.testing.expect(true);
 }
