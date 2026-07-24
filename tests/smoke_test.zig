@@ -4,6 +4,17 @@ const causeway = @import("causeway");
 test "public module exposes architectural layers" {
     _ = causeway.core;
     _ = causeway.http;
+    _ = causeway.api;
+    try std.testing.expect(true);
+}
+
+test "public API exposes typed JSON and structured errors" {
+    _ = causeway.api.Json;
+    _ = causeway.api.JsonResponse;
+    _ = causeway.api.ApiError;
+    _ = causeway.api.ErrorMiddleware;
+    _ = causeway.api.Dispatcher;
+    _ = causeway.api.validate;
     try std.testing.expect(true);
 }
 
