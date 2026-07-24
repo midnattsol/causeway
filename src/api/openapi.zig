@@ -356,9 +356,14 @@ test "OpenAPI generates routes parameters bodies responses and schemas" {
         ) !api.JsonResult(User) {
             return error.NotImplemented;
         }
+
+        fn list(_: *const Context(State), _: extractors.Path(u64, "id")) api.JsonResponse(User) {
+            return .ok(.{ .id = 1, .name = "Alice", .nickname = null });
+        }
     };
     const App = api.Router(.{
         route.withResponseStatus(route.route(.POST, "/users/:id", Handler.create), .created),
+        route.route(.GET, "/users/:id", Handler.list),
     });
     const document = try generate(App, std.testing.allocator, .{ .title = "Users", .version = "1.0.0" });
     defer std.testing.allocator.free(document);
@@ -367,6 +372,8 @@ test "OpenAPI generates routes parameters bodies responses and schemas" {
 
     try std.testing.expect(std.mem.find(u8, document, "\"openapi\":\"3.1.0\"") != null);
     try std.testing.expect(std.mem.find(u8, document, "\"/users/{id}\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, document, "\"/users/{id}\""));
+    try std.testing.expect(std.mem.find(u8, document, "\"get\":") != null);
     try std.testing.expect(std.mem.find(u8, document, "\"name\":\"x-token\",\"in\":\"header\",\"required\":false") != null);
     try std.testing.expect(std.mem.find(u8, document, "\"requestBody\":{\"required\":true") != null);
     try std.testing.expect(std.mem.find(u8, document, "\"201\":") != null);
