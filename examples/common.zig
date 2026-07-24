@@ -10,6 +10,15 @@ pub const State = struct {
 
 const CreateUser = struct { name: []const u8 };
 const User = struct { id: usize, name: []const u8 };
+const CreateUserValidator = struct {
+    pub fn validate(value: CreateUser, result: *api.Validation) !void {
+        if (value.name.len == 0) try result.add(.{
+            .path = "/name",
+            .code = "required",
+            .detail = "Name must not be empty",
+        });
+    }
+};
 
 fn hello(context: *const http.context.Context(State)) http.response.Response {
     _ = context.execution.state.requests.fetchAdd(1, .monotonic);
@@ -51,8 +60,12 @@ fn stylesheet(_: *const http.context.Context(State)) http.response.Response {
     };
 }
 
-fn createUser(context: *const http.context.Context(State), input: api.Json(CreateUser)) api.JsonResponse(User) {
+fn createUser(context: *const http.context.Context(State), input: api.Json(CreateUser)) !api.JsonResult(User) {
     _ = context.execution.state.requests.fetchAdd(1, .monotonic);
+    var validation = try api.Validation.init(context.execution.allocator, 4);
+    try api.validate(input.value, CreateUserValidator, &validation);
+    if (validation.hasIssues()) return .validation(validation.issues());
+
     const id = context.execution.state.next_user_id.fetchAdd(1, .monotonic);
     return .created(.{ .id = id, .name = input.value.name });
 }

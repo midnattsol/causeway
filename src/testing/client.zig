@@ -197,8 +197,20 @@ test "Client executes JSON routing extraction conversion and errors without sock
     const State = struct { created: usize = 0 };
     const Input = struct { name: []const u8 };
     const User = struct { id: usize, name: []const u8 };
+    const Validator = struct {
+        pub fn validate(value: Input, result: *api.Validation) !void {
+            if (value.name.len == 0) try result.add(.{
+                .path = "/name",
+                .code = "required",
+                .detail = "Name must not be empty",
+            });
+        }
+    };
     const Handler = struct {
-        fn create(context: *const http_context.Context(State), input: api.Json(Input)) !api.JsonResponse(User) {
+        fn create(context: *const http_context.Context(State), input: api.Json(Input)) !api.JsonResult(User) {
+            var validation = try api.Validation.init(context.execution.allocator, 4);
+            try api.validate(input.value, Validator, &validation);
+            if (validation.hasIssues()) return .validation(validation.issues());
             context.execution.state.created += 1;
             return .created(.{ .id = context.execution.state.created, .name = input.value.name });
         }
@@ -246,6 +258,15 @@ test "Client executes JSON routing extraction conversion and errors without sock
     try missing_body.expectStatus(.bad_request);
     const missing_problem = try missing_body.json(api.ApiError);
     try std.testing.expectEqualStrings("missing_json_body", missing_problem.type);
+
+    var validation_response = try client_value.post("/users").sendJson(.{ .name = "" });
+    defer validation_response.deinit();
+    try validation_response.expectStatus(.unprocessable_entity);
+    const validation_problem = try validation_response.json(api.ValidationError);
+    try std.testing.expectEqualStrings("validation_failed", validation_problem.type);
+    try std.testing.expectEqual(@as(usize, 1), validation_problem.issues.len);
+    try std.testing.expectEqualStrings("/name", validation_problem.issues[0].path);
+    try std.testing.expectEqualStrings("required", validation_problem.issues[0].code);
 
     var full = client_value.get("/");
     for (0..Client(State, AppDispatcher).maximum_headers) |_| full = try full.withHeader("x-test", "value");

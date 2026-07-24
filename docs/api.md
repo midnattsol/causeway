@@ -85,21 +85,81 @@ cannot carry status, detail, or field payloads.
 
 ## Validation
 
-Deserialization and input validation are separate:
+Deserialization and input validation are separate. Validators add stable issues
+to a bounded request-scoped collector:
 
 ```zig
 const Validator = struct {
-    pub fn validate(input: Input) !void {
+    pub fn validate(input: Input, result: *causeway.api.Validation) !void {
+        if (input.name.len == 0) try result.add(.{
+            .path = "/name",
+            .code = "required",
+            .detail = "Name must not be empty",
+        });
+    }
+};
+
+fn create(
+    context: *const causeway.http.context.Context(State),
+    input: causeway.api.Json(Input),
+) !causeway.api.JsonResult(User) {
+    var validation = try causeway.api.Validation.init(
+        context.execution.allocator,
+        16,
+    );
+    try causeway.api.validate(input.value, Validator, &validation);
+    if (validation.hasIssues()) return .validation(validation.issues());
+
+    return .created(.{ .id = 1, .name = input.value.name });
+}
+```
+
+`Issue.path` is a JSON Pointer. An empty path addresses the complete input.
+`Validation.add` copies path, code, and detail into the supplied allocator and
+returns `error.TooManyValidationIssues` at the configured maximum. Initialize
+it with the request allocator; its issues remain valid through response
+normalization and require no individual cleanup from an arena.
+
+`JsonResult(T)` has the same `intoResponse` contract as `JsonResponse(T)`. It
+supports `init`, `ok`, and `created` for success, plus `validation` for a `422`
+response shaped as:
+
+```json
+{
+  "type": "validation_failed",
+  "status": 422,
+  "detail": "Request validation failed",
+  "issues": [
+    {
+      "path": "/name",
+      "code": "required",
+      "detail": "Name must not be empty"
+    }
+  ]
+}
+```
+
+Validator error sets are preserved. Failures in the validation mechanism, such
+as a backend becoming unavailable, therefore remain application errors rather
+than being mislabeled as invalid input.
+
+Validation is explicit rather than hidden in `Json(T)`: a Zig error cannot carry
+the issue payload needed by the response, and no request-global side channel is
+introduced. Domain rules that depend on databases, authorization, or current
+application state remain in services or handlers.
+
+For simple checks that do not need structured issues, validators may still
+return their own errors:
+
+```zig
+const Validator = struct {
+    pub fn validate(input: Input, _: *causeway.api.Validation) !void {
         if (input.name.len == 0) return error.EmptyName;
     }
 };
 
-try causeway.api.validate(input.value, Validator);
+try causeway.api.validate(input.value, Validator, &validation);
 ```
-
-Validator error sets are preserved so applications can map input constraints
-separately from domain failures. Domain rules that depend on databases,
-authorization, or current application state belong in services or handlers.
 
 ## In-process testing
 

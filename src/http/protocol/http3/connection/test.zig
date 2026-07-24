@@ -10,6 +10,7 @@ const Session = @import("session.zig").Session;
 const Headers = @import("../../../message/headers.zig").Headers;
 const response_module = @import("../../../message/response.zig");
 const Response = response_module.Response;
+const http_context = @import("../../../context.zig");
 const route = @import("../../../routing/route.zig");
 const router = @import("../../../routing/router.zig");
 const push_message = @import("../../../message/push.zig");
@@ -215,18 +216,35 @@ test "HTTP/3 JSON API matches typed success and extraction error responses" {
     const State = struct {};
     const Input = struct { name: []const u8 };
     const User = struct { id: u8, name: []const u8 };
+    const Validator = struct {
+        pub fn validate(value: Input, result: *api.Validation) !void {
+            if (value.name.len == 0) try result.add(.{
+                .path = "/name",
+                .code = "required",
+                .detail = "Name must not be empty",
+            });
+        }
+    };
     const Handlers = struct {
-        fn create(input: api.Json(Input)) api.JsonResponse(User) {
+        fn create(context: *const http_context.Context(State), input: api.Json(Input)) !api.JsonResult(User) {
+            var validation = try api.Validation.init(context.execution.allocator, 4);
+            try api.validate(input.value, Validator, &validation);
+            if (validation.hasIssues()) return .validation(validation.issues());
             return .created(.{ .id = 1, .name = input.value.name });
         }
     };
     const Router = router.Router(.{route.route(.POST, "/users", Handlers.create)});
     const Dispatcher = api.Dispatcher(Router);
+    const api_test_config = comptime blk: {
+        var value = test_config;
+        value.max_response_body_size = 256;
+        break :blk value;
+    };
     const Run = struct {
         fn request(io: Io, body: []const u8, content_type: ?[]const u8, expected_status: []const u8, expected_body: []const u8) !void {
             var transport: FakeConnection = .{};
             var state: State = .{};
-            var session = Session(State, Dispatcher, FakeConnection, test_config).init(&transport, std.testing.allocator, &state, io);
+            var session = Session(State, Dispatcher, FakeConnection, api_test_config).init(&transport, std.testing.allocator, &state, io);
             defer session.deinit();
             try session.activate();
             try transport.feed(try support.clientUniId(0), "\x00\x04\x00", false);
@@ -293,6 +311,13 @@ test "HTTP/3 JSON API matches typed success and extraction error responses" {
         "application/json",
         "400",
         "{\"type\":\"missing_json_body\",\"status\":400,\"detail\":\"Missing JSON request body\"}",
+    );
+    try Run.request(
+        threaded.io(),
+        "{\"name\":\"\"}",
+        "application/json",
+        "422",
+        "{\"type\":\"validation_failed\",\"status\":422,\"detail\":\"Request validation failed\",\"issues\":[{\"path\":\"/name\",\"code\":\"required\",\"detail\":\"Name must not be empty\"}]}",
     );
 }
 

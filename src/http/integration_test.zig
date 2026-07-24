@@ -364,8 +364,20 @@ test "end-to-end app composes request id, route auth, router, and typed extracto
 const ApiState = struct { next_id: usize = 1 };
 const ApiInput = struct { name: []const u8 };
 const ApiUser = struct { id: usize, name: []const u8 };
+const ApiValidator = struct {
+    pub fn validate(value: ApiInput, result: *api.Validation) !void {
+        if (value.name.len == 0) try result.add(.{
+            .path = "/name",
+            .code = "required",
+            .detail = "Name must not be empty",
+        });
+    }
+};
 
-fn apiCreateUser(context: *const causeway.http.context.Context(ApiState), input: api.Json(ApiInput)) api.JsonResponse(ApiUser) {
+fn apiCreateUser(context: *const causeway.http.context.Context(ApiState), input: api.Json(ApiInput)) !api.JsonResult(ApiUser) {
+    var validation = try api.Validation.init(context.execution.allocator, 4);
+    try api.validate(input.value, ApiValidator, &validation);
+    if (validation.hasIssues()) return .validation(validation.issues());
     const id = context.execution.state.next_id;
     context.execution.state.next_id += 1;
     return .created(.{ .id = id, .name = input.value.name });
@@ -436,6 +448,16 @@ test "end-to-end JSON API normalizes typed responses and extraction errors" {
     try testing.expectEqualStrings(
         "{\"type\":\"missing_json_body\",\"status\":400,\"detail\":\"Missing JSON request body\"}",
         missing_body.body,
+    );
+
+    const validation_raw = try rawRequest(testing.allocator, io, harness.address, "POST /users HTTP/1.1\r\n" ++
+        "Host: localhost\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"name\":\"\"}");
+    defer testing.allocator.free(validation_raw);
+    const validation = try parseResponse(validation_raw, 0);
+    try testing.expectEqual(@as(u16, 422), validation.status);
+    try testing.expectEqualStrings(
+        "{\"type\":\"validation_failed\",\"status\":422,\"detail\":\"Request validation failed\",\"issues\":[{\"path\":\"/name\",\"code\":\"required\",\"detail\":\"Name must not be empty\"}]}",
+        validation.body,
     );
     try harness.stop();
 }

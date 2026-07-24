@@ -7,6 +7,7 @@ const connection_options = @import("options.zig");
 const frame = @import("../frame/root.zig");
 const frame_writer = @import("../frame/writer.zig");
 const hpack = @import("../hpack/codec.zig");
+const http_context = @import("../../../context.zig");
 const route = @import("../../../routing/route.zig");
 const router = @import("../../../routing/router.zig");
 const headers_module = @import("../../../message/headers.zig");
@@ -69,8 +70,20 @@ test "HTTP/2 JSON API matches typed success and extraction error responses" {
     const State = struct {};
     const Input = struct { name: []const u8 };
     const User = struct { id: u8, name: []const u8 };
+    const Validator = struct {
+        pub fn validate(value: Input, result: *api.Validation) !void {
+            if (value.name.len == 0) try result.add(.{
+                .path = "/name",
+                .code = "required",
+                .detail = "Name must not be empty",
+            });
+        }
+    };
     const Handlers = struct {
-        fn create(input: api.Json(Input)) api.JsonResponse(User) {
+        fn create(context: *const http_context.Context(State), input: api.Json(Input)) !api.JsonResult(User) {
+            var validation = try api.Validation.init(context.execution.allocator, 4);
+            try api.validate(input.value, Validator, &validation);
+            if (validation.hasIssues()) return .validation(validation.issues());
             return .created(.{ .id = 1, .name = input.value.name });
         }
     };
@@ -149,6 +162,13 @@ test "HTTP/2 JSON API matches typed success and extraction error responses" {
         "application/json",
         "400",
         "{\"type\":\"missing_json_body\",\"status\":400,\"detail\":\"Missing JSON request body\"}",
+    );
+    try Run.request(
+        threaded.io(),
+        "{\"name\":\"\"}",
+        "application/json",
+        "422",
+        "{\"type\":\"validation_failed\",\"status\":422,\"detail\":\"Request validation failed\",\"issues\":[{\"path\":\"/name\",\"code\":\"required\",\"detail\":\"Name must not be empty\"}]}",
     );
 }
 
