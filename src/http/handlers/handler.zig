@@ -1,7 +1,8 @@
 //! Static HTTP handler invocation with context and typed extractors.
 
 const std = @import("std");
-const Response = @import("../message/response.zig").Response;
+const response_module = @import("../message/response.zig");
+const Response = response_module.Response;
 const RequestBody = @import("../message/request_body.zig").RequestBody;
 const signature = @import("signature.zig");
 
@@ -30,7 +31,12 @@ pub fn invoke(comptime handler: anytype, context: anytype) !Response {
             try Parameter.extract(context);
     }
 
-    return @call(.auto, handler, args);
+    const result = switch (@typeInfo(function_info.return_type.?)) {
+        .error_union => try @call(.auto, handler, args),
+        else => @call(.auto, handler, args),
+    };
+    if (comptime @TypeOf(result) == Response) return result;
+    return response_module.normalize(result, context.execution.allocator);
 }
 
 // -----------------------------------------------------------------------------
@@ -39,6 +45,7 @@ pub fn invoke(comptime handler: anytype, context: anytype) !Response {
 
 const TestContext = struct {
     fail: bool = false,
+    execution: struct { allocator: std.mem.Allocator } = .{ .allocator = std.testing.allocator },
 };
 
 fn infallibleHandler(_: *const TestContext) Response {
@@ -52,6 +59,21 @@ fn fallibleHandler(context: *const TestContext) error{Failure}!Response {
 
 fn noArgumentsHandler() Response {
     return .{ .status = .no_content };
+}
+
+const TypedResponse = struct {
+    value: []const u8,
+    pub const is_http_response = true;
+    pub fn intoResponse(self: @This(), allocator: std.mem.Allocator) !Response {
+        return .{
+            .status = .created,
+            .body = .{ .bytes = try allocator.dupe(u8, self.value) },
+        };
+    }
+};
+
+fn typedResponseHandler() TypedResponse {
+    return .{ .value = "typed" };
 }
 
 test "invoke normalizes an infallible handler to !Response" {
@@ -77,6 +99,15 @@ test "invoke propagates a handler error" {
 test "invoke supports handlers without arguments" {
     const context = TestContext{};
     try std.testing.expectEqual(.no_content, (try invoke(noArgumentsHandler, &context)).status);
+}
+
+test "invoke normalizes typed handler results with the request allocator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const context = TestContext{ .execution = .{ .allocator = arena.allocator() } };
+    const response = try invoke(typedResponseHandler, &context);
+    try std.testing.expectEqual(.created, response.status);
+    try std.testing.expectEqualStrings("typed", response.body.asBytes().?);
 }
 
 const Path = @import("../extractors/path.zig").Path;

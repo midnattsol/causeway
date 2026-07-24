@@ -617,6 +617,29 @@ pub const Response = struct {
     }
 };
 
+/// Reports whether `T` is the common `Response` type or an explicit typed
+/// response adapter. Adapters must declare `is_http_response = true` and an
+/// `intoResponse(self, allocator)` method returning `Response` or `!Response`.
+pub fn isResponseResult(comptime T: type) bool {
+    if (T == Response) return true;
+    switch (@typeInfo(T)) {
+        .@"struct", .@"union", .@"enum", .@"opaque" => {},
+        else => return false,
+    }
+    if (!@hasDecl(T, "is_http_response") or !@hasDecl(T, "intoResponse")) return false;
+    return @TypeOf(T.is_http_response) == bool and T.is_http_response;
+}
+
+/// Converts an explicit typed response adapter to the protocol-independent
+/// response model. Callers should preserve the direct `Response` fast path when
+/// no conversion is needed.
+pub fn normalize(value: anytype, allocator: std.mem.Allocator) !Response {
+    const T = @TypeOf(value);
+    if (comptime T == Response) return value;
+    if (comptime !isResponseResult(T)) @compileError("value must be Response or an HTTP response adapter");
+    return value.intoResponse(allocator);
+}
+
 pub const ContentType = struct {
     // Text
     pub const json = "application/json";
@@ -670,6 +693,23 @@ test "Response initializes status headers and byte body" {
     try std.testing.expectEqualStrings("Hello", response.body.asBytes().?);
     try std.testing.expectEqual(@as(?u64, 5), response.body.contentLength());
     try std.testing.expectEqual(Connection.keep_alive, response.connection);
+}
+
+test "typed response adapters normalize through the common response model" {
+    const Typed = struct {
+        body: []const u8,
+        pub const is_http_response = true;
+        pub fn intoResponse(self: @This(), _: std.mem.Allocator) Response {
+            return .{ .status = .created, .body = .{ .bytes = self.body } };
+        }
+    };
+
+    try std.testing.expect(isResponseResult(Response));
+    try std.testing.expect(isResponseResult(Typed));
+    try std.testing.expect(!isResponseResult(struct {}));
+    const response = try normalize(Typed{ .body = "typed" }, std.testing.allocator);
+    try std.testing.expectEqual(Status.created, response.status);
+    try std.testing.expectEqualStrings("typed", response.body.asBytes().?);
 }
 
 test "Response supports empty headers and body fast path" {

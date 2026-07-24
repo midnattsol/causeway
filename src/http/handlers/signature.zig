@@ -1,7 +1,8 @@
 //! Compile-time validation of HTTP handler parameters and return values.
 
 const std = @import("std");
-const Response = @import("../message/response.zig").Response;
+const response_module = @import("../message/response.zig");
+const Response = response_module.Response;
 
 const Problem = enum {
     not_function,
@@ -17,7 +18,8 @@ const Problem = enum {
 /// A handler must be a non-generic, non-variadic function. Every parameter must
 /// be either `*const ContextType` or an HTTP extractor type, and the return must
 /// be `Response` or an error union whose payload is `Response`. Zero-argument
-/// handlers remain valid for endpoints that need no request data.
+/// handlers remain valid for endpoints that need no request data. Return payloads
+/// may also be explicit typed response adapters normalized by handler invocation.
 pub fn validate(comptime handler: anytype, comptime ContextType: type) void {
     const signature_problem = comptime problem(handler, ContextType);
     if (signature_problem == null) return;
@@ -28,7 +30,7 @@ pub fn validate(comptime handler: anytype, comptime ContextType: type) void {
         .variadic => @compileError("handler must not be variadic"),
         .parameter_type => @compileError("handler arguments must be *const ContextType or HTTP extractors"),
         .incompatible_body_access => @compileError("handler cannot combine BodyStream with another body extractor"),
-        .return_type => @compileError("handler must return Response or !Response"),
+        .return_type => @compileError("handler must return Response, a typed HTTP response, or an error union containing either"),
     }
 }
 
@@ -82,10 +84,10 @@ fn problem(comptime handler: anytype, comptime ContextType: type) ?Problem {
     if (has_streaming_body and body_access_count > 1) return .incompatible_body_access;
 
     const return_type = function_info.return_type orelse return .return_type;
-    if (return_type == Response) return null;
+    if (response_module.isResponseResult(return_type)) return null;
 
     return switch (@typeInfo(return_type)) {
-        .error_union => |error_union| if (error_union.payload == Response) null else .return_type,
+        .error_union => |error_union| if (response_module.isResponseResult(error_union.payload)) null else .return_type,
         else => .return_type,
     };
 }
@@ -111,6 +113,13 @@ const TestExtractor = struct {
     pub const is_http_extractor = true;
     pub fn extract(_: anytype) !@This() {
         return .{ .value = 1 };
+    }
+};
+
+const TestTypedResponse = struct {
+    pub const is_http_response = true;
+    pub fn intoResponse(_: @This(), _: std.mem.Allocator) Response {
+        return .{ .status = .created };
     }
 };
 
@@ -158,6 +167,10 @@ fn noArgumentsHandler() Response {
     return .{ .status = .ok };
 }
 
+fn typedResponseHandler() TestTypedResponse {
+    return .{};
+}
+
 fn wrongArgumentHandler(_: *TestContext) Response {
     return .{ .status = .ok };
 }
@@ -180,6 +193,7 @@ test "validate accepts context extractor mixed and zero-argument handlers" {
     validate(extractedHandler, TestContext);
     validate(mixedHandler, TestContext);
     validate(noArgumentsHandler, TestContext);
+    validate(typedResponseHandler, TestContext);
     validate(streamingBodyHandler, TestContext);
 }
 
