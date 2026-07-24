@@ -8,16 +8,23 @@ const value = @import("value.zig");
 /// Header lookup semantics are provided by `context.request.headers`. Optional
 /// values become `null` when absent; required and malformed values report
 /// `error.MissingHeader` and `error.InvalidHeader`, respectively.
-pub fn Header(comptime T: type, comptime name: []const u8) type {
+pub fn Header(comptime T: type, comptime header_name: []const u8) type {
     value.validate(T, "Header");
 
     return struct {
         value: T,
 
         pub const is_http_extractor = true;
+        pub const source = .header;
+        pub const Value = T;
+        pub const name = header_name;
+        pub const required = switch (@typeInfo(T)) {
+            .optional => false,
+            else => true,
+        };
 
         pub fn extract(context: anytype) !@This() {
-            const raw = context.request.headers.get(name) orelse {
+            const raw = context.request.headers.get(header_name) orelse {
                 return switch (@typeInfo(T)) {
                     .optional => .{ .value = null },
                     else => error.MissingHeader,
@@ -56,6 +63,10 @@ test "Header extracts strings and converted scalar values" {
     const SelectedMode = Header(Mode, "x-mode");
 
     try std.testing.expect(Length.is_http_extractor);
+    try std.testing.expect(Length.source == .header);
+    try std.testing.expect(Length.Value == usize);
+    try std.testing.expectEqualStrings("content-length", Length.name);
+    try std.testing.expect(Length.required);
     try std.testing.expectEqual(@as(usize, 12), (try Length.extract(testContext("Content-Length", "12"))).value);
     try std.testing.expectEqualStrings("text/plain", (try Kind.extract(testContext("Content-Type", "text/plain"))).value);
     try std.testing.expectEqual(Mode.fast, (try SelectedMode.extract(testContext("X-Mode", "fast"))).value);
@@ -64,6 +75,7 @@ test "Header extracts strings and converted scalar values" {
 test "Header handles optional, missing, and invalid values" {
     const Required = Header(bool, "x-enabled");
     const Optional = Header(?bool, "x-enabled");
+    try std.testing.expect(!Optional.required);
 
     try std.testing.expectError(error.MissingHeader, Required.extract(testContext("x-enabled", null)));
     try std.testing.expectEqual(null, (try Optional.extract(testContext("x-enabled", null))).value);

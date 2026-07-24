@@ -16,6 +16,9 @@ pub fn Query(comptime T: type) type {
         value: T,
 
         pub const is_http_extractor = true;
+        pub const source = .query;
+        pub const Value = T;
+        pub const required = queryRequired(T);
 
         pub fn extract(context: anytype) !@This() {
             if (T == []const u8) {
@@ -38,6 +41,15 @@ pub fn Query(comptime T: type) type {
     };
 }
 
+fn queryRequired(comptime T: type) bool {
+    if (T == []const u8) return true;
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_types, info.field_attrs) |FieldType, attributes| {
+        if (@typeInfo(FieldType) != .optional and attributes.defaultValue(FieldType) == null) return true;
+    }
+    return false;
+}
+
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -55,6 +67,9 @@ fn testContext(query: ?[]const u8, allocator: std.mem.Allocator) struct {
 test "Query extracts the raw query and reports absence" {
     const Raw = Query([]const u8);
     try std.testing.expect(Raw.is_http_extractor);
+    try std.testing.expect(Raw.source == .query);
+    try std.testing.expect(Raw.Value == []const u8);
+    try std.testing.expect(Raw.required);
     try std.testing.expectEqualStrings("page=2", (try Raw.extract(testContext("page=2", std.testing.allocator))).value);
     try std.testing.expectError(error.MissingQuery, Raw.extract(testContext(null, std.testing.allocator)));
 }
@@ -103,6 +118,10 @@ test "Query treats absent struct query as empty and applies defaults" {
     const Optional = struct { page: ?u8 };
     const Defaulted = struct { page: u8 = 1 };
     const Required = struct { page: u8 };
+
+    try std.testing.expect(!Query(Optional).required);
+    try std.testing.expect(!Query(Defaulted).required);
+    try std.testing.expect(Query(Required).required);
 
     try std.testing.expectEqual(null, (try Query(Optional).extract(testContext(null, std.testing.allocator))).value.page);
     try std.testing.expectEqual(@as(u8, 1), (try Query(Defaulted).extract(testContext(null, std.testing.allocator))).value.page);

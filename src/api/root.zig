@@ -27,3 +27,23 @@ pub fn Router(comptime routes: anytype) type {
 test {
     std.testing.refAllDecls(@This());
 }
+
+test "API Router preserves typed route definitions through error middleware" {
+    const Input = struct { name: []const u8 };
+    const Handler = struct {
+        fn create(_: Json(Input)) JsonResponse(Input) {
+            return .ok(.{ .name = "created" });
+        }
+    };
+    const App = Router(.{
+        @import("../http/routing/route.zig").route(.POST, "/users", Handler.create),
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), App.route_definitions.len);
+    try std.testing.expect(App.route_definitions[0].method.is(.POST));
+    try std.testing.expectEqualStrings("/users", App.route_definitions[0].pattern);
+    const Route = @TypeOf(App.route_definitions[0]);
+    const Extractor = @typeInfo(Route.Handler).@"fn".param_types[0].?;
+    try std.testing.expect(Extractor.source == .json_body);
+    try std.testing.expect(Extractor.Value == Input);
+}

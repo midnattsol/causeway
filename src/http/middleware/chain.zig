@@ -17,6 +17,12 @@ pub fn Chain(comptime middlewares: anytype, comptime Dispatcher: type) type {
     }
 
     return struct {
+        /// Preserves route definitions through global middleware wrappers.
+        pub const route_definitions = if (@hasDecl(Dispatcher, "route_definitions"))
+            Dispatcher.route_definitions
+        else
+            .{};
+
         /// Forwards pre-body route metadata without executing middleware.
         pub fn bodyLimit(method: Method, path: []const u8) ?usize {
             if (comptime @hasDecl(Dispatcher, "bodyLimit")) {
@@ -154,6 +160,13 @@ const FailingDispatcher = struct {
     }
 };
 
+const MetadataDispatcher = struct {
+    pub const route_definitions = .{ "first", "second" };
+    pub fn dispatch(_: anytype) !Response {
+        return .{ .status = .ok };
+    }
+};
+
 const Recover = struct {
     pub fn handle(context: anytype, next: anytype) !Response {
         return next.run(context) catch .{ .status = .service_unavailable };
@@ -168,6 +181,12 @@ test "Chain executes pre and post middleware in nesting order" {
 
     try std.testing.expectEqual(.ok, (try Dispatcher.dispatch(&context)).status);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6 }, events.items);
+}
+
+test "Chain preserves route definitions" {
+    const Wrapped = Chain(.{First}, MetadataDispatcher);
+    try std.testing.expectEqual(@as(usize, 2), Wrapped.route_definitions.len);
+    try std.testing.expectEqualStrings("second", Wrapped.route_definitions[1]);
 }
 
 test "Chain supports empty stacks and middleware short circuit" {

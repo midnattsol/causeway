@@ -8,16 +8,23 @@ const value = @import("value.zig");
 /// Optional values become `null` when the parameter is absent. All other
 /// supported types report `error.MissingPathParameter` on absence and
 /// `error.InvalidPathParameter` when conversion fails.
-pub fn Path(comptime T: type, comptime name: []const u8) type {
+pub fn Path(comptime T: type, comptime parameter_name: []const u8) type {
     value.validate(T, "Path");
 
     return struct {
         value: T,
 
         pub const is_http_extractor = true;
+        pub const source = .path;
+        pub const Value = T;
+        pub const name = parameter_name;
+        pub const required = switch (@typeInfo(T)) {
+            .optional => false,
+            else => true,
+        };
 
         pub fn extract(context: anytype) !@This() {
-            const raw = context.params.get(name) orelse {
+            const raw = context.params.get(parameter_name) orelse {
                 return switch (@typeInfo(T)) {
                     .optional => .{ .value = null },
                     else => error.MissingPathParameter,
@@ -74,6 +81,10 @@ test "Path extracts strings and converted scalar values" {
     const SelectedMode = Path(Mode, "mode");
 
     try std.testing.expect(Id.is_http_extractor);
+    try std.testing.expect(Id.source == .path);
+    try std.testing.expect(Id.Value == u32);
+    try std.testing.expectEqualStrings("id", Id.name);
+    try std.testing.expect(Id.required);
     try std.testing.expectEqual(@as(u32, 42), (try Id.extract(testContext("id", "42"))).value);
     try std.testing.expectEqualStrings("zig", (try Label.extract(testContext("label", "zig"))).value);
     try std.testing.expectEqual(true, (try Enabled.extract(testContext("enabled", "true"))).value);
@@ -91,6 +102,7 @@ test "Path extracts strings and converted scalar values" {
 test "Path handles missing and invalid values" {
     const Required = Path(u8, "id");
     const Optional = Path(?u8, "id");
+    try std.testing.expect(!Optional.required);
 
     try std.testing.expectError(error.MissingPathParameter, Required.extract(testContext("id", null)));
     try std.testing.expectEqual(null, (try Optional.extract(testContext("id", null))).value);

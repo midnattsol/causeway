@@ -69,6 +69,10 @@ pub fn RouterWithOptions(comptime routes: anytype, comptime options: anytype) ty
     }};
 
     return struct {
+        /// Original compile-time route tuple for documentation and tooling.
+        pub const route_definitions = routes;
+        pub const router_options = options;
+
         /// Returns the matched route's body limit without executing middleware or handlers.
         pub fn bodyLimit(method: Method, path: []const u8) ?usize {
             inline for (0..maximum_specificity + 1) |offset| {
@@ -504,6 +508,18 @@ test "Router dispatches static routes by method and path" {
 
     const post_context = TestContext{ .request = .{ .method = .POST, .path = "/users" } };
     try std.testing.expectEqualStrings("other", (try AppRouter.dispatch(&post_context)).body.asBytes().?);
+}
+
+test "Router exposes original route definitions and options" {
+    const AppRouter = RouterWithOptions(.{
+        route_module.route(.GET, "/health", staticHandler),
+        route_module.route(.POST, "/users", otherHandler),
+    }, .{ .method_mismatch = .method_not_allowed });
+
+    try std.testing.expectEqual(@as(usize, 2), AppRouter.route_definitions.len);
+    try std.testing.expect(AppRouter.route_definitions[0].method.is(.GET));
+    try std.testing.expectEqualStrings("/users", AppRouter.route_definitions[1].pattern);
+    try std.testing.expectEqual(MethodMismatchPolicy.method_not_allowed, AppRouter.router_options.method_mismatch);
 }
 
 test "Router dispatches extension methods" {

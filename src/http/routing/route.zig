@@ -8,7 +8,7 @@ const middleware_chain = @import("../middleware/chain.zig");
 
 /// Returns the route representation for a concrete handler and middleware stack.
 fn RouteType(
-    comptime Handler: type,
+    comptime HandlerFn: type,
     comptime route_middlewares: anytype,
     comptime route_body_limit: ?usize,
     comptime route_replay_safe: bool,
@@ -16,8 +16,9 @@ fn RouteType(
     return struct {
         method: Method,
         pattern: []const u8,
-        handler_fn: *const Handler,
+        handler_fn: *const HandlerFn,
 
+        pub const Handler = HandlerFn;
         pub const middlewares = route_middlewares;
         pub const max_body_size = route_body_limit;
         pub const replay_safe = route_replay_safe;
@@ -33,7 +34,7 @@ fn RouteType(
 
         /// Returns the same route with `outer` middleware wrapped around its
         /// existing route-local middleware.
-        pub fn withMiddleware(comptime self: @This(), comptime outer: anytype) RouteType(Handler, outer ++ route_middlewares, route_body_limit, route_replay_safe) {
+        pub fn withMiddleware(comptime self: @This(), comptime outer: anytype) RouteType(HandlerFn, outer ++ route_middlewares, route_body_limit, route_replay_safe) {
             return .{
                 .method = self.method,
                 .pattern = self.pattern,
@@ -42,7 +43,7 @@ fn RouteType(
         }
 
         /// Returns the same route with a stricter request-body limit.
-        pub fn withBodyLimit(comptime self: @This(), comptime maximum: usize) RouteType(Handler, route_middlewares, maximum, route_replay_safe) {
+        pub fn withBodyLimit(comptime self: @This(), comptime maximum: usize) RouteType(HandlerFn, route_middlewares, maximum, route_replay_safe) {
             if (maximum == 0) @compileError("route body limit must be positive");
             return .{
                 .method = self.method,
@@ -52,7 +53,7 @@ fn RouteType(
         }
 
         /// Marks the effective route pipeline as safe for replayable early data.
-        pub fn withReplaySafe(comptime self: @This()) RouteType(Handler, route_middlewares, route_body_limit, true) {
+        pub fn withReplaySafe(comptime self: @This()) RouteType(HandlerFn, route_middlewares, route_body_limit, true) {
             return .{
                 .method = self.method,
                 .pattern = self.pattern,
@@ -157,6 +158,7 @@ test "route stores its method pattern and handler" {
     try std.testing.expect(value.method.eql(.GET));
     try std.testing.expectEqualStrings("/users/:id", value.pattern);
     try std.testing.expect(value.handler_fn == firstHandler);
+    try std.testing.expect(@TypeOf(value).Handler == @TypeOf(firstHandler));
 }
 
 test "route accepts extension methods" {

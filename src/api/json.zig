@@ -29,6 +29,7 @@ pub fn Json(comptime T: type) type {
         pub const source = .json_body;
         pub const Value = T;
         pub const content_type = media_type;
+        pub const required = true;
 
         pub fn extract(context: anytype) !@This() {
             if (!supportedContentType(context.request.headers)) return error.UnsupportedJsonMediaType;
@@ -130,6 +131,9 @@ test "Json parses request-scoped values independently of body storage" {
     const headers: Headers = .{ .items = &.{.{ .name = "Content-Type", .value = "application/json; charset=utf-8" }} };
 
     const input = try Json(Input).extract(testContext(.init(&body_state), headers, arena.allocator()));
+    try std.testing.expect(Json(Input).source == .json_body);
+    try std.testing.expect(Json(Input).Value == Input);
+    try std.testing.expect(Json(Input).required);
     @memset(&bytes, 'x');
     try std.testing.expectEqualStrings("Alice", input.value.name);
     try std.testing.expectEqual(@as(u8, 2), input.value.count);

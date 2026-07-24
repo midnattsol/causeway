@@ -67,6 +67,8 @@ pub fn JsonResult(comptime T: type) type {
         pub const is_http_response = true;
         pub const Value = T;
         pub const content_type = json.media_type;
+        pub const Error = ValidationError;
+        pub const error_status = std.http.Status.unprocessable_entity;
 
         pub fn init(status: std.http.Status, value: T) @This() {
             return .{ .success = .init(status, value) };
@@ -160,6 +162,9 @@ test "JsonResult serializes success and validation responses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
+    try std.testing.expect(JsonResult(User).Value == User);
+    try std.testing.expect(JsonResult(User).Error == ValidationError);
+    try std.testing.expectEqual(std.http.Status.unprocessable_entity, JsonResult(User).error_status);
 
     const success = try JsonResult(User).created(.{ .id = 1 }).intoResponse(allocator);
     try std.testing.expectEqual(std.http.Status.created, success.status);
