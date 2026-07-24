@@ -10,6 +10,9 @@ const Request = request_module.Request;
 const Method = request_module.Method;
 const RequestBody = @import("../http/message/request_body.zig").RequestBody;
 const response_module = @import("../http/message/response.zig");
+const middleware = @import("../http/middleware/root.zig");
+const route = @import("../http/routing/route.zig");
+const router = @import("../http/routing/router.zig");
 
 pub const Response = struct {
     status: std.http.Status,
@@ -53,6 +56,14 @@ pub const Response = struct {
 };
 
 pub fn Client(comptime State: type, comptime Dispatcher: type) type {
+    return ClientType(State, null, Dispatcher);
+}
+
+pub fn ClientWithLocals(comptime State: type, comptime Locals: type, comptime Dispatcher: type) type {
+    return ClientType(State, Locals, Dispatcher);
+}
+
+fn ClientType(comptime State: type, comptime Locals: ?type, comptime Dispatcher: type) type {
     return struct {
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -67,6 +78,7 @@ pub fn Client(comptime State: type, comptime Dispatcher: type) type {
             target: []const u8,
             headers: [maximum_headers]Header = undefined,
             header_count: usize = 0,
+            early_data: http_context.EarlyData = .none,
 
             pub fn withHeader(self: @This(), name: []const u8, value: []const u8) !@This() {
                 var result = self;
@@ -76,12 +88,18 @@ pub fn Client(comptime State: type, comptime Dispatcher: type) type {
                 return result;
             }
 
+            pub fn withEarlyData(self: @This(), value: http_context.EarlyData) @This() {
+                var result = self;
+                result.early_data = value;
+                return result;
+            }
+
             pub fn send(self: @This()) !Response {
-                return self.client.dispatch(self.method, self.target, self.headers[0..self.header_count], null);
+                return self.client.dispatch(self.method, self.target, self.headers[0..self.header_count], null, self.early_data);
             }
 
             pub fn sendBody(self: @This(), body: []const u8) !Response {
-                return self.client.dispatch(self.method, self.target, self.headers[0..self.header_count], body);
+                return self.client.dispatch(self.method, self.target, self.headers[0..self.header_count], body, self.early_data);
             }
 
             pub fn sendJson(self: @This(), value: anytype) !Response {
@@ -101,6 +119,7 @@ pub fn Client(comptime State: type, comptime Dispatcher: type) type {
                     self.target,
                     headers[0 .. self.header_count + 1],
                     output.written(),
+                    self.early_data,
                 );
             }
         };
@@ -133,10 +152,17 @@ pub fn Client(comptime State: type, comptime Dispatcher: type) type {
             return self.request(.DELETE, target);
         }
 
-        fn dispatch(self: *Self, method: Method, target: []const u8, headers: []const Header, body: ?[]const u8) !Response {
+        fn dispatch(
+            self: *Self,
+            method: Method,
+            target: []const u8,
+            headers: []const Header,
+            body: ?[]const u8,
+            early_data: http_context.EarlyData,
+        ) !Response {
             var request_arena = std.heap.ArenaAllocator.init(self.allocator);
             defer request_arena.deinit();
-            return self.dispatchWithArena(&request_arena, method, target, headers, body);
+            return self.dispatchWithArena(&request_arena, method, target, headers, body, early_data);
         }
 
         fn dispatchWithArena(
@@ -146,13 +172,24 @@ pub fn Client(comptime State: type, comptime Dispatcher: type) type {
             target: []const u8,
             headers: []const Header,
             body: ?[]const u8,
+            early_data: http_context.EarlyData,
         ) !Response {
             var body_state = if (body) |bytes| RequestBody.State.initBuffered(bytes) else RequestBody.State.initAbsent();
             const request_value = try Request.init(target, method, .{ .items = headers }, .init(&body_state));
-            const Context = http_context.Context(State);
-            const context = Context{
+            const Context = if (Locals) |LocalState|
+                http_context.ContextWithLocals(State, LocalState)
+            else
+                http_context.Context(State);
+            var locals: if (Locals) |LocalState| LocalState else void = if (Locals != null) .{} else {};
+            const context = if (Locals) |_| Context{
                 .execution = .{ .state = self.state, .allocator = request_arena.allocator(), .io = self.io },
                 .request = request_value,
+                .early_data = early_data,
+                .locals = &locals,
+            } else Context{
+                .execution = .{ .state = self.state, .allocator = request_arena.allocator(), .io = self.io },
+                .request = request_value,
+                .early_data = early_data,
             };
             var response = try Dispatcher.dispatch(&context);
             var completed = false;
@@ -220,7 +257,6 @@ test "Client executes JSON routing extraction conversion and errors without sock
             return .created(.{ .id = context.execution.state.created, .name = input.value.name });
         }
     };
-    const route = @import("../http/routing/route.zig");
     const AppDispatcher = api.Router(.{route.route(.POST, "/users", Handler.create)});
 
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
@@ -275,4 +311,132 @@ test "Client executes JSON routing extraction conversion and errors without sock
     var full = client_value.get("/");
     for (0..Client(State, AppDispatcher).maximum_headers) |_| full = try full.withHeader("x-test", "value");
     try std.testing.expectError(error.TooManyRequestHeaders, full.withHeader("x-extra", "value"));
+}
+
+test "ClientWithLocals resets locals and exposes early-data provenance" {
+    const State = struct {
+        fresh_locals: usize = 0,
+        accepted_early: usize = 0,
+        observed_request_id: []const u8 = "",
+    };
+    const Locals = struct { request_id: []const u8 = "" };
+    const SetRequestId = struct {
+        pub fn handle(context: anytype, next: anytype) !response_module.Response {
+            if (context.locals.request_id.len == 0) context.execution.state.fresh_locals += 1;
+            context.locals.request_id = "test-request";
+            return next.run(context);
+        }
+    };
+    const Handler = struct {
+        fn get(context: *const http_context.ContextWithLocals(State, Locals)) response_module.Response {
+            context.execution.state.observed_request_id = context.locals.request_id;
+            if (context.early_data == .accepted) context.execution.state.accepted_early += 1;
+            return .{ .status = .ok };
+        }
+    };
+    const Router = router.Router(.{route.route(.GET, "/", Handler.get)});
+    const Dispatcher = middleware.Chain(.{SetRequestId}, Router);
+
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var state: State = .{};
+    var client_value = ClientWithLocals(State, Locals, Dispatcher).init(std.testing.allocator, threaded.io(), &state);
+
+    var early = try client_value.get("/").withEarlyData(.accepted).send();
+    defer early.deinit();
+    var ordinary = try client_value.get("/").send();
+    defer ordinary.deinit();
+    try std.testing.expectEqual(@as(usize, 2), state.fresh_locals);
+    try std.testing.expectEqual(@as(usize, 1), state.accepted_early);
+    try std.testing.expectEqualStrings("test-request", state.observed_request_id);
+}
+
+test "Client captures streaming lifecycle in wire order" {
+    const State = struct {
+        produced: usize = 0,
+        finalized: usize = 0,
+        completed: usize = 0,
+        finalized_before_completion: bool = false,
+        completion_succeeded: bool = false,
+    };
+    const Producer = struct {
+        state: *State,
+        pub fn produce(self: *@This(), writer: *std.Io.Writer) !void {
+            self.state.produced += 1;
+            try writer.writeAll("streamed");
+        }
+        pub fn finalize(self: *@This()) void {
+            self.state.finalized += 1;
+        }
+    };
+    const Observer = struct {
+        state: *State,
+        pub fn complete(self: *@This(), result: response_module.CompletionResult) void {
+            self.state.completed += 1;
+            self.state.finalized_before_completion = self.state.finalized == 1;
+            self.state.completion_succeeded = switch (result) {
+                .success => true,
+                .failure => false,
+            };
+        }
+    };
+    const Handler = struct {
+        fn get(context: *const http_context.Context(State)) !response_module.Response {
+            var response = response_module.Response.streaming(
+                .ok,
+                .empty,
+                try response_module.Stream.init(context.execution.allocator, Producer{ .state = context.execution.state }, .{}),
+            );
+            response.completion = try response_module.Completion.create(
+                context.execution.allocator,
+                Observer{ .state = context.execution.state },
+                null,
+            );
+            return response;
+        }
+    };
+    const Dispatcher = router.Router(.{route.route(.GET, "/stream", Handler.get)});
+
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var state: State = .{};
+    var client_value = Client(State, Dispatcher).init(std.testing.allocator, threaded.io(), &state);
+    var response = try client_value.get("/stream").send();
+    defer response.deinit();
+
+    try response.expectBody("streamed");
+    try std.testing.expectEqual(@as(usize, 1), state.produced);
+    try std.testing.expectEqual(@as(usize, 1), state.finalized);
+    try std.testing.expectEqual(@as(usize, 1), state.completed);
+    try std.testing.expect(state.finalized_before_completion);
+    try std.testing.expect(state.completion_succeeded);
+}
+
+test "Client executes custom application error mapping" {
+    const State = struct {};
+    const Handler = struct {
+        fn get(_: *const http_context.Context(State)) error{DatabaseUnavailable}!response_module.Response {
+            return error.DatabaseUnavailable;
+        }
+    };
+    const Mapper = struct {
+        pub fn map(err: anyerror, _: anytype) ?response_module.Response {
+            if (err != error.DatabaseUnavailable) return null;
+            return .{
+                .status = .service_unavailable,
+                .body = .{ .bytes = "dependency unavailable" },
+            };
+        }
+    };
+    const Router = router.Router(.{route.route(.GET, "/failure", Handler.get)});
+    const Dispatcher = middleware.Chain(.{middleware.ErrorMapping(Mapper)}, Router);
+
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var state: State = .{};
+    var client_value = Client(State, Dispatcher).init(std.testing.allocator, threaded.io(), &state);
+    var response = try client_value.get("/failure").send();
+    defer response.deinit();
+    try response.expectStatus(.service_unavailable);
+    try response.expectBody("dependency unavailable");
 }

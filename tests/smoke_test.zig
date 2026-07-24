@@ -11,6 +11,7 @@ test "public module exposes architectural layers" {
 
 test "public API exposes in-process testing" {
     _ = causeway.testing.Client;
+    _ = causeway.testing.ClientWithLocals;
     _ = causeway.testing.Response;
     try std.testing.expect(true);
 }
