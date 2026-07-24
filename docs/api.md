@@ -231,8 +231,46 @@ The client executes custom middleware and error mappers, but intentionally does
 not apply protocol body limits or simulate framing, flow control, keep-alive,
 replay admission, or stream resets. Those require wire-level integration tests.
 
+## Compile-time metadata
+
+Routers expose their original route tuple in registration order. Global
+`middleware.Chain` wrappers, including `api.Router`, preserve it:
+
+```zig
+inline for (Dispatcher.route_definitions) |definition| {
+    const Route = @TypeOf(definition);
+    const handler = @typeInfo(Route.Handler).@"fn";
+
+    _ = definition.method;
+    _ = definition.pattern;
+    _ = handler.param_types;
+    _ = handler.return_type;
+}
+```
+
+Route types also retain `middlewares`, `max_body_size`, and `replay_safe`.
+Relevant extractors expose declarations that can be inspected without executing
+a request:
+
+| Extractor | Metadata |
+| --- | --- |
+| `api.Json(T)` | `source`, `Value`, `required`, `content_type` |
+| `Path(T, name)` | `source`, `Value`, `name`, `required` |
+| `Header(T, name)` | `source`, `Value`, `name`, `required` |
+| `Query(T)` | `source`, `Value`, `required` |
+
+For `Query(T)`, `required` reports whether an absent query would leave at least
+one non-optional field without a default. Individual query fields remain
+available through normal Zig struct reflection.
+
+`JsonResponse(T)` exposes `Value` and `content_type`. `JsonResult(T)` additionally
+exposes `Error` and `error_status` for its structured `422` alternative. A
+`JsonResponse` success status is runtime data because `ok`, `created`, and
+`init` share the same response type; metadata does not invent a status.
+
 ## Current boundary
 
-The API layer intentionally does not yet expose OpenAPI generation or a route
-documentation DSL. Metadata will be added after JSON, typed response, error,
-and ownership contracts have demonstrated stable use.
+The API layer intentionally does not yet generate OpenAPI or expose a separate
+documentation DSL. The metadata above is the input to the next slice. OpenAPI
+must either represent runtime success status conservatively or add an explicit,
+small route-level status annotation rather than guessing from handler bodies.

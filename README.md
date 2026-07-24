@@ -30,7 +30,7 @@ The implemented scope is a bounded **server-side** HTTP/3 stack, not a universal
 
 See [the explicit HTTP/3 non-goals](docs/http3.md#explicit-non-goals-and-current-exclusions) for the maintained detailed list.
 
-The integrated API layer currently provides request-scoped JSON extraction, typed JSON responses, structured error mapping, bounded validation issues with `422` responses, and in-process pipeline testing with typed locals and response lifecycle coverage. OpenAPI metadata is planned after these contracts mature. GraphQL and integrations with external dependencies are intentionally outside this package.
+The integrated API layer currently provides request-scoped JSON extraction, typed JSON responses, structured error mapping, bounded validation issues with `422` responses, in-process pipeline testing with typed locals and response lifecycle coverage, and compile-time route/extractor metadata. OpenAPI generation is the next planned layer. GraphQL and integrations with external dependencies are intentionally outside this package.
 
 ## Toolchain
 
