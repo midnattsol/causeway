@@ -32,6 +32,11 @@ pub const Response = struct {
         if (!std.mem.eql(u8, self.body, expected)) return error.UnexpectedBody;
     }
 
+    pub fn expectHeader(self: *const Response, name: []const u8, expected: []const u8) !void {
+        const actual = self.headers.get(name) orelse return error.MissingExpectedHeader;
+        if (!std.mem.eql(u8, actual, expected)) return error.UnexpectedHeader;
+    }
+
     /// Parses JSON into the response arena. Returned slices remain valid until
     /// `deinit`; callers do not separately free the result.
     pub fn json(self: *Response, comptime T: type) !T {
@@ -58,9 +63,9 @@ pub fn Client(comptime State: type, comptime Dispatcher: type) type {
             headers: [maximum_headers]Header = undefined,
             header_count: usize = 0,
 
-            pub fn withHeader(self: @This(), name: []const u8, value: []const u8) @This() {
+            pub fn withHeader(self: @This(), name: []const u8, value: []const u8) !@This() {
                 var result = self;
-                if (result.header_count == result.headers.len) @panic("Causeway test request header capacity exceeded");
+                if (result.header_count == result.headers.len) return error.TooManyRequestHeaders;
                 result.headers[result.header_count] = .{ .name = name, .value = value };
                 result.header_count += 1;
                 return result;
@@ -175,6 +180,7 @@ pub fn Client(comptime State: type, comptime Dispatcher: type) type {
                     break :blk output.written();
                 },
             };
+            response.body.finalize();
             response.complete(.success);
             completed = true;
             return .{
@@ -215,10 +221,13 @@ test "Client executes JSON routing extraction conversion and errors without sock
     try std.testing.expectEqualStrings("Alice", user.name);
 
     var invalid = try client_value.post("/users")
-        .withHeader("content-type", "application/json")
+        .withHeader("content-type", "application/json");
+    invalid = try invalid.withHeader("accept", "application/json");
+    var invalid_response = try invalid
         .sendBody("{");
-    defer invalid.deinit();
-    try invalid.expectStatus(.bad_request);
-    const problem = try invalid.json(api.ApiError);
+    defer invalid_response.deinit();
+    try invalid_response.expectStatus(.bad_request);
+    try invalid_response.expectHeader("content-type", "application/json");
+    const problem = try invalid_response.json(api.ApiError);
     try std.testing.expectEqualStrings("invalid_json", problem.type);
 }

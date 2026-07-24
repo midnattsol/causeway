@@ -84,8 +84,10 @@ fn supportedContentType(headers: Headers) bool {
     const separator = std.mem.findScalar(u8, raw, ';') orelse raw.len;
     const value = std.mem.trim(u8, raw[0..separator], " \t");
     if (std.ascii.eqlIgnoreCase(value, media_type)) return true;
-    if (value.len <= "+json".len or !std.ascii.endsWithIgnoreCase(value, "+json")) return false;
-    return std.ascii.startsWithIgnoreCase(value, "application/");
+    const prefix = "application/";
+    const suffix = "+json";
+    if (value.len <= prefix.len + suffix.len or !std.ascii.endsWithIgnoreCase(value, suffix)) return false;
+    return std.ascii.startsWithIgnoreCase(value, prefix);
 }
 
 fn testContext(body: RequestBody, headers: Headers, allocator: std.mem.Allocator) struct {
@@ -129,6 +131,11 @@ test "Json rejects missing media type body and malformed input" {
     try std.testing.expectError(
         error.InvalidJson,
         Json(Input).extract(testContext(.init(&malformed), headers, std.testing.allocator)),
+    );
+    const empty_vendor: Headers = .{ .items = &.{.{ .name = "content-type", .value = "application/+json" }} };
+    try std.testing.expectError(
+        error.UnsupportedJsonMediaType,
+        Json(Input).extract(testContext(.init(&absent), empty_vendor, std.testing.allocator)),
     );
 }
 
