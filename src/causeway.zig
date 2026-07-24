@@ -8,11 +8,6 @@ const std = @import("std");
 pub const core = @import("core/root.zig");
 pub const quic = @import("quic/root.zig");
 pub const http = @import("http/root.zig");
-pub const rest = @import("rest/root.zig");
-pub const graphql = @import("graphql/root.zig");
-pub const openapi = @import("openapi/root.zig");
-pub const adapters = @import("adapters/root.zig");
-pub const testing = @import("testing/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

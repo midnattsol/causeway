@@ -28,7 +28,7 @@ The implemented scope is a bounded **server-side** HTTP/3 stack, not a universal
 
 See [the explicit HTTP/3 non-goals](docs/http3.md#explicit-non-goals-and-current-exclusions) for the maintained detailed list.
 
-REST, GraphQL, OpenAPI, and adapters remain separate higher-level phases.
+An integrated JSON API layer is under development. GraphQL and integrations with external dependencies are intentionally outside this package.
 
 ## Toolchain
 
@@ -99,10 +99,6 @@ The HTTP/1 and HTTP/2 examples share the basic router from `examples/common.zig`
 - `core`: protocol-independent execution context and application state.
 - `http`: messages, semantics, wire protocols, transport, routing, handlers, extractors, and middleware.
 - `quic`: UDP endpoint, connection, TLS, packets, streams, recovery, CIDs, and paths.
-- `rest`: JSON responses, API errors, validation, and REST conventions.
-- `graphql`: planned higher-level GraphQL integration.
-- `openapi`: planned route metadata and OpenAPI generation.
-- `adapters`: optional integrations such as OIDC and observability.
 
 The HTTP package is split by responsibility:
 
