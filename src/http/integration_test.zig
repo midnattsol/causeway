@@ -386,8 +386,16 @@ fn apiCreateUser(context: *const causeway.http.context.Context(ApiState), input:
     }} });
 }
 
+fn apiOpenApi(context: *const causeway.http.context.Context(ApiState)) !Response {
+    return api.openapi.response(ApiDispatcher, context.execution.allocator, .{
+        .title = "Integration API",
+        .version = "1.0.0",
+    });
+}
+
 const ApiDispatcher = api.Router(.{
-    routing.route.route(.POST, "/users", apiCreateUser),
+    routing.route.route(.POST, "/users", apiCreateUser).withResponseStatus(.created),
+    routing.route.route(.GET, "/openapi.json", apiOpenApi),
 });
 const ApiApp = app_module.AppWithOptions(ApiState, ApiDispatcher, .{});
 
@@ -462,6 +470,17 @@ test "end-to-end JSON API normalizes typed responses and extraction errors" {
         "{\"type\":\"validation_failed\",\"status\":422,\"detail\":\"Request validation failed\",\"issues\":[{\"path\":\"/name\",\"code\":\"required\",\"detail\":\"Name must not be empty\"}]}",
         validation.body,
     );
+
+    const openapi_raw = try rawRequest(testing.allocator, io, harness.address, "GET /openapi.json HTTP/1.1\r\n" ++
+        "Host: localhost\r\nConnection: close\r\n\r\n");
+    defer testing.allocator.free(openapi_raw);
+    const openapi_response = try parseResponse(openapi_raw, 0);
+    try testing.expectEqual(@as(u16, 200), openapi_response.status);
+    try testing.expectEqualStrings("application/json", openapi_response.header("content-type").?);
+    const document = try std.json.parseFromSlice(std.json.Value, testing.allocator, openapi_response.body, .{});
+    defer document.deinit();
+    try testing.expect(std.mem.find(u8, openapi_response.body, "\"/users\"") != null);
+    try testing.expect(std.mem.find(u8, openapi_response.body, "\"201\":") != null);
     try harness.stop();
 }
 

@@ -270,7 +270,7 @@ exposes `Error` and `error_status` for its structured `422` alternative. A
 
 ## Current boundary
 
-The API layer intentionally does not yet generate OpenAPI or expose a separate
-documentation DSL. The metadata above is the input to the next slice. OpenAPI
-must either represent runtime success status conservatively or add an explicit,
-small route-level status annotation rather than guessing from handler bodies.
+The API layer generates a minimal OpenAPI 3.1 document from this metadata.
+Runtime success status is represented conservatively as `200` unless the route
+uses `withResponseStatus`. See [`openapi.md`](openapi.md) for generation, schema
+support, endpoint setup, and explicit exclusions.

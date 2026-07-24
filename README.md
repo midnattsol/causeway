@@ -30,7 +30,7 @@ The implemented scope is a bounded **server-side** HTTP/3 stack, not a universal
 
 See [the explicit HTTP/3 non-goals](docs/http3.md#explicit-non-goals-and-current-exclusions) for the maintained detailed list.
 
-The integrated API layer currently provides request-scoped JSON extraction, typed JSON responses, structured error mapping, bounded validation issues with `422` responses, in-process pipeline testing with typed locals and response lifecycle coverage, and compile-time route/extractor metadata. OpenAPI generation is the next planned layer. GraphQL and integrations with external dependencies are intentionally outside this package.
+The integrated API layer provides request-scoped JSON extraction, typed JSON responses, structured error mapping, bounded validation issues with `422` responses, in-process pipeline testing with typed locals and response lifecycle coverage, compile-time route/extractor metadata, and OpenAPI 3.1 generation. GraphQL and integrations with external dependencies are intentionally outside this package.
 
 ## Toolchain
 
@@ -84,7 +84,8 @@ fn createUser(input: api.Json(CreateUser)) api.JsonResponse(User) {
 }
 
 const Router = api.Router(.{
-    http.routing.route.route(.POST, "/users", createUser),
+    http.routing.route.route(.POST, "/users", createUser)
+        .withResponseStatus(.created),
 });
 ```
 
@@ -98,6 +99,7 @@ Run HTTP/1 on TCP port `8080`:
 zig build example-http1
 curl http://127.0.0.1:8080/
 curl -H 'content-type: application/json' -d '{"name":"Alice"}' http://127.0.0.1:8080/api/users
+curl http://127.0.0.1:8080/openapi.json
 ```
 
 Run h2c prior-knowledge HTTP/2 on TCP port `8081`:
@@ -137,7 +139,7 @@ The HTTP package is split by responsibility:
 - `src/http/routing/`, `handlers/`, `extractors/`, and `middleware/`: the shared application pipeline;
 - `src/quic/`: the UDP/QUIC transport used by HTTP/3.
 
-See [`docs/api.md`](docs/api.md) for typed API construction, [`docs/http-streaming.md`](docs/http-streaming.md) for request/response body streaming, [`docs/http-files.md`](docs/http-files.md) for file transfer and cache semantics, [`docs/http-protocol.md`](docs/http-protocol.md) for HTTP/1.x behavior, [`docs/http2.md`](docs/http2.md) for HTTP/2, and [`docs/http3.md`](docs/http3.md) for HTTP/3/QUIC architecture, limits, security, and validation.
+See [`docs/api.md`](docs/api.md) for typed API construction, [`docs/openapi.md`](docs/openapi.md) for OpenAPI generation, [`docs/http-streaming.md`](docs/http-streaming.md) for request/response body streaming, [`docs/http-files.md`](docs/http-files.md) for file transfer and cache semantics, [`docs/http-protocol.md`](docs/http-protocol.md) for HTTP/1.x behavior, [`docs/http2.md`](docs/http2.md) for HTTP/2, and [`docs/http3.md`](docs/http3.md) for HTTP/3/QUIC architecture, limits, security, and validation.
 
 ## License
 

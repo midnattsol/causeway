@@ -73,6 +73,13 @@ fn createUser(context: *const http.context.Context(State), input: api.Json(Creat
     }} });
 }
 
+fn openApi(context: *const http.context.Context(State)) !http.response.Response {
+    return api.openapi.response(Router, context.execution.allocator, .{
+        .title = "Causeway example API",
+        .version = "1.0.0",
+    });
+}
+
 fn earlyHello(context: *const http.context.Context(State)) http.response.Response {
     _ = context.execution.state.requests.fetchAdd(1, .monotonic);
     return .{
@@ -105,12 +112,13 @@ fn webTransport(context: *const http.context.Context(State)) !http.response.Resp
 
 const routes = .{
     http.routing.route.route(.GET, "/", hello),
-    http.routing.route.route(.POST, "/api/users", createUser),
+    http.routing.route.route(.POST, "/api/users", createUser).withResponseStatus(.created),
+    http.routing.route.route(.GET, "/openapi.json", openApi),
 };
 
 const http3_routes = .{
     http.routing.route.route(.GET, "/", http3Hello),
-    http.routing.route.route(.POST, "/api/users", createUser),
+    http.routing.route.route(.POST, "/api/users", createUser).withResponseStatus(.created),
     http.routing.route.route(.GET, "/assets/app.css", stylesheet),
     http.routing.route.route(.GET, "/early", earlyHello).withReplaySafe(),
     http.routing.route.route(.CONNECT, "/webtransport", webTransport),
