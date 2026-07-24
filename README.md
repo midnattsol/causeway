@@ -1,6 +1,8 @@
 # Causeway
 
-Causeway is a typed, modular HTTP API library for Zig. Its protocol-independent request pipeline is separated from wire-protocol engines and network transport. The repository contains server-side HTTP/1.x, HTTP/2, and HTTP/3 engines plus a bounded QUIC/TLS transport.
+Typed HTTP servers and APIs over HTTP/1, HTTP/2, and HTTP/3 in Zig.
+
+Causeway is a compile-time typed framework for building HTTP servers and APIs. It combines routing, extractors, middleware, streaming bodies, server lifecycle, typed JSON, and an owned HTTP/1, HTTP/2, HTTP/3, and QUIC stack behind one protocol-independent handler model. It has no runtime dependencies outside Zig's standard library.
 
 ## Status
 
@@ -28,7 +30,7 @@ The implemented scope is a bounded **server-side** HTTP/3 stack, not a universal
 
 See [the explicit HTTP/3 non-goals](docs/http3.md#explicit-non-goals-and-current-exclusions) for the maintained detailed list.
 
-An integrated JSON API layer is under development. GraphQL and integrations with external dependencies are intentionally outside this package.
+The integrated API layer currently provides request-scoped JSON extraction, typed JSON responses, structured error mapping, explicit validation hooks, and in-process pipeline testing. OpenAPI metadata is planned after these contracts mature. GraphQL and integrations with external dependencies are intentionally outside this package.
 
 ## Toolchain
 
@@ -65,6 +67,29 @@ zig build ci
 
 `http2-compliance` and `http3-compliance` are self-contained repository matrices and are included by `zig build test`. `http3-fuzz` exercises HTTP/3/QPACK primitives and bounded complete-session scripts; `quic-fuzz` targets QUIC packets, transport state, recovery, streams, and TLS wire parsing. The benchmark targets report microbenchmark costs and should be run with an optimized build. These targets are regression tools, not claims of complete independent interoperability certification.
 
+## JSON APIs
+
+Typed API results normalize to the same `Response` consumed by every protocol engine:
+
+```zig
+const causeway = @import("causeway");
+const api = causeway.api;
+const http = causeway.http;
+
+const CreateUser = struct { name: []const u8 };
+const User = struct { id: usize, name: []const u8 };
+
+fn createUser(input: api.Json(CreateUser)) api.JsonResponse(User) {
+    return .created(.{ .id = 1, .name = input.value.name });
+}
+
+const Router = api.Dispatcher(http.routing.router.Router(.{
+    http.routing.route.route(.POST, "/users", createUser),
+}));
+```
+
+`api.Json(T)` requires a JSON media type and copies decoded strings into the request allocator. Its value remains valid through response completion but must be copied before being retained longer. `api.Dispatcher` maps JSON and built-in HTTP extractor failures to a stable JSON error response before protocol-specific fallback policies run. See [`docs/api.md`](docs/api.md) for ownership, validation, errors, and in-process testing.
+
 ## Examples
 
 Run HTTP/1 on TCP port `8080`:
@@ -72,6 +97,7 @@ Run HTTP/1 on TCP port `8080`:
 ```sh
 zig build example-http1
 curl http://127.0.0.1:8080/
+curl -H 'content-type: application/json' -d '{"name":"Alice"}' http://127.0.0.1:8080/api/users
 ```
 
 Run h2c prior-knowledge HTTP/2 on TCP port `8081`:
@@ -98,7 +124,9 @@ The HTTP/1 and HTTP/2 examples share the basic router from `examples/common.zig`
 
 - `core`: protocol-independent execution context and application state.
 - `http`: messages, semantics, wire protocols, transport, routing, handlers, extractors, and middleware.
+- `api`: typed JSON, structured API errors, and input validation.
 - `quic`: UDP endpoint, connection, TLS, packets, streams, recovery, CIDs, and paths.
+- `testing`: in-process application pipeline requests and response assertions.
 
 The HTTP package is split by responsibility:
 
@@ -109,7 +137,7 @@ The HTTP package is split by responsibility:
 - `src/http/routing/`, `handlers/`, `extractors/`, and `middleware/`: the shared application pipeline;
 - `src/quic/`: the UDP/QUIC transport used by HTTP/3.
 
-See [`docs/http-streaming.md`](docs/http-streaming.md) for request/response body streaming, [`docs/http-files.md`](docs/http-files.md) for file transfer and cache semantics, [`docs/http-protocol.md`](docs/http-protocol.md) for HTTP/1.x behavior, [`docs/http2.md`](docs/http2.md) for HTTP/2, and [`docs/http3.md`](docs/http3.md) for HTTP/3/QUIC architecture, limits, security, and validation.
+See [`docs/api.md`](docs/api.md) for typed API construction, [`docs/http-streaming.md`](docs/http-streaming.md) for request/response body streaming, [`docs/http-files.md`](docs/http-files.md) for file transfer and cache semantics, [`docs/http-protocol.md`](docs/http-protocol.md) for HTTP/1.x behavior, [`docs/http2.md`](docs/http2.md) for HTTP/2, and [`docs/http3.md`](docs/http3.md) for HTTP/3/QUIC architecture, limits, security, and validation.
 
 ## License
 

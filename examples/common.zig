@@ -1,10 +1,15 @@
 const causeway = @import("causeway");
 const http = causeway.http;
+const api = causeway.api;
 const std = @import("std");
 
 pub const State = struct {
     requests: std.atomic.Value(usize) = .init(0),
+    next_user_id: std.atomic.Value(usize) = .init(1),
 };
+
+const CreateUser = struct { name: []const u8 };
+const User = struct { id: usize, name: []const u8 };
 
 fn hello(context: *const http.context.Context(State)) http.response.Response {
     _ = context.execution.state.requests.fetchAdd(1, .monotonic);
@@ -46,6 +51,12 @@ fn stylesheet(_: *const http.context.Context(State)) http.response.Response {
     };
 }
 
+fn createUser(context: *const http.context.Context(State), input: api.Json(CreateUser)) api.JsonResponse(User) {
+    _ = context.execution.state.requests.fetchAdd(1, .monotonic);
+    const id = context.execution.state.next_user_id.fetchAdd(1, .monotonic);
+    return .created(.{ .id = id, .name = input.value.name });
+}
+
 fn earlyHello(context: *const http.context.Context(State)) http.response.Response {
     _ = context.execution.state.requests.fetchAdd(1, .monotonic);
     return .{
@@ -78,17 +89,19 @@ fn webTransport(context: *const http.context.Context(State)) !http.response.Resp
 
 const routes = .{
     http.routing.route.route(.GET, "/", hello),
+    http.routing.route.route(.POST, "/api/users", createUser),
 };
 
 const http3_routes = .{
     http.routing.route.route(.GET, "/", http3Hello),
+    http.routing.route.route(.POST, "/api/users", createUser),
     http.routing.route.route(.GET, "/assets/app.css", stylesheet),
     http.routing.route.route(.GET, "/early", earlyHello).withReplaySafe(),
     http.routing.route.route(.CONNECT, "/webtransport", webTransport),
 };
 
-pub const Router = http.routing.router.Router(routes);
+pub const Router = api.Dispatcher(http.routing.router.Router(routes));
 pub const Http3Router = blk: {
-    @setEvalBranchQuota(2_000);
-    break :blk http.routing.router.Router(http3_routes);
+    @setEvalBranchQuota(4_000);
+    break :blk api.Dispatcher(http.routing.router.Router(http3_routes));
 };

@@ -1,5 +1,6 @@
 const std = @import("std");
 const causeway = @import("causeway");
+const api = causeway.api;
 const app_module = causeway.http.app;
 const server_module = causeway.http.server;
 const Response = causeway.http.response.Response;
@@ -358,6 +359,55 @@ test "end-to-end app composes request id, route auth, router, and typed extracto
     try testing.expectEqual(@as(u32, 42), state.id);
     try testing.expectEqual(@as(u8, 7), state.page);
     try testing.expect(state.header_ok and state.body_ok and state.local_ok);
+}
+
+const ApiState = struct { next_id: usize = 1 };
+const ApiInput = struct { name: []const u8 };
+const ApiUser = struct { id: usize, name: []const u8 };
+
+fn apiCreateUser(context: *const causeway.http.context.Context(ApiState), input: api.Json(ApiInput)) api.JsonResponse(ApiUser) {
+    const id = context.execution.state.next_id;
+    context.execution.state.next_id += 1;
+    return .created(.{ .id = id, .name = input.value.name });
+}
+
+const ApiRouter = routing.router.Router(.{
+    routing.route.route(.POST, "/users", apiCreateUser),
+});
+const ApiDispatcher = api.Dispatcher(ApiRouter);
+const ApiApp = app_module.AppWithOptions(ApiState, ApiDispatcher, .{});
+
+test "end-to-end JSON API normalizes typed responses and extraction errors" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    threaded.setAsyncLimit(.limited(16));
+    const io = threaded.io();
+    var state: ApiState = .{};
+    var app = ApiApp.init(testing.allocator, io, &state, server_options);
+    defer app.deinit();
+    var harness = Harness(ApiApp).init(&app);
+    try harness.start();
+    defer harness.stop() catch {};
+
+    const created_raw = try rawRequest(testing.allocator, io, harness.address, "POST /users HTTP/1.1\r\n" ++
+        "Host: localhost\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n" ++
+        "{\"name\":\"Alice\"}");
+    defer testing.allocator.free(created_raw);
+    const created = try parseResponse(created_raw, 0);
+    try testing.expectEqual(@as(u16, 201), created.status);
+    try testing.expectEqualStrings("application/json", created.header("content-type").?);
+    try testing.expectEqualStrings("{\"id\":1,\"name\":\"Alice\"}", created.body);
+
+    const invalid_raw = try rawRequest(testing.allocator, io, harness.address, "POST /users HTTP/1.1\r\n" ++
+        "Host: localhost\r\nContent-Type: application/json\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{");
+    defer testing.allocator.free(invalid_raw);
+    const invalid = try parseResponse(invalid_raw, 0);
+    try testing.expectEqual(@as(u16, 400), invalid.status);
+    try testing.expectEqualStrings(
+        "{\"type\":\"invalid_json\",\"status\":400,\"detail\":\"Invalid JSON request body\"}",
+        invalid.body,
+    );
+    try harness.stop();
 }
 
 // -----------------------------------------------------------------------------
